@@ -25,7 +25,10 @@ func (c *converter) convertActions() {
 	for _, n := range c.tree.nodes {
 		var calls []string
 		for _, fn := range n.cl.actions {
-			if call := c.convertAction(n, fn, elsewhere[fn.fn]); call != "" {
+			// A function given to Action through a variable, as in
+			// action := run, is used where that variable is too.
+			used, direct := elsewhere[fn.fn]
+			if call := c.convertAction(n, fn, used || !direct); call != "" {
 				calls = append(calls, call)
 			}
 		}
