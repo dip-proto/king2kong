@@ -1003,9 +1003,38 @@ func (in *interp) forgetWrites(fr *frame, n dst.Node) {
 // forgetPointed drops what the interpreter knows of the plain values a call
 // it does not follow could change: variables passed by address, as in
 // withPrefix(&spec), and the data fields of structs passed by pointer.
-// Fields holding kingpin values or other structs are kept, since helpers
-// rarely replace those and commands need them to stay reachable.
+// Fields holding kingpin values are kept, since helpers rarely replace
+// those and commands need them to stay reachable.
+// Structs nested by value are only gone through for calls into other
+// packages, such as json.Unmarshal(data, &cfg), since the program's own
+// helpers rarely fill a whole configuration.
 func (in *interp) forgetPointed(fr *frame, c *dst.CallExpr, recv value, args []value) {
+	fn := in.staticCallee(fr.pkg, c)
+	deep := fn != nil && !in.prog.owns(fn.Pkg())
+	var forgetFields func(o *object)
+	forgetFields = func(o *object) {
+		// A missing field reads as its zero value, so it is marked unknown.
+		for i := range o.st.NumFields() {
+			f := o.st.Field(i)
+			switch v := o.fields[f].(type) {
+			case nil, vConst, vSlice:
+				switch typeUnder(f.Type()).(type) {
+				case *types.Basic, *types.Slice:
+					o.fields[f] = vUnknown{}
+				case *types.Struct:
+					if deep && v == nil {
+						sub := in.newObject(f.Type(), false, o.site+"."+f.Name())
+						sub.parent, sub.pfield = o, f
+						o.fields[f] = vObj{sub}
+					}
+				}
+			case vObj:
+				if deep && v.o.parent == o && v.o.st != nil {
+					forgetFields(v.o)
+				}
+			}
+		}
+	}
 	forgetObject := func(v value) {
 		if fp, ok := v.(vFieldPtr); ok {
 			// As in readBool(&settings.Remote).
@@ -1015,20 +1044,8 @@ func (in *interp) forgetPointed(fr *frame, c *dst.CallExpr, recv value, args []v
 			}
 			return
 		}
-		p, ok := v.(vPtr)
-		if !ok || p.o.st == nil {
-			return
-		}
-		// A missing field reads as its zero value, so it is marked unknown.
-		for i := range p.o.st.NumFields() {
-			f := p.o.st.Field(i)
-			switch p.o.fields[f].(type) {
-			case nil, vConst, vSlice:
-				switch typeUnder(f.Type()).(type) {
-				case *types.Basic, *types.Slice:
-					p.o.fields[f] = vUnknown{}
-				}
-			}
+		if p, ok := v.(vPtr); ok && p.o.st != nil {
+			forgetFields(p.o)
 		}
 	}
 	forgetObject(recv)
@@ -1558,7 +1575,7 @@ func (in *interp) composite(fr *frame, cl *dst.CompositeLit, t types.Type) value
 			if f == nil {
 				continue
 			}
-			v := in.evalTyped(fr, ve, f.Type())
+			v := in.copyData(ve, in.evalTyped(fr, ve, f.Type()))
 			if kc, ok := v.(vClause); ok && !in.prog.ownsType(t) {
 				in.escapes = append(in.escapes, escape{pos: fr.pkg.position(cl), what: fmt.Sprintf("the kingpin %s is stored in a %s, which belongs to code the tool does not follow: it may register more grammar or parse there", kc.c.kind, types.TypeString(t, nil)), report: true, fatal: kc.c.kind == kindApp})
 			}
@@ -1582,7 +1599,7 @@ func (in *interp) composite(fr *frame, cl *dst.CompositeLit, t types.Type) value
 			if _, ok := el.(*dst.KeyValueExpr); ok {
 				return vUnknown{}
 			}
-			v := in.evalTyped(fr, el, elemT)
+			v := in.copyData(el, in.evalTyped(fr, el, elemT))
 			if prev, seen := in.eltVals[el]; !seen {
 				in.eltVals[el] = v
 			} else if a, ok := prev.(vPtr); !ok || v != value(a) {

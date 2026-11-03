@@ -44,12 +44,18 @@ func (c *converter) cleanupWiring() {
 					continue
 				}
 				fn, _ := p.objectOf(fd.Name).(*types.Func)
-				if c.regOnly[fn] && fd.Name.Name != "init" {
+				testsCall := fn != nil && c.testRefs.mentions(filepath.Dir(p.filename(f)), p.PkgPath, fn.Name(), fn.Type().(*types.Signature).Recv() != nil)
+				if c.regOnly[fn] && fd.Name.Name != "init" && !testsCall {
 					// removeDeadCode takes care of it, but never of init.
 					for _, s := range fd.Body.List {
 						c.reportDroppedFields(p, fd, s, dests)
 					}
 					continue
+				}
+				if c.regOnly[fn] && testsCall {
+					// Emptied like the rest, but the tests that call it lose
+					// what it registered for them.
+					c.issue(p.position(fd), "tests call %s, which only registered flags and now does nothing; check those tests by hand", fn.Name())
 				}
 				del, lowered := c.deletableStmts(p, fd.Body)
 				if c.ctors[fn] == nil {

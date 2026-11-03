@@ -4,10 +4,12 @@ import (
 	"bytes"
 	"fmt"
 	"go/ast"
+	"go/constant"
 	"go/token"
 	"go/types"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -389,9 +391,9 @@ func (t *testConversion) ownRootFlags(f *dst.File, call *dst.CallExpr) dst.Expr 
 	if app == nil {
 		return nil
 	}
-	names := map[string]bool{}
+	flags := map[string]*clause{}
 	for _, fl := range t.c.tree.Root.cl.flags() {
-		names[fl.name] = true
+		flags[fl.name] = fl
 	}
 	want := types.TypeString(t.c.rootFlags, nil)
 	var holder dst.Expr
@@ -410,7 +412,12 @@ func (t *testConversion) ownRootFlags(f *dst.File, call *dst.CallExpr) dst.Expr 
 		if base == nil || p.objectOf(base) != app || flagName == "" {
 			return true
 		}
-		if !names[flagName] || len(outer.Args) != 1 {
+		if flags[flagName] == nil || len(outer.Args) != 1 {
+			ok = false
+			return false
+		}
+		if !sameSettings(p, outer, flags[flagName]) {
+			t.c.issue(p.position(s), "the test registers flag %q with other settings than the program, which the converted grammar has; port this test by hand", flagName)
 			ok = false
 			return false
 		}
@@ -435,6 +442,20 @@ func (t *testConversion) ownRootFlags(f *dst.File, call *dst.CallExpr) dst.Expr 
 	if !ok || holder == nil {
 		return nil
 	}
+	root := holder
+	for {
+		if sel, isSel := root.(*dst.SelectorExpr); isSel {
+			root = sel.X
+			continue
+		}
+		break
+	}
+	if id, isIdent := root.(*dst.Ident); isIdent {
+		if v := p.objectOf(id); v != nil && p.astOf(call) != nil && v.Pos() > p.astOf(call).Pos() {
+			t.c.issue(p.position(call), "the test declares %s after creating the application, where the converted grammar needs it; declare it first", id.Name)
+			return nil
+		}
+	}
 	for _, s := range stmts {
 		t.drop[s] = true
 	}
@@ -442,6 +463,51 @@ func (t *testConversion) ownRootFlags(f *dst.File, call *dst.CallExpr) dst.Expr 
 		return dst.Clone(holder).(dst.Expr)
 	}
 	return &dst.UnaryExpr{Op: token.AND, X: dst.Clone(holder).(dst.Expr)}
+}
+
+// sameSettings reports whether a test's registration chain, such as
+// app.Flag("debug", "...").Short('d').BoolVar(&x), gives the flag the
+// default, environment variable, short form and requirement the program
+// gave cl.
+func sameSettings(p *Package, call *dst.CallExpr, cl *clause) bool {
+	var defaults []string
+	var envar string
+	var short rune
+	required := false
+	for e := dst.Expr(call); ; {
+		x, isCall := e.(*dst.CallExpr)
+		if !isCall {
+			break
+		}
+		sel, isSel := x.Fun.(*dst.SelectorExpr)
+		if !isSel {
+			break
+		}
+		var args []string
+		for _, a := range x.Args {
+			if tv, ok := p.tv(a); ok && tv.Value != nil && tv.Value.Kind() == constant.String {
+				args = append(args, constant.StringVal(tv.Value))
+			}
+		}
+		switch sel.Sel.Name {
+		case "Default":
+			defaults = append(args, defaults...)
+		case "Envar":
+			if len(args) == 1 {
+				envar = args[0]
+			}
+		case "Short":
+			if tv, ok := p.tv(x.Args[0]); ok && tv.Value != nil {
+				if r, exact := constant.Int64Val(tv.Value); exact {
+					short = rune(r)
+				}
+			}
+		case "Required":
+			required = true
+		}
+		e = sel.X
+	}
+	return slices.Equal(defaults, cl.defaults) && envar == cl.envar && short == cl.short && required == cl.required
 }
 
 // chainBase returns the variable a builder chain such as

@@ -143,6 +143,16 @@ func valueTexts(ctx *kong.DecodeContext, sep rune, many bool) ([]string, error) 
 	return kong.SplitEscaped(fmt.Sprint(t.Value), sep), nil
 }
 
+// parseDuration parses a duration as the program's kingpin did.
+// durations_v2.go swaps in str2duration for kingpin v2.3.0 and later.
+var parseDuration = time.ParseDuration
+
+// ParseDuration parses a duration as the program's kingpin did, for the
+// generated code that decodes values itself.
+func ParseDuration(s string) (time.Duration, error) {
+	return parseDuration(s)
+}
+
 // counter adds one for every value, as kingpin's counter did.
 func counter(ctx *kong.DecodeContext, target reflect.Value) error {
 	if ctx.Scan.Peek().Type == kong.FlagValueToken {

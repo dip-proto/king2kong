@@ -150,6 +150,8 @@ func TestEndToEnd(t *testing.T) {
 			{"--port=1", "--conf=endtoend_test.go", "--input=./endtoend_test.go", "true"},
 			{"--port=x", "--version"},
 			{"--help", "--version"},
+			{"--port=1", "--conf=endtoend_test.go", "--tag=x", "--no-color", "true", "a.txt", "b.txt"},
+			{"--port=1", "--conf=endtoend_test.go", "--color", "false"},
 			{"env:QUIRKS_PORT=5", "--bogus", "--version"},
 			// kingpin checked the defaults in random order, so only one is
 			// bad here.

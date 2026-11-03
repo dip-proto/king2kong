@@ -650,6 +650,11 @@ func (p *Plan) tagFor(b *binding, fieldName string) *kongtag.Tag {
 			// kingpin v3 sets a flag named no-x to false when it is given.
 			t.Set("type", "noflag")
 		}
+	case "SetValue":
+		if !p.g.prog.kingpinV3 && c.kind == kindFlag && boolLike(b) {
+			// kingpin v2 accepts --no-x for custom booleans too.
+			t.Flag("negatable")
+		}
 	case "Counter":
 		t.Set("type", "counter")
 	case "ExistingFile", "ExistingFiles":
@@ -665,6 +670,22 @@ func (p *Plan) tagFor(b *binding, fieldName string) *kongtag.Tag {
 	}
 	p.helpTag(t, c)
 	return t
+}
+
+// boolLike reports whether b's custom value has an IsBoolFlag method.
+func boolLike(b *binding) bool {
+	var t types.Type
+	switch {
+	case b.field != nil:
+		t = b.field.Type()
+	case b.dstVar != nil:
+		t = b.dstVar.Type()
+	default:
+		return false
+	}
+	obj, _, _ := types.LookupFieldOrMethod(types.NewPointer(deref(t)), true, nil, "IsBoolFlag")
+	_, ok := obj.(*types.Func)
+	return ok
 }
 
 // runtimeVar returns the name of the kong variable holding a run-time value

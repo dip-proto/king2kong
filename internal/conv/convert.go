@@ -225,6 +225,28 @@ func (h *hookSet) paramOfType(typ string) string {
 	return ""
 }
 
+// builtByCall reports whether s creates a command struct with a function
+// call, as in j := defaultJob(), rather than a literal or new.
+func builtByCall(s dst.Stmt) bool {
+	var values []dst.Expr
+	switch s := s.(type) {
+	case *dst.AssignStmt:
+		values = s.Rhs
+	case *dst.DeclStmt:
+		if gd, ok := s.Decl.(*dst.GenDecl); ok && len(gd.Specs) == 1 {
+			values = gd.Specs[0].(*dst.ValueSpec).Values
+		}
+	}
+	for _, v := range values {
+		if call, ok := unparen(v).(*dst.CallExpr); ok {
+			if id, ok := call.Fun.(*dst.Ident); !ok || id.Name != "new" || id.Path != "" {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // paramToLocal replaces the BeforeApply parameter name of type typ with
 // the local that decl declares, and reports whether there was one.
 // It is for setup moved from a constructor that still reads a parameter
@@ -1016,6 +1038,21 @@ func (%[1]s *%[2]s) Decode(ctx *kong.DecodeContext) error {
 func (%[1]s *%[2]s) IsBool() bool {
 	return true
 }`, recv, t, v, negatedNote(given != "true"), given, valueless)
+		case types.TypeString(w.value.Type(), nil) == "time.Duration" && c.compatPath != "":
+			imports[c.compatPath] = "kongcompat"
+			body = fmt.Sprintf(`// Decode implements kong.MapperValue, so the flag value lands in %[3]s.
+func (%[1]s *%[2]s) Decode(ctx *kong.DecodeContext) error {
+	var s string
+	if err := ctx.Scan.PopValueInto("value", &s); err != nil {
+		return err
+	}
+	d, err := kongcompat.ParseDuration(s)
+	if err != nil {
+		return err
+	}
+	%[1]s.%[3]s = d
+	return nil
+}`, recv, t, v)
 		case u.Info()&types.IsNumeric != 0:
 			imports["strconv"] = "strconv"
 			body = numericDecode(recv, t, v, u, typeExpr(w.value.Type(), w.named.Obj().Pkg(), imports))
@@ -1180,8 +1217,8 @@ func recvType(t *types.Named) string {
 // templateNames are the names used inside the generated Decode and
 // AfterApply methods.
 var templateNames = map[string]bool{
-	"ctx": true, "path": true, "value": true, "s": true, "v": true, "b": true, "n": true, "sep": true, "err": true,
-	"kong": true, "fmt": true, "strconv": true, "strings": true, "slices": true,
+	"ctx": true, "path": true, "value": true, "s": true, "v": true, "b": true, "n": true, "d": true, "sep": true, "err": true, "part": true,
+	"kong": true, "kongcompat": true, "fmt": true, "strconv": true, "strings": true, "slices": true,
 }
 
 // methodRecv is receiverName for a generated method, avoiding the names
@@ -1305,6 +1342,10 @@ func (c *converter) convertConstructors() {
 			set[it.field] = it.kind
 		}
 		for i, it := range ci.items {
+			if it.kind == ctorStructure && builtByCall(it.stmt) {
+				c.issue(ci.decl.pkg.position(it.stmt), "constructor %s gets its %s from a function call, whose setup the tool cannot move into a hook", fn.Name(), ci.inst.Obj().Name())
+				ok = false
+			}
 			if it.kind == ctorResidue && it.stmt != nil && it.field == nil && deletable[it.stmt] {
 				// Registration through a local clause, such as
 				// clause := parent.Command(...).

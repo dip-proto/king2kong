@@ -111,6 +111,13 @@ func (a *Application) UsageTemplate(template string) *Application {
 	return a
 }
 
+// Version sets the version --version prints.
+// The flag itself comes from the grammar.
+func (a *Application) Version(version string) *Application {
+	_ = kong.Vars{"version": version}.Apply(a.Kong)
+	return a
+}
+
 // Author sets the author shown by some templates.
 func (a *Application) Author(author string) *Application {
 	_ = kong.Vars{"author": author}.Apply(a.Kong)

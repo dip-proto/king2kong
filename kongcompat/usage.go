@@ -180,7 +180,7 @@ func templateFuncs(indent, width int) template.FuncMap {
 		"FormatAppUsage":     formatAppUsage,
 		"FormatCommandUsage": formatCmdUsage,
 		"IsCumulative": func(v *kong.Value) bool {
-			return v != nil && v.IsCumulative()
+			return v != nil && cumulative(v)
 		},
 		"Char": func(c rune) string {
 			return string(c)

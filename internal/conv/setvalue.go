@@ -66,16 +66,37 @@ func (%[1]s *%[2]s) Decode(ctx *kong.DecodeContext) error {
 	if ctx.Scan.Peek().Type != kong.FlagValueToken {
 		return %[1]s.Set("true")
 	}
-	var value string
-	if err := ctx.Scan.PopValueInto("value", &value); err != nil {
-		return err
-	}
-	return %[1]s.Set(value)
+	return %[1]s.Set(fmt.Sprint(ctx.Scan.Pop().Value))
 }
 
 // IsBool tells kong whether the flag takes a value, as IsBoolFlag told kingpin.
 func (%[1]s *%[2]s) IsBool() bool {
 	return %[1]s.IsBoolFlag()
+}`, recv, name)
+	} else if c.hasMethod(t, "IsCumulative") {
+		body = fmt.Sprintf(`// Decode implements kong.MapperValue with Set, which kingpin called for
+// each value.
+// An argument takes the rest of the command line, and a default or an
+// environment variable holds several values split at the separator.
+func (%[1]s *%[2]s) Decode(ctx *kong.DecodeContext) error {
+	for {
+		var value string
+		if err := ctx.Scan.PopValueInto("value", &value); err != nil {
+			return err
+		}
+		parts := []string{value}
+		if sep := ctx.Value.Tag.Sep; sep != -1 {
+			parts = strings.Split(value, string(sep))
+		}
+		for _, part := range parts {
+			if err := %[1]s.Set(part); err != nil {
+				return err
+			}
+		}
+		if ctx.Value.Flag != nil || !ctx.Scan.Peek().IsValue() {
+			return nil
+		}
+	}
 }`, recv, name)
 	} else {
 		body = fmt.Sprintf(`// Decode implements kong.MapperValue with Set, which kingpin called for
@@ -89,6 +110,11 @@ func (%[1]s *%[2]s) Decode(ctx *kong.DecodeContext) error {
 }`, recv, name)
 	}
 	imports := map[string]string{"github.com/alecthomas/kong": "kong"}
+	for _, pkg := range []string{"fmt", "strings"} {
+		if strings.Contains(body, pkg+".") {
+			imports[pkg] = pkg
+		}
+	}
 	decls, err := snippet(loc.pkg.Name, imports, body)
 	if err != nil {
 		c.issue(token.Position{}, "%v", err)

@@ -13,6 +13,7 @@ import (
 
 func init() {
 	newOptions = append(newOptions, Durations())
+	parseDuration = str2duration.ParseDuration
 }
 
 // Durations decodes durations the way kingpin v2.3.0 and later did.
