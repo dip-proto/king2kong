@@ -55,6 +55,8 @@ type converter struct {
 	valueEmbeds map[*types.Var]bool
 	// cmdTypes are the struct types of grammar nodes.
 	cmdTypes map[*types.Named]bool
+	// destFields are the fields flags and arguments store their values in.
+	destFields map[*types.Var]bool
 	// rootFlags is the struct holding the application's own flags.
 	rootFlags *types.Named
 	// main is set when the program parses its command line in the package
@@ -116,6 +118,9 @@ type converter struct {
 	// reassigned are its locals assigned somewhere other than where they
 	// are declared.
 	reassigned map[types.Object]bool
+	// boundValues are what each parser binds for the hooks, by type, in the
+	// runtime conversion, as source.
+	boundValues map[string]string
 	// unmapped are the kingpin names already reported as having no
 	// kongcompat equivalent.
 	unmapped map[string]bool
@@ -252,6 +257,7 @@ func Convert(prog *Program, opts Options) (*Result, error) {
 		pureCalls:      map[*types.Func]bool{},
 		pkgFlagVars:    map[types.Object]bool{},
 		unmapped:       map[string]bool{},
+		boundValues:    map[string]string{},
 		funcWork:       map[*types.Func]bool{},
 		hooks:          map[*types.Named]*hookSet{},
 		valueEmbeds:    map[*types.Var]bool{},
@@ -1298,10 +1304,45 @@ func (c *converter) convertConstructors() {
 	for _, f := range slices.SortedFunc(maps.Keys(c.valueEmbeds), byPos) {
 		c.embedByValue(f)
 	}
+	// kong hands every hook the one value bound for a type, so the
+	// constructors must all get the same one.
+	// Main mode checks the arguments themselves, below.
+	type given struct {
+		v  value
+		fn *types.Func
+	}
+	firstGiven := map[string]given{}
+	clashes := func(f *types.Var, list []inj) bool {
+		t := list[0].param.Type()
+		key := types.TypeString(t, nil)
+		for _, in := range list {
+			idx := in.ci.params[in.param]
+			for _, s := range c.g.in.sites {
+				if s.callee != in.ci.fn || idx >= len(s.args) {
+					continue
+				}
+				prev, seen := firstGiven[key]
+				if !seen {
+					firstGiven[key] = given{s.args[idx], in.ci.fn}
+					continue
+				}
+				if !differentValues(prev.v, s.args[idx]) {
+					continue
+				}
+				who := "constructors " + prev.fn.Name() + " and " + in.ci.fn.Name() + " get"
+				if prev.fn == in.ci.fn {
+					who = "constructor " + prev.fn.Name() + " gets"
+				}
+				c.issue(in.ci.decl.pkg.position(in.ci.decl.decl), "%s different %s values, but kong hands every hook the one value bound for its type; set %s by hand", who, types.TypeString(t, shortQual), c.finalName(f))
+				return true
+			}
+		}
+		return false
+	}
 	for _, f := range slices.SortedFunc(maps.Keys(injections), byPos) {
 		list := injections[f]
 		owner := c.nm.declaringType(f)
-		if owner == nil {
+		if owner == nil || c.main == nil && clashes(f, list) {
 			continue
 		}
 		param := list[0].param
@@ -1363,6 +1404,28 @@ func (c *converter) convertConstructors() {
 			c.addInjected(param.Type())
 		}
 	}
+}
+
+// differentValues reports whether a and b are known to be different values,
+// such as pointers to two objects or two distinct constants.
+func differentValues(a, b value) bool {
+	switch a := a.(type) {
+	case vPtr:
+		switch b := b.(type) {
+		case vPtr:
+			return a.o != b.o
+		case vNil:
+			return true
+		}
+	case vConst:
+		if b, ok := b.(vConst); ok {
+			return !constant.Compare(a.c, token.EQL, b.c)
+		}
+	case vNil:
+		_, ok := b.(vPtr)
+		return ok
+	}
+	return false
 }
 
 // addInjected records a type the hooks take, which the parser has to bind.

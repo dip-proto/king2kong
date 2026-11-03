@@ -130,12 +130,12 @@ func (c *ClauseModel) FormatPlaceHolder() string {
 
 // isString reports whether the value is a plain string, which kingpin quoted
 // in placeholders.
-// Enums were not quoted.
+// Enums, paths and custom values were not quoted.
 func (c *ClauseModel) isString() bool {
-	if c.Value == nil || c.Value.Enum != "" || !c.Value.Target.IsValid() {
+	if c.Value == nil || c.Value.Enum != "" || isPath(c.Value) || !c.Value.Target.IsValid() {
 		return false
 	}
-	return c.Value.Target.Kind() == reflect.String
+	return c.Value.Target.Type() == reflect.TypeOf("")
 }
 
 // ArgGroupModel lists positional arguments.

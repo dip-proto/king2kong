@@ -204,6 +204,7 @@ type callSite struct {
 	call    *dst.CallExpr
 	fn      *types.Func // the function containing the call
 	callee  *types.Func
+	args    []value
 	result  *object
 	clauses []*clause // clauses created during the call
 	depth   int

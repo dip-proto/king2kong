@@ -151,9 +151,6 @@ func Parse(k *kong.Kong, args []string, uc *UsageContext) (string, error) {
 	if err != nil {
 		return "", valueError(k, err)
 	}
-	if err := checkKeptDefaults(kctx); err != nil {
-		return "", err
-	}
 	return FullCommand(kctx), nil
 }
 
@@ -428,26 +425,16 @@ func pickStatus(v2, v3 int) int {
 	return v3
 }
 
-// checkKeptDefaults checks the existing file or directory defaults that
-// were not replaced, which is when kingpin checked them.
-func checkKeptDefaults(kctx *kong.Context) error {
-	for _, p := range kctx.Path {
-		n := p.Command
-		if p.App != nil {
-			n = p.App.Node
-		}
-		if n == nil {
-			continue
-		}
-		for _, v := range ownValues(n) {
-			dir := v.Tag.Type == "existingdir"
-			if v.Tag.Type != "existingfile" && !dir || v.Default == "" || v.Target.Kind() != reflect.String || v.Target.String() != v.Default {
-				continue
-			}
-			if err := checkPath(v.Default, dir); err != nil {
-				return err
-			}
-		}
+// isPath reports whether v holds an existing file or directory.
+func isPath(v *kong.Value) bool {
+	return v.Tag.Type == "existingfile" || v.Tag.Type == "existingdir"
+}
+
+// checkDefault checks the default of an existing file or directory value,
+// which kingpin did only when the default was used.
+func checkDefault(v *kong.Value) error {
+	if !isPath(v) || v.Default == "" || v.Target.Kind() != reflect.String {
+		return nil
 	}
-	return nil
+	return checkPath(v.Default, v.Tag.Type == "existingdir")
 }

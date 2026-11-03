@@ -39,11 +39,26 @@ func (c *converter) cleanupWiring() {
 				if !c.hasTouched(fd.Body) {
 					continue
 				}
-				if fn, ok := p.objectOf(fd.Name).(*types.Func); ok && c.regOnly[fn] && fd.Name.Name != "init" {
+				fn, _ := p.objectOf(fd.Name).(*types.Func)
+				if c.regOnly[fn] && fd.Name.Name != "init" {
 					// removeDeadCode takes care of it, but never of init.
+					for _, s := range fd.Body.List {
+						c.reportDroppedFields(p, fd, s)
+					}
 					continue
 				}
 				del, lowered := c.deletableStmts(p, fd.Body)
+				if c.ctors[fn] == nil {
+					for _, s := range fd.Body.List {
+						dst.Inspect(s, func(n dst.Node) bool {
+							if s, ok := n.(dst.Stmt); ok && (del[s] || lowered[s] != nil) {
+								c.reportDroppedFields(p, fd, s)
+								return false
+							}
+							return true
+						})
+					}
+				}
 				dead := map[types.Object]bool{}
 				c.jumpKinds = labelJumps(fd.Body, func(br *dst.BranchStmt) bool { return !del[br] })
 				c.reassigned = map[types.Object]bool{}
@@ -77,6 +92,72 @@ func (c *converter) cleanupWiring() {
 		}
 	}
 	c.dropEmptiedCalls()
+}
+
+// reportDroppedFields reports the fields that s, a statement going away
+// with the registrations, sets in a command struct literal, as in
+// h := &hello{cfg: cfg} in a function that only registers h's command.
+// Nothing carries those values over, so code reading them would see zero
+// values.
+func (c *converter) reportDroppedFields(p *Package, fd *dst.FuncDecl, s dst.Stmt) {
+	if c.destFields == nil {
+		c.destFields = map[*types.Var]bool{}
+		for _, b := range c.plan.bindings {
+			c.destFields[b.field] = true
+		}
+	}
+	dst.Inspect(s, func(n dst.Node) bool {
+		if _, ok := n.(*dst.FuncLit); ok {
+			return false
+		}
+		lit, ok := n.(*dst.CompositeLit)
+		if !ok {
+			return true
+		}
+		t, ok := deref(p.typeOf(lit)).(*types.Named)
+		if !ok || !c.cmdTypes[t] {
+			return true
+		}
+		st := structOf(t)
+		for i, el := range lit.Elts {
+			var f *types.Var
+			val := el
+			if kv, ok := el.(*dst.KeyValueExpr); ok {
+				f, _ = p.objectOf(kv.Key).(*types.Var)
+				val = kv.Value
+			} else if i < st.NumFields() {
+				f = st.Field(i)
+			}
+			if f == nil || c.prog.isKingpinType(f.Type()) || c.destFields[f] || isZeroValue(p, val) || !c.fieldRead(f) {
+				continue
+			}
+			c.issue(p.position(el), "%s builds a %s with %s set, which goes away with the registration; set %s in a hook by hand", fd.Name.Name, t.Obj().Name(), f.Name(), f.Name())
+		}
+		return true
+	})
+}
+
+// isZeroValue reports whether e is nil or a constant zero value, which a
+// command struct starts with anyway.
+func isZeroValue(p *Package, e dst.Expr) bool {
+	tv, ok := p.tv(e)
+	if !ok {
+		return false
+	}
+	if tv.IsNil() {
+		return true
+	}
+	switch v := tv.Value; {
+	case v == nil:
+		return false
+	case v.Kind() == constant.String:
+		return constant.StringVal(v) == ""
+	case v.Kind() == constant.Bool:
+		return !constant.BoolVal(v)
+	case v.Kind() == constant.Int || v.Kind() == constant.Float:
+		return constant.Sign(v) == 0
+	}
+	return false
 }
 
 // singleStmt merges list into one statement, for spots such as an if header

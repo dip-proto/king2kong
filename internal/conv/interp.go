@@ -1598,6 +1598,7 @@ func (in *interp) inline(fr *frame, c *dst.CallExpr, fd funcDecl, fn *types.Func
 				call:    c,
 				fn:      fr.fn,
 				callee:  fn,
+				args:    append([]value{}, args...),
 				result:  pv.o,
 				clauses: append([]*clause{}, in.clauses[mark:]...),
 				depth:   len(in.stack),

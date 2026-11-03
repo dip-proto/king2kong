@@ -379,6 +379,14 @@ func (s *checker) finish() error {
 	if s.syntaxOnly || s.noRequired {
 		return nil
 	}
+	// kingpin applied the defaults first, unless --help was given.
+	if !s.sawHelp {
+		for _, v := range s.unset() {
+			if err := checkDefault(v); err != nil {
+				return err
+			}
+		}
+	}
 	commands := hasCommands(s.node)
 	if commands && len(s.path) > 1 {
 		return fmt.Errorf("must select a subcommand of '%s'", fullCommand(s.node))
@@ -390,6 +398,23 @@ func (s *checker) finish() error {
 		return ErrCommandNotSpecified
 	}
 	return nil
+}
+
+// unset returns the flags and arguments in scope that were neither given
+// nor set from the environment.
+func (s *checker) unset() []*kong.Value {
+	var out []*kong.Value
+	for _, f := range s.flags {
+		if !s.given[f.Value] && !envSet(f.Value) {
+			out = append(out, f.Value)
+		}
+	}
+	for _, a := range s.args {
+		if !s.given[a] && !envSet(a) {
+			out = append(out, a)
+		}
+	}
+	return out
 }
 
 func (s *checker) missingRequired() error {

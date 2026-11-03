@@ -318,7 +318,7 @@ func (t *testConversion) newApplication(f *dst.File, call *dst.CallExpr) dst.Exp
 			binds, typs = append(binds, dst.NewIdent(v.Name())), append(typs, typ)
 		}
 	}
-	args = append(args, bindCalls(binds, typs, t.p.PkgPath, kongOption)...)
+	args = append(args, c.bindCalls(t.p.position(call), binds, typs, t.p.PkgPath, kongOption)...)
 	args = append(args, c.newOptions(c.tree.RootPkg.PkgPath)...)
 	return callOf(c.compatIdent("New"), args...)
 }
@@ -554,7 +554,7 @@ func (t *testConversion) bindAtCall(cur *dstutil.Cursor, s dst.Stmt) {
 	for _, i := range bound {
 		typs = append(typs, params.At(i).Type())
 	}
-	for _, b := range bindCalls(binds, typs, t.p.PkgPath, methodOn(appExpr)) {
+	for _, b := range t.c.bindCalls(t.p.position(call), binds, typs, t.p.PkgPath, methodOn(appExpr)) {
 		cur.InsertBefore(&dst.ExprStmt{X: b})
 	}
 }

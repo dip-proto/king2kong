@@ -192,10 +192,17 @@ func (c *converter) bindAtCall(p *Package, cur *dstutil.Cursor, s dst.Stmt) {
 	}
 	appExpr, binds := c.sharedArgs(p, cur, s, call, app, bound, params)
 	var typs []types.Type
-	for _, i := range bound {
-		typs = append(typs, params.At(i).Type())
+	for j, i := range bound {
+		t := params.At(i).Type()
+		typs = append(typs, t)
+		// kong keeps the last value bound for a type, for every hook.
+		key := renderExact(appExpr) + " " + types.TypeString(t, nil)
+		if prev, ok := c.boundValues[key]; ok && prev != renderExact(binds[j]) {
+			c.issue(p.position(call), "%s and %s are both bound for the hooks as %s, but kong keeps only the last one; set the value by hand", prev, renderExact(binds[j]), types.TypeString(t, shortQual))
+		}
+		c.boundValues[key] = renderExact(binds[j])
 	}
-	for _, b := range bindCalls(binds, typs, p.PkgPath, methodOn(appExpr)) {
+	for _, b := range c.bindCalls(p.position(call), binds, typs, p.PkgPath, methodOn(appExpr)) {
 		cur.InsertBefore(&dst.ExprStmt{X: b})
 	}
 }
@@ -203,10 +210,12 @@ func (c *converter) bindAtCall(p *Package, cur *dstutil.Cursor, s dst.Stmt) {
 // ifaceArg returns (*T)(nil) when t is an interface such as io.Writer, or nil.
 // kong binds a value by its dynamic type, so one a hook takes as an
 // interface has to be bound to that interface with BindTo.
+// It reports false for an unnamed interface tied to a package, through its
+// method types or unexported methods, which it does not write out.
 // from is the package the expression is written in.
-func ifaceArg(t types.Type, from string) dst.Expr {
+func ifaceArg(t types.Type, from string) (dst.Expr, bool) {
 	if !types.IsInterface(t) {
-		return nil
+		return nil, true
 	}
 	var typ dst.Expr
 	switch t := types.Unalias(t).(type) {
@@ -217,21 +226,41 @@ func ifaceArg(t types.Type, from string) dst.Expr {
 		}
 		typ = id
 	case *types.Interface:
-		if !t.Empty() {
-			return nil
+		if t.Empty() {
+			typ = dst.NewIdent("any")
+			break
 		}
-		typ = dst.NewIdent("any")
+		// One naming no package, as interface{ Write([]byte) (int, error) },
+		// is the same type wherever it is written.
+		// Unexported methods belong to their package, though.
+		local := false
+		text := types.TypeString(t, func(*types.Package) string {
+			local = true
+			return ""
+		})
+		for i := range t.NumMethods() {
+			local = local || !t.Method(i).Exported()
+		}
+		if local {
+			return nil, false
+		}
+		typ = dst.NewIdent(text)
 	}
-	return callOf(&dst.ParenExpr{X: &dst.StarExpr{X: typ}}, dst.NewIdent("nil"))
+	return callOf(&dst.ParenExpr{X: &dst.StarExpr{X: typ}}, dst.NewIdent("nil")), true
 }
 
 // bindCalls returns the calls binding values, of types typs, for the hooks:
 // one Bind for most, and a BindTo for each interface.
 // call builds each one from its name, as kong.Bind or app.Bind.
-func bindCalls(values []dst.Expr, typs []types.Type, from string, call func(name string, args ...dst.Expr) dst.Expr) []dst.Expr {
+// pos is where to report what cannot be bound.
+func (c *converter) bindCalls(pos token.Position, values []dst.Expr, typs []types.Type, from string, call func(name string, args ...dst.Expr) dst.Expr) []dst.Expr {
 	var out, plain []dst.Expr
 	for i, v := range values {
-		if iface := ifaceArg(typs[i], from); iface != nil {
+		iface, ok := ifaceArg(typs[i], from)
+		if !ok {
+			c.issue(pos, "the hooks take %s as %s, an interface kong can only bind by its concrete type here; bind it with kong.BindTo by hand", render(v), types.TypeString(typs[i], shortQual))
+		}
+		if iface != nil {
 			out = append(out, call("BindTo", v, iface))
 			continue
 		}
@@ -369,12 +398,12 @@ func (c *converter) newApplication(p *Package, cur *dstutil.Cursor, call *dst.Ca
 		}
 		v := c.variableOfType(p, call, t)
 		if v == nil {
-			c.issue(p.position(call), "the commands' hooks take a %s, but no single variable of that type is at hand here; add it to kong.Bind by hand", types.TypeString(t, nil))
+			c.issue(p.position(call), "the commands' hooks take a value of type %s, but no single variable of that type is at hand here; add it to kong.Bind by hand", types.TypeString(t, shortQual))
 			continue
 		}
 		binds, typs = append(binds, dst.NewIdent(v.Name())), append(typs, t)
 	}
-	args = append(args, bindCalls(binds, typs, p.PkgPath, kongOption)...)
+	args = append(args, c.bindCalls(p.position(call), binds, typs, p.PkgPath, kongOption)...)
 	args = append(args, c.newOptions(c.qualifier(p, root))...)
 	newCall := callOf(c.compatIdent("New"), args...)
 	c.parserCalls = append(c.parserCalls, newCall)
