@@ -7,6 +7,7 @@ import (
 	"go/constant"
 	"go/token"
 	"go/types"
+	"maps"
 	"math"
 	"slices"
 	"strconv"
@@ -444,6 +445,7 @@ func (in *interp) stmt(fr *frame, s dst.Stmt) {
 		if in.mentionsBuilder(fr.pkg, s) {
 			in.escapes = append(in.escapes, escape{pos: fr.pkg.position(s), what: "kingpin registration inside a loop, switch, defer or goroutine, which the tool does not follow", report: true})
 		}
+		in.forgetWrites(fr, s)
 		// We don't step into it, but if it parses, the values flag
 		// variables start with are the ones they hold now.
 		parses := false
@@ -549,8 +551,37 @@ func (in *interp) assign(fr *frame, s *dst.AssignStmt) {
 		if i < len(vals) {
 			v = vals[i]
 		}
+		if i < len(s.Rhs) && len(s.Lhs) == len(s.Rhs) {
+			v = in.copyData(s.Rhs[i], v)
+		}
 		in.store(fr, l, v)
 	}
+}
+
+// copyData gives x := y, where y is a struct of plain data such as names and
+// help texts, an object of its own, so changing the copy leaves y alone.
+// Other structs stay shared, which keeps the fields of a command reachable
+// through its copies.
+func (in *interp) copyData(rhs dst.Expr, v value) value {
+	vo, ok := v.(vObj)
+	if !ok {
+		return v
+	}
+	switch unparen(rhs).(type) {
+	case *dst.Ident, *dst.SelectorExpr, *dst.StarExpr:
+	default:
+		return v
+	}
+	for _, f := range vo.o.fields {
+		switch f.(type) {
+		case vConst, vSlice, vUnknown, vNil:
+		default:
+			return v
+		}
+	}
+	o := in.newObject(vo.o.typ, vo.o.known, vo.o.site)
+	maps.Copy(o.fields, vo.o.fields)
+	return vObj{o}
 }
 
 func (in *interp) store(fr *frame, lhs dst.Expr, v value) {
@@ -735,6 +766,45 @@ func (in *interp) forgetWrites(fr *frame, n dst.Node) {
 	})
 }
 
+// forgetPointed drops what the interpreter knows of the plain values a call
+// it does not follow could change: variables passed by address, as in
+// withPrefix(&spec), and the data fields of structs passed by pointer.
+// Fields holding kingpin values or other structs are kept, since helpers
+// rarely replace those and commands need them to stay reachable.
+func (in *interp) forgetPointed(fr *frame, c *dst.CallExpr, recv value, args []value) {
+	forgetObject := func(v value) {
+		p, ok := v.(vPtr)
+		if !ok || p.o.st == nil {
+			return
+		}
+		// A missing field reads as its zero value, so it is marked unknown.
+		for i := range p.o.st.NumFields() {
+			f := p.o.st.Field(i)
+			switch p.o.fields[f].(type) {
+			case nil, vConst, vSlice:
+				switch typeUnder(f.Type()).(type) {
+				case *types.Basic, *types.Slice:
+					p.o.fields[f] = vUnknown{}
+				}
+			}
+		}
+	}
+	forgetObject(recv)
+	for i, a := range c.Args {
+		if u, ok := unparen(a).(*dst.UnaryExpr); ok && u.Op == token.AND {
+			if v, ok := fr.pkg.objectOf(unparen(u.X)).(*types.Var); ok && !v.IsField() {
+				if _, isStruct := typeUnder(v.Type()).(*types.Struct); !isStruct {
+					fr.vars[v] = vUnknown{}
+					in.varVals[v] = vUnknown{}
+				}
+			}
+		}
+		if i < len(args) {
+			forgetObject(args[i])
+		}
+	}
+}
+
 // leavesLoop reports whether s has a break or continue of the loop around it.
 func leavesLoop(s dst.Stmt) bool {
 	found := false
@@ -752,6 +822,8 @@ func leavesLoop(s dst.Stmt) bool {
 
 func (in *interp) rangeStmt(fr *frame, s *dst.RangeStmt) {
 	if !in.mentionsBuilder(fr.pkg, s.Body) {
+		// Not followed, so what it writes is no longer known.
+		in.forgetWrites(fr, s.Body)
 		return
 	}
 	sl, ok := in.eval(fr, s.X).(vSlice)
@@ -1364,6 +1436,7 @@ func (in *interp) call(fr *frame, c *dst.CallExpr) []value {
 	}
 	if fn == nil {
 		in.noteEscape(fr, c, args)
+		in.forgetPointed(fr, c, recv, args)
 		return []value{vUnknown{}}
 	}
 	if v, ok := foldCall(fn, args, c.Ellipsis); ok {
@@ -1377,6 +1450,7 @@ func (in *interp) call(fr *frame, c *dst.CallExpr) []value {
 		return in.inline(fr, c, fd, fn, recv, args, c.Ellipsis)
 	}
 	in.noteEscape(fr, c, args)
+	in.forgetPointed(fr, c, recv, args)
 	n := 1
 	if sig, ok := fn.Type().(*types.Signature); ok && sig.Results().Len() > 1 {
 		n = sig.Results().Len()

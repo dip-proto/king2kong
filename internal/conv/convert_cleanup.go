@@ -2093,19 +2093,25 @@ func sharedImportNames(p *Package, f *dst.File) map[string]string {
 		}
 		out[path] = name
 	}
-	// An import the conversion adds, such as kong, must not be hidden by a
-	// local of the same name.
+	// A package the conversion refers to anew, such as kong or os for
+	// os.Args, must not be hidden by a local of the same name.
 	added := map[string]bool{}
 	dst.Inspect(f, func(n dst.Node) bool {
-		if id, ok := n.(*dst.Ident); ok && id.Path != "" && id.Path != p.PkgPath && names[id.Path] == nil {
+		if id, ok := n.(*dst.Ident); ok && id.Path != "" && id.Path != p.PkgPath && (names[id.Path] == nil || len(names[id.Path]) == 1 && p.astOf(id) == nil) {
 			added[id.Path] = true
 		}
 		return true
 	})
 	for _, path := range slices.Sorted(maps.Keys(added)) {
 		own := cmp.Or(knownPackageNames[path], p.names[path], pathpkg.Base(path))
+		if ns := names[path]; len(ns) == 1 {
+			if ns[0] == "." || ns[0] == "_" {
+				continue
+			}
+			own = ns[0]
+		}
 		taken := func(n string) bool {
-			return declared[n] || chosen[n] || slices.ContainsFunc(slices.Collect(maps.Values(names)), func(ns []string) bool { return slices.Contains(ns, n) })
+			return declared[n] || chosen[n] || slices.ContainsFunc(slices.Collect(maps.Values(names)), func(ns []string) bool { return n != own && slices.Contains(ns, n) })
 		}
 		if taken(own) {
 			name := firstFree(taken, own)

@@ -8,10 +8,9 @@
 package kongcompat
 
 import (
-	"cmp"
 	"fmt"
 	"reflect"
-	"slices"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -481,7 +480,7 @@ func commandFlags(n *kong.Node) []*kong.Flag {
 		rank[name] = i + 1
 	}
 	// The flags it does not list, such as --help, keep their place.
-	flags := slices.Clone(n.Flags)
+	flags := append([]*kong.Flag(nil), n.Flags...)
 	var slots []int
 	var listed []*kong.Flag
 	for i, f := range flags {
@@ -490,7 +489,7 @@ func commandFlags(n *kong.Node) []*kong.Flag {
 			listed = append(listed, f)
 		}
 	}
-	slices.SortStableFunc(listed, func(a, b *kong.Flag) int { return cmp.Compare(rank[a.Name], rank[b.Name]) })
+	sort.SliceStable(listed, func(i, j int) bool { return rank[listed[i].Name] < rank[listed[j].Name] })
 	for i, at := range slots {
 		flags[at] = listed[i]
 	}

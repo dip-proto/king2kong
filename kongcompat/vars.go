@@ -1,7 +1,6 @@
 package kongcompat
 
 import (
-	"maps"
 	"strings"
 
 	"github.com/alecthomas/kong"
@@ -63,7 +62,9 @@ func collectVars(root *kong.Node, vars Vars) {
 	nodes(root, func(n *kong.Node) {
 		if n.Target.IsValid() && n.Target.CanAddr() {
 			if v, ok := n.Target.Addr().Interface().(interface{ Vars() Vars }); ok {
-				maps.Copy(vars, v.Vars())
+				for name, value := range v.Vars() {
+					vars[name] = value
+				}
 			}
 		}
 	})

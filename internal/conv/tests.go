@@ -416,8 +416,12 @@ func (t *testConversion) ownRootFlags(f *dst.File, call *dst.CallExpr) dst.Expr 
 			return false
 		}
 		u, isAddr := outer.Args[0].(*dst.UnaryExpr)
+		if !isAddr {
+			ok = false
+			return false
+		}
 		sel, isSel := u.X.(*dst.SelectorExpr)
-		if !isAddr || !isSel || types.TypeString(deref(p.typeOf(sel.X)), nil) != want {
+		if !isSel || types.TypeString(deref(p.typeOf(sel.X)), nil) != want {
 			ok = false
 			return false
 		}

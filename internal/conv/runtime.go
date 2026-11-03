@@ -92,7 +92,11 @@ func (c *converter) convertRuntime() {
 				if n.Path == "" || !c.prog.isKingpinPath(n.Path) {
 					return false, true
 				}
-				if exports[n.Name] {
+				if to, ok := runtimeRenames[n.Name]; ok {
+					n.Name, n.Path = to, c.compatPath
+					return true, true
+				}
+				if exports[n.Name] && !notCarried[n.Name] {
 					n.Path = c.compatPath
 					return true, true
 				}
@@ -105,6 +109,14 @@ func (c *converter) convertRuntime() {
 		}, nil)
 	}
 }
+
+// runtimeRenames are kingpin's package-level functions whose kongcompat
+// version has another name, the name they have taking other arguments.
+var runtimeRenames = map[string]string{"MustParse": "Must"}
+
+// notCarried are kingpin's package-level names whose kongcompat namesakes
+// mean something else, so they are reported instead.
+var notCarried = map[string]bool{"Parse": true, "Usage": true, "HelpCommand": true}
 
 // applyRuntime walks the kept declarations of p, calling stmt (when not nil)
 // and then pre on each node.

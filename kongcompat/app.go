@@ -1,7 +1,6 @@
 package kongcompat
 
 import (
-	"cmp"
 	"io"
 	"reflect"
 	"strings"
@@ -320,10 +319,13 @@ func (a *Application) CommandOf(cmd any) *CmdClause {
 			same = n
 		}
 	})
-	if found := cmp.Or(same, byType); found != nil {
-		return newCmdClause(found)
+	if same == nil {
+		same = byType
 	}
-	return nil
+	if same == nil {
+		return nil
+	}
+	return newCmdClause(same)
 }
 
 // FullCommand returns the command's full name, as CommandName does.

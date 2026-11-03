@@ -167,16 +167,22 @@ func (c *converter) addFlagOrders(nodes []*node) {
 	for _, n := range nodes {
 		add(n)
 	}
+	// A command with no flags has an empty order, which still counts, so
+	// orders are looked up by key.
+	ordered := func(t *types.Named) bool {
+		_, ok := orders[t]
+		return ok
+	}
 	for added := len(typs) > 0; added; {
 		added = false
 		for _, n := range c.tree.nodes {
 			t := c.flagsType(n)
-			if t == nil || orders[t] != nil || !c.prog.owns(t.Obj().Pkg()) {
+			if t == nil || ordered(t) || !c.prog.owns(t.Obj().Pkg()) {
 				continue
 			}
 			names := flagNames(n)
 			if slices.ContainsFunc(embeddedClosure(t), func(e *types.Named) bool {
-				return orders[e] != nil && !slices.Equal(orders[e], names)
+				return ordered(e) && !slices.Equal(orders[e], names)
 			}) {
 				add(n)
 				added = true

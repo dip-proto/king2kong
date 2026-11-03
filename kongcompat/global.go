@@ -83,3 +83,13 @@ func Fatalf(format string, args ...any) {
 func FatalIfError(err error, format string, args ...any) {
 	ErrorReporter{}.FatalIfError(err, format, args...)
 }
+
+// Must is kingpin's package-level MustParse, for the result of
+// Application.Parse: on an error it prints it, as kingpin did, and exits
+// with status 1.
+func Must(command string, err error) string {
+	if err != nil {
+		Fatalf("%s, try --help", err)
+	}
+	return command
+}

@@ -465,7 +465,12 @@ func (c *converter) typeIdent(t *types.Named) *dst.Ident {
 func (c *converter) copiesVariable(o types.Object) bool {
 	root := c.tree.RootPkg
 	copied := false
+	// A variable or what a pointer variable points to, as in *serve.
 	isVar := func(e dst.Expr) bool {
+		e = unparen(e)
+		if star, ok := e.(*dst.StarExpr); ok {
+			e = unparen(star.X)
+		}
 		switch e.(type) {
 		case *dst.Ident, *dst.SelectorExpr:
 			_, ok := root.objectOf(e).(*types.Var)
@@ -1558,6 +1563,12 @@ func (c *converter) rewriteCall(p *Package, cur *dstutil.Cursor, call *dst.CallE
 	case "Usage":
 		if sel != nil && len(call.Args) == 1 {
 			cur.Replace(callOf(c.compatIdent("PrintUsage"), sel.X, call.Args[0], c.usageExpr()))
+			return true
+		}
+		if sel == nil && len(call.Args) == 0 {
+			// kingpin.Usage() prints the default application's usage for
+			// the program's own command line.
+			cur.Replace(callOf(c.compatIdent("PrintUsage"), c.parserExpr(), osArgs, c.usageExpr()))
 			return true
 		}
 	case "Fatalf", "Errorf", "FatalIfError":

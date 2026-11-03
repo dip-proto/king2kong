@@ -1,11 +1,13 @@
 package conv
 
 import (
+	"cmp"
 	"fmt"
 	"go/constant"
 	"go/token"
 	"go/types"
 	"io/fs"
+	"maps"
 	"path/filepath"
 	"slices"
 	"sort"
@@ -1265,10 +1267,14 @@ func (c *converter) convertConstructors() {
 		c.removedCtors[fn] = true
 		c.res.Stats.RemovedFuncs++
 	}
-	for f := range c.valueEmbeds {
+	// Fields in source order, so hooks and bindings come out the same each
+	// run.
+	byPos := func(a, b *types.Var) int { return cmp.Compare(a.Pos(), b.Pos()) }
+	for _, f := range slices.SortedFunc(maps.Keys(c.valueEmbeds), byPos) {
 		c.embedByValue(f)
 	}
-	for f, list := range injections {
+	for _, f := range slices.SortedFunc(maps.Keys(injections), byPos) {
+		list := injections[f]
 		owner := c.nm.declaringType(f)
 		if owner == nil {
 			continue
@@ -1294,7 +1300,11 @@ func (c *converter) convertConstructors() {
 					}
 				}
 			}
-			if lit, ok := sameConstant(argPkg, args); ok {
+			if lit, t, ok := sameConstant(argPkg, args); ok {
+				// A constant of a named type, as time.Second, keeps its type.
+				if _, basic := t.(*types.Basic); t != nil && !basic {
+					lit = typeExpr(t, pkg, h.imports) + "(" + lit + ")"
+				}
 				h.before = append(h.before, fmt.Sprintf("%s.%s = %s", c.recvPlaceholder, c.finalName(f), lit))
 				continue
 			}
@@ -1341,30 +1351,31 @@ func (c *converter) addInjected(t types.Type) {
 }
 
 // sameConstant returns the source of args when they are all the same
-// constant.
-func sameConstant(p *Package, args []dst.Expr) (string, bool) {
+// constant, and its type when that source is a value rather than a literal.
+func sameConstant(p *Package, args []dst.Expr) (string, types.Type, bool) {
 	if len(args) == 0 || p == nil {
-		return "", false
+		return "", nil, false
 	}
 	first := ""
+	var t types.Type
 	for i, a := range args {
 		tv, ok := p.tv(a)
 		if !ok || tv.Value == nil {
-			return "", false
+			return "", nil, false
 		}
 		// The hook may live in another package, which can't see a named
 		// constant of the caller, so only literals are copied as written.
 		s := renderExact(a)
 		if _, lit := unparen(a).(*dst.BasicLit); !lit {
-			s = constLiteral(tv.Value)
+			s, t = constLiteral(tv.Value), tv.Type
 		}
 		if i == 0 {
 			first = s
 		} else if s != first {
-			return "", false
+			return "", nil, false
 		}
 	}
-	return first, true
+	return first, t, true
 }
 
 // constLiteral writes a constant value as Go source.

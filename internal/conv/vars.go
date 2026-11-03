@@ -88,8 +88,11 @@ func (c *converter) hostVars(n *node, vars []runtimeVar) {
 		if !ok || !c.prog.owns(host.Obj().Pkg()) || !c.allMovable(vars, host.Obj().Pkg()) {
 			continue
 		}
-		if c.hasMethod(host, "Vars") {
-			break
+		if c.hasMethod(host, "Vars") || slices.Contains(memberNames(host), "Vars") {
+			for _, v := range vars {
+				c.issue(v.cl.pos, "%s %q: its %s is computed at run time, and %s already has a Vars member to give it to kong; give kong the %s variable by hand", v.cl.kind, v.cl.name, v.what, host.Obj().Name(), v.name)
+			}
+			return
 		}
 		imports := map[string]string{}
 		recv := c.receiverName(host, strings.ToLower(host.Obj().Name()[:1]))
