@@ -70,9 +70,11 @@ A repository holding several kingpin programs is converted one program at a time
 
 What the tool knows it could not convert is in the report, and flags it could not convert keep a `TODO` with the original kingpin call.
 
-## What gets converted
+## Output
 
-The tool turns your kingpin registration code into kong struct tags. The converted output is plain kong — readable, writable, and without the tool's own scaffolding.
+The tool turns your kingpin registration code into kong struct tags.
+
+The converted output is plain kong, readable, writable, and without the tool's own scaffolding.
 
 It handles:
 
@@ -87,4 +89,3 @@ It handles:
 It also generates a small `internal/kongcompat` package that keeps kingpin's user-visible behaviors: help output, error messages, shell completion, `--version`, `@file` arguments, and other quirks users and scripts rely on.
 
 Delete it once your program moves to kong's own help and errors.
-
