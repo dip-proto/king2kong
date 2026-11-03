@@ -113,6 +113,8 @@ type frame struct {
 	done  bool
 	// jump is the break or continue leaving the current loop iteration.
 	jump token.Token
+	// unknownIf is the last if statement whose condition was not known.
+	unknownIf *dst.IfStmt
 }
 
 func newInterp(prog *Program) *interp {
@@ -388,11 +390,19 @@ func (in *interp) opaque(t types.Type, site string) value {
 }
 
 func (in *interp) block(fr *frame, stmts []dst.Stmt) {
+	saved := fr.conds
+	defer func() { fr.conds = saved }()
 	for _, s := range stmts {
 		if fr.done || fr.jump != 0 {
 			return
 		}
 		in.stmt(fr, s)
+		// After if cond { return }, the rest only runs when cond is false.
+		if g, ok := s.(*dst.IfStmt); ok && g.Else == nil && len(g.Body.List) > 0 && !in.mentionsBuilder(fr.pkg, g.Body) {
+			if _, returns := g.Body.List[len(g.Body.List)-1].(*dst.ReturnStmt); returns && fr.unknownIf == g {
+				fr.conds = append(append([]cond{}, fr.conds...), cond{expr: g.Cond, neg: true, fn: fr.fn, pkg: fr.pkg})
+			}
+		}
 	}
 }
 
@@ -705,6 +715,9 @@ func (in *interp) ifStmt(fr *frame, s *dst.IfStmt) {
 		in.stmt(fr, s.Init)
 	}
 	b, known := in.truth(fr, s.Cond)
+	if !known {
+		fr.unknownIf = s
+	}
 	if known {
 		if b {
 			in.block(fr, s.Body.List)
@@ -725,13 +738,23 @@ func (in *interp) ifStmt(fr *frame, s *dst.IfStmt) {
 		return
 	}
 	saved := fr.conds
+	// Both branches run, one after the other, so neither may end the
+	// loop iteration for good: a break or continue under this condition
+	// is reported instead.
+	settle := func() {
+		fr.done = false
+		if fr.jump != 0 {
+			in.escapes = append(in.escapes, escape{pos: fr.pkg.position(s), what: "kingpin registration in a loop that skips some values under a condition the tool cannot resolve", report: true})
+			fr.jump = 0
+		}
+	}
 	fr.conds = append(append([]cond{}, saved...), cond{expr: s.Cond, fn: fr.fn, pkg: fr.pkg})
 	in.block(fr, s.Body.List)
-	fr.done = false
+	settle()
 	if s.Else != nil {
 		fr.conds = append(append([]cond{}, saved...), cond{expr: s.Cond, neg: true, fn: fr.fn, pkg: fr.pkg})
 		in.stmt(fr, s.Else)
-		fr.done = false
+		settle()
 	}
 	fr.conds = saved
 }

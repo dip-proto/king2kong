@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"regexp"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -801,9 +802,12 @@ func (c *converter) writeHooks() {
 			continue
 		}
 		conflict := false
-		for m, needed := range map[string]bool{"BeforeApply": len(h.before) > 0, "AfterApply": len(h.after)+len(h.checks)+len(h.actions) > 0} {
-			if _, exists := c.ed.methods[t][m]; exists && needed {
-				c.issue(loc.pkg.position(loc.spec), "%s already has a %s method; the generated one has to be merged by hand", t.Obj().Name(), m)
+		members := memberNames(t)
+		for _, m := range []string{"BeforeApply", "AfterApply"} {
+			needed := m == "BeforeApply" && len(h.before) > 0 || m == "AfterApply" && len(h.after)+len(h.checks)+len(h.actions) > 0
+			_, method := c.ed.methods[t][m]
+			if needed && (method || slices.Contains(members, m)) {
+				c.issue(loc.pkg.position(loc.spec), "%s already has a %s method or field; the generated hook has to be merged by hand", t.Obj().Name(), m)
 				conflict = true
 			}
 		}

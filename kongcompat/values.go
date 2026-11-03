@@ -113,8 +113,16 @@ func floatInt(ctx *kong.DecodeContext, target reflect.Value) error {
 }
 
 // valueTexts pops the raw text of a value: a flag's value split at sep, or
-// all the remaining arguments for a positional one.
-func valueTexts(ctx *kong.DecodeContext, sep rune) ([]string, error) {
+// for a positional one, the next argument, or all the remaining ones when
+// many is set.
+func valueTexts(ctx *kong.DecodeContext, sep rune, many bool) ([]string, error) {
+	if ctx.Value.Flag == nil && !many {
+		t := ctx.Scan.Pop()
+		if !t.IsValue() {
+			return nil, fmt.Errorf("missing value")
+		}
+		return []string{fmt.Sprint(t.Value)}, nil
+	}
 	if ctx.Value.Flag == nil {
 		var out []string
 		for _, t := range ctx.Scan.PopWhile(func(t kong.Token) bool { return t.IsValue() }) {
@@ -130,7 +138,7 @@ func valueTexts(ctx *kong.DecodeContext, sep rune) ([]string, error) {
 }
 
 func boolList(ctx *kong.DecodeContext, target reflect.Value) error {
-	texts, err := valueTexts(ctx, ctx.Value.Tag.Sep)
+	texts, err := valueTexts(ctx, ctx.Value.Tag.Sep, true)
 	if err != nil {
 		return err
 	}
@@ -145,7 +153,7 @@ func boolList(ctx *kong.DecodeContext, target reflect.Value) error {
 }
 
 func stringMap(ctx *kong.DecodeContext, target reflect.Value) error {
-	texts, err := valueTexts(ctx, ctx.Value.Tag.MapSep)
+	texts, err := valueTexts(ctx, ctx.Value.Tag.MapSep, true)
 	if err != nil {
 		return err
 	}
@@ -164,18 +172,20 @@ func stringMap(ctx *kong.DecodeContext, target reflect.Value) error {
 
 func existingPath(dir bool) kong.MapperFunc {
 	return func(ctx *kong.DecodeContext, target reflect.Value) error {
+		many := target.Kind() == reflect.Slice
 		sep := ctx.Value.Tag.Sep
-		if target.Kind() != reflect.Slice {
+		if !many {
 			sep = -1
 		}
-		texts, err := valueTexts(ctx, sep)
+		texts, err := valueTexts(ctx, sep, many)
 		if err != nil {
 			return err
 		}
 		for _, s := range texts {
-			// kong also decodes the defaults of unselected commands, which
-			// kingpin never checked.
-			if ctx.Value.Active {
+			// kong also decodes the defaults of unselected commands, and
+			// of flags given on the command line, which kingpin never
+			// checked; Parse checks a default that is kept.
+			if ctx.Value.Active && (many || s != ctx.Value.Default) {
 				if err := checkPath(s, dir); err != nil {
 					return err
 				}

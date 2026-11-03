@@ -36,7 +36,6 @@ func (c *converter) convertRuntime() {
 	c.pointRemovedCalls()
 	c.declareListCLIs()
 	exports := c.compatExports()
-	unknown := map[string]bool{}
 	// Hook values are bound at kingpin.New when they are in scope there,
 	// and otherwise where they were passed to the wiring code.
 	for _, p := range c.prog.Packages {
@@ -92,18 +91,7 @@ func (c *converter) convertRuntime() {
 				if n.Path == "" || !c.prog.isKingpinPath(n.Path) {
 					return false, true
 				}
-				if to, ok := runtimeRenames[n.Name]; ok {
-					n.Name, n.Path = to, c.compatPath
-					return true, true
-				}
-				if exports[n.Name] && !notCarried[n.Name] {
-					n.Path = c.compatPath
-					return true, true
-				}
-				if !unknown[n.Name] {
-					unknown[n.Name] = true
-					c.issue(p.position(n), "kingpin.%s has no kongcompat equivalent; port this use to kong by hand", n.Name)
-				}
+				return c.compatName(p, n, exports), true
 			}
 			return false, true
 		}, nil)
@@ -117,6 +105,27 @@ var runtimeRenames = map[string]string{"MustParse": "Must"}
 // notCarried are kingpin's package-level names whose kongcompat namesakes
 // mean something else, so they are reported instead.
 var notCarried = map[string]bool{"Parse": true, "Usage": true, "HelpCommand": true}
+
+// compatName moves a use of a kingpin package-level name, such as
+// kingpin.MustParse, to its kongcompat equivalent, and tells whether there is
+// one.
+// When there is none, the use is reported, once per name, since the program
+// would still depend on kingpin.
+func (c *converter) compatName(p *Package, n *dst.Ident, exports map[string]bool) bool {
+	if to, ok := runtimeRenames[n.Name]; ok {
+		n.Name, n.Path = to, c.compatPath
+		return true
+	}
+	if exports[n.Name] && !notCarried[n.Name] {
+		n.Path = c.compatPath
+		return true
+	}
+	if !c.unmapped[n.Name] {
+		c.unmapped[n.Name] = true
+		c.issue(p.position(n), "kingpin.%s has no kongcompat equivalent; port this use to kong by hand", n.Name)
+	}
+	return false
+}
 
 // applyRuntime walks the kept declarations of p, calling stmt (when not nil)
 // and then pre on each node.
@@ -182,8 +191,68 @@ func (c *converter) bindAtCall(p *Package, cur *dstutil.Cursor, s dst.Stmt) {
 		return
 	}
 	appExpr, binds := c.sharedArgs(p, cur, s, call, app, bound, params)
-	bind := callOf(&dst.SelectorExpr{X: appExpr, Sel: dst.NewIdent("Bind")}, binds...)
-	cur.InsertBefore(&dst.ExprStmt{X: bind})
+	var typs []types.Type
+	for _, i := range bound {
+		typs = append(typs, params.At(i).Type())
+	}
+	for _, b := range bindCalls(binds, typs, p.PkgPath, methodOn(appExpr)) {
+		cur.InsertBefore(&dst.ExprStmt{X: b})
+	}
+}
+
+// ifaceArg returns (*T)(nil) when t is an interface such as io.Writer, or nil.
+// kong binds a value by its dynamic type, so one a hook takes as an
+// interface has to be bound to that interface with BindTo.
+// from is the package the expression is written in.
+func ifaceArg(t types.Type, from string) dst.Expr {
+	if !types.IsInterface(t) {
+		return nil
+	}
+	var typ dst.Expr
+	switch t := types.Unalias(t).(type) {
+	case *types.Named:
+		id := dst.NewIdent(t.Obj().Name())
+		if pkg := t.Obj().Pkg(); pkg != nil && pkg.Path() != from {
+			id.Path = pkg.Path()
+		}
+		typ = id
+	case *types.Interface:
+		if !t.Empty() {
+			return nil
+		}
+		typ = dst.NewIdent("any")
+	}
+	return callOf(&dst.ParenExpr{X: &dst.StarExpr{X: typ}}, dst.NewIdent("nil"))
+}
+
+// bindCalls returns the calls binding values, of types typs, for the hooks:
+// one Bind for most, and a BindTo for each interface.
+// call builds each one from its name, as kong.Bind or app.Bind.
+func bindCalls(values []dst.Expr, typs []types.Type, from string, call func(name string, args ...dst.Expr) dst.Expr) []dst.Expr {
+	var out, plain []dst.Expr
+	for i, v := range values {
+		if iface := ifaceArg(typs[i], from); iface != nil {
+			out = append(out, call("BindTo", v, iface))
+			continue
+		}
+		plain = append(plain, v)
+	}
+	if len(plain) > 0 {
+		out = append([]dst.Expr{call("Bind", plain...)}, out...)
+	}
+	return out
+}
+
+// kongOption builds a kong option call, as kong.Bind(x).
+func kongOption(name string, args ...dst.Expr) dst.Expr {
+	return callOf(kongIdent(name), args...)
+}
+
+// methodOn builds calls of methods of app, as app.Bind(x).
+func methodOn(app dst.Expr) func(name string, args ...dst.Expr) dst.Expr {
+	return func(name string, args ...dst.Expr) dst.Expr {
+		return callOf(&dst.SelectorExpr{X: dst.Clone(app).(dst.Expr), Sel: dst.NewIdent(name)}, args...)
+	}
 }
 
 // stmtCall is the call a statement makes, as f(x) or v := f(x), or nil.
@@ -293,6 +362,7 @@ func (c *converter) newApplication(p *Package, cur *dstutil.Cursor, call *dst.Ca
 	args := []dst.Expr{&dst.UnaryExpr{Op: token.AND, X: cli}}
 	args = append(args, call.Args...)
 	var binds []dst.Expr
+	var typs []types.Type
 	for _, t := range c.injected {
 		if containsType(c.boundAtCall, t) {
 			continue
@@ -302,11 +372,9 @@ func (c *converter) newApplication(p *Package, cur *dstutil.Cursor, call *dst.Ca
 			c.issue(p.position(call), "the commands' hooks take a %s, but no single variable of that type is at hand here; add it to kong.Bind by hand", types.TypeString(t, nil))
 			continue
 		}
-		binds = append(binds, dst.NewIdent(v.Name()))
+		binds, typs = append(binds, dst.NewIdent(v.Name())), append(typs, t)
 	}
-	if len(binds) > 0 {
-		args = append(args, callOf(kongIdent("Bind"), binds...))
-	}
+	args = append(args, bindCalls(binds, typs, p.PkgPath, kongOption)...)
 	args = append(args, c.newOptions(c.qualifier(p, root))...)
 	newCall := callOf(c.compatIdent("New"), args...)
 	c.parserCalls = append(c.parserCalls, newCall)

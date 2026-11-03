@@ -151,6 +151,9 @@ func Parse(k *kong.Kong, args []string, uc *UsageContext) (string, error) {
 	if err != nil {
 		return "", valueError(k, err)
 	}
+	if err := checkKeptDefaults(kctx); err != nil {
+		return "", err
+	}
 	return FullCommand(kctx), nil
 }
 
@@ -423,4 +426,28 @@ func pickStatus(v2, v3 int) int {
 		return v2
 	}
 	return v3
+}
+
+// checkKeptDefaults checks the existing file or directory defaults that
+// were not replaced, which is when kingpin checked them.
+func checkKeptDefaults(kctx *kong.Context) error {
+	for _, p := range kctx.Path {
+		n := p.Command
+		if p.App != nil {
+			n = p.App.Node
+		}
+		if n == nil {
+			continue
+		}
+		for _, v := range ownValues(n) {
+			dir := v.Tag.Type == "existingdir"
+			if v.Tag.Type != "existingfile" && !dir || v.Default == "" || v.Target.Kind() != reflect.String || v.Target.String() != v.Default {
+				continue
+			}
+			if err := checkPath(v.Default, dir); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
 }

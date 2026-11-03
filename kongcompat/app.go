@@ -54,6 +54,13 @@ func (a *Application) Bind(values ...any) *Application {
 	return a
 }
 
+// BindTo is kong.BindTo for a parser that is already built: it binds value
+// to the interface iface points to, such as (*io.Writer)(nil).
+func (a *Application) BindTo(value, iface any) *Application {
+	_ = kong.BindTo(value, iface).Apply(a.Kong)
+	return a
+}
+
 // Writers sets where usage and errors go (kingpin v3).
 func (a *Application) Writers(out, err io.Writer) *Application {
 	a.Kong.Stdout, a.Kong.Stderr = out, err

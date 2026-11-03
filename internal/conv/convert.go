@@ -116,6 +116,9 @@ type converter struct {
 	// reassigned are its locals assigned somewhere other than where they
 	// are declared.
 	reassigned map[types.Object]bool
+	// unmapped are the kingpin names already reported as having no
+	// kongcompat equivalent.
+	unmapped map[string]bool
 	// pkgFlagVars are the package-level variables of other packages that
 	// now point into their package's flags struct, whose assignments go.
 	pkgFlagVars map[types.Object]bool
@@ -248,6 +251,7 @@ func Convert(prog *Program, opts Options) (*Result, error) {
 		tagged:         map[*types.Var]bool{},
 		pureCalls:      map[*types.Func]bool{},
 		pkgFlagVars:    map[types.Object]bool{},
+		unmapped:       map[string]bool{},
 		funcWork:       map[*types.Func]bool{},
 		hooks:          map[*types.Named]*hookSet{},
 		valueEmbeds:    map[*types.Var]bool{},
@@ -290,8 +294,11 @@ func Convert(prog *Program, opts Options) (*Result, error) {
 	}
 
 	fatal := false
+	// A loop the interpreter unrolls meets the same escape once per value.
+	reported := map[escape]bool{}
 	for _, e := range c.g.in.escapes {
-		if e.report {
+		if e.report && !reported[e] {
+			reported[e] = true
 			c.issue(e.pos, "%s", e.what)
 		}
 		fatal = fatal || e.fatal
@@ -1207,9 +1214,27 @@ func (c *converter) convertConstructors() {
 		fns = append(fns, fn)
 	}
 	sort.Slice(fns, func(i, j int) bool { return fns[i].FullName() < fns[j].FullName() })
+	// Commands sharing a type share its hook, so their constructors must set
+	// it up the same way.
+	setups := map[*types.Named]*ctorInfo{}
+	setup := func(ci *ctorInfo) string {
+		var lines []string
+		for _, it := range ci.items {
+			if it.kind == ctorResidue || it.kind == ctorCrossRef {
+				lines = append(lines, it.text)
+			}
+		}
+		return strings.Join(lines, "\n")
+	}
 	for _, fn := range fns {
 		ci := c.ctors[fn]
 		ok := true
+		if other := setups[ci.inst]; other != nil && setup(other) != setup(ci) {
+			c.issue(ci.decl.pkg.position(ci.decl.decl), "constructors %s and %s set up %s differently, but the commands share one hook; set them up by hand", other.fn.Name(), fn.Name(), ci.inst.Obj().Name())
+			ok = false
+		} else if other == nil {
+			setups[ci.inst] = ci
+		}
 		deletable, _ := c.deletableStmts(ci.decl.pkg, ci.decl.decl.Body)
 		// The hook sets injected fields after the other ones, so a field
 		// set both ways would end with the wrong value.

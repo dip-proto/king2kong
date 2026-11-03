@@ -1657,13 +1657,12 @@ func (c *converter) parserArgs(name, help dst.Expr) []dst.Expr {
 	if c.commandVars {
 		args = append(args, callOf(c.compatIdent("CommandVars")))
 	}
-	if len(mp.binds) > 0 {
-		var binds []dst.Expr
-		for _, b := range mp.binds {
-			binds = append(binds, dst.Clone(b).(dst.Expr))
-		}
-		args = append(args, callOf(kongIdent("Bind"), binds...))
+	var binds []dst.Expr
+	var typs []types.Type
+	for i, b := range mp.binds {
+		binds, typs = append(binds, dst.Clone(b).(dst.Expr)), append(typs, mp.bound[i].Type())
 	}
+	args = append(args, bindCalls(binds, typs, c.tree.RootPkg.PkgPath, kongOption)...)
 	if mp.exit != nil {
 		args = append(args, callOf(kongIdent("Exit"), exitFunc(dst.Clone(mp.exit).(dst.Expr))))
 	}

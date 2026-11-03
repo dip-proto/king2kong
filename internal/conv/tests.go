@@ -185,8 +185,8 @@ func (t *testConversion) convert(f *dst.File, name string) (string, error) {
 				}
 			}
 		case *dst.Ident:
-			if n.Path != "" && c.prog.isKingpinPath(n.Path) && exports[n.Name] {
-				n.Path = c.compatPath
+			if n.Path != "" && c.prog.isKingpinPath(n.Path) {
+				c.compatName(p, n, exports)
 			} else if n.Path == "" {
 				if o := p.objectOf(n); o != nil {
 					if v, ok := o.(*types.Var); ok && v.IsField() {
@@ -310,16 +310,15 @@ func (t *testConversion) newApplication(f *dst.File, call *dst.CallExpr) dst.Exp
 	}
 	args := append([]dst.Expr{&dst.UnaryExpr{Op: token.AND, X: cli}}, call.Args...)
 	var binds []dst.Expr
+	var typs []types.Type
 	for _, typ := range c.injected {
 		// The tests are type-checked apart: types compare by name.
 		want := types.TypeString(typ, nil)
 		if v := onlyVarAt(t.p, call, func(v *types.Var) bool { return types.TypeString(v.Type(), nil) == want }); v != nil {
-			binds = append(binds, dst.NewIdent(v.Name()))
+			binds, typs = append(binds, dst.NewIdent(v.Name())), append(typs, typ)
 		}
 	}
-	if len(binds) > 0 {
-		args = append(args, callOf(kongIdent("Bind"), binds...))
-	}
+	args = append(args, bindCalls(binds, typs, t.p.PkgPath, kongOption)...)
 	args = append(args, c.newOptions(c.tree.RootPkg.PkgPath)...)
 	return callOf(c.compatIdent("New"), args...)
 }
@@ -551,7 +550,13 @@ func (t *testConversion) bindAtCall(cur *dstutil.Cursor, s dst.Stmt) {
 		return
 	}
 	appExpr, binds := t.c.sharedArgs(t.p, cur, s, call, app, bound, params)
-	cur.InsertBefore(&dst.ExprStmt{X: callOf(&dst.SelectorExpr{X: appExpr, Sel: dst.NewIdent("Bind")}, binds...)})
+	var typs []types.Type
+	for _, i := range bound {
+		typs = append(typs, params.At(i).Type())
+	}
+	for _, b := range bindCalls(binds, typs, t.p.PkgPath, methodOn(appExpr)) {
+		cur.InsertBefore(&dst.ExprStmt{X: b})
+	}
 }
 
 // onlyTests reports whether the Go files of dir are all tests.

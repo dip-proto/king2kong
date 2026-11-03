@@ -506,6 +506,9 @@ func (c *converter) dropUnusedIn(p *Package, body *dst.BlockStmt) bool {
 			return false
 		}
 		if o := p.objectOf(id); o != nil {
+			if c.boundLater(o) {
+				return false
+			}
 			return reads[o] <= 1 && byName[id.Name] == 0
 		}
 		return byName[id.Name] <= 1
@@ -936,7 +939,7 @@ func (c *converter) pruneDeadUses(p *Package, list []dst.Stmt, dead map[types.Ob
 // its own declaration statement.
 func (c *converter) unusedOutside(p *Package, id *dst.Ident, list []dst.Stmt, decl dst.Stmt) bool {
 	obj := p.objectOf(id)
-	if obj == nil {
+	if obj == nil || c.boundLater(obj) {
 		return false
 	}
 	used := false
@@ -952,6 +955,13 @@ func (c *converter) unusedOutside(p *Package, id *dst.Ident, list []dst.Stmt, de
 		})
 	}
 	return !used
+}
+
+// boundLater reports whether the parser, written after cleanup, binds o for
+// the hooks.
+func (c *converter) boundLater(o types.Object) bool {
+	v, ok := o.(*types.Var)
+	return ok && c.main != nil && slices.Contains(c.main.bound, v)
 }
 
 func (c *converter) pureAssign(p *Package, s *dst.AssignStmt) bool {

@@ -551,6 +551,13 @@ func (p *Plan) tagFor(b *binding, fieldName string) *kongtag.Tag {
 	case isSlice && (len(c.defaults) > 1 || !p.g.prog.kingpinV3 && (c.hasEnvar || defaultEnvar(c) != "")):
 		sep = "\n"
 	}
+	// A map takes one key=value per flag, so its defaults and kingpin v2's
+	// newline-separated environment entries need a separator of their own.
+	isMap := strings.TrimSuffix(c.bind, "Var") == "StringMap"
+	mapSep := "none"
+	if isMap && (len(c.defaults) > 1 || !p.g.prog.kingpinV3 && (c.hasEnvar || defaultEnvar(c) != "")) {
+		mapSep = "\n"
+	}
 	if isSlice && p.g.prog.kingpinV3 && (c.hasEnvar || defaultEnvar(c) != "") && !c.hasSep {
 		p.issue(c.pos, "%s %q: kingpin split its environment variable on %q, kong takes it whole", c.kind, c.name, string(os.PathListSeparator))
 	}
@@ -580,7 +587,10 @@ func (p *Plan) tagFor(b *binding, fieldName string) *kongtag.Tag {
 		t.Set("default", "${"+p.runtimeVar(c, "default", c.defaultExpr)+"}")
 	} else if c.hasDefault {
 		joined := c.defaults[0]
-		if sep != "none" {
+		switch {
+		case isMap && mapSep != "none":
+			joined = strings.Join(c.defaults, "\n")
+		case sep != "none":
 			joined = strings.Join(c.defaults, sep)
 		}
 		t.Set("default", kongtag.Interpolated(joined))
@@ -639,7 +649,7 @@ func (p *Plan) tagFor(b *binding, fieldName string) *kongtag.Tag {
 		t.Set("type", "existingdir")
 	case "StringMap":
 		// kingpin took one key=value per flag; kong also splits on ";".
-		t.Set("mapsep", "none")
+		t.Set("mapsep", mapSep)
 	}
 	if c.hidden {
 		t.Flag("hidden")

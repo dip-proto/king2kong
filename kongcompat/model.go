@@ -362,7 +362,10 @@ func clause(v *kong.Value, short rune, placeholder string, hidden bool) *ClauseM
 	}
 	if v.HasDefault && !emptyEnumDefault(v) {
 		c.Default = []string{v.Default}
-		if cumulative(v) && v.Tag.Sep != -1 {
+		switch {
+		case v.IsMap() && v.Tag.MapSep != -1:
+			c.Default = strings.Split(v.Default, string(v.Tag.MapSep))
+		case cumulative(v) && v.Tag.Sep != -1:
 			c.Default = strings.Split(v.Default, string(v.Tag.Sep))
 		}
 	}
