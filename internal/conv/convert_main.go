@@ -657,8 +657,11 @@ func (c *converter) rewriteMain() {
 					if call, ok := unparen(n.X).(*dst.CallExpr); ok {
 						read[call] = n.Sel.Name
 					}
-					if p != root && c.adaptErrors(p, n) {
-						c.ed.touch(p, f)
+					if p != root {
+						c.reportMethodValue(p, cur, n)
+						if c.adaptErrors(p, n) {
+							c.ed.touch(p, f)
+						}
 					}
 				case *dst.CallExpr:
 					// Calls in other packages also drop the arguments of
@@ -775,6 +778,22 @@ func (c *converter) rewriteGlobals(p *Package, gd *dst.GenDecl) bool {
 	return changed
 }
 
+// reportMethodValue reports an app method used as a value, as in
+// usage := app.Usage, since the kong parser doesn't have it.
+// Errorf, Fatalf and FatalIfError are handled by adaptErrors.
+func (c *converter) reportMethodValue(p *Package, cur *dstutil.Cursor, sel *dst.SelectorExpr) {
+	if call, ok := cur.Parent().(*dst.CallExpr); ok && call.Fun == dst.Expr(sel) {
+		return
+	}
+	switch sel.Sel.Name {
+	case "Errorf", "Fatalf", "FatalIfError":
+		return
+	}
+	if s := p.selection(sel); s != nil && s.Kind() == types.MethodVal && c.isAppType(s.Recv()) {
+		c.issue(p.position(sel), "%s is used as a value, but the kong parser has no such method; rewrite it by hand", render(sel))
+	}
+}
+
 // adaptErrors routes the application's Errorf, Fatalf and FatalIfError
 // through kongcompat.Errors, whether they are called or used as values.
 // kong's methods with the same names print and exit a little differently,
@@ -855,6 +874,7 @@ func (c *converter) rewriteNode(p *Package, cur *dstutil.Cursor) bool {
 			n.X = pathExpr(r.path)
 			return true
 		}
+		c.reportMethodValue(p, cur, n)
 		return c.adaptErrors(p, n)
 	case *dst.Ident:
 		// Only the names being declared stay; their uses are replaced.
@@ -1059,9 +1079,24 @@ func (c *converter) declareParsers(p *Package, f *dst.File) bool {
 		if !ok || fd.Body == nil || c.ed.removed[d] {
 			continue
 		}
-		// Parsers declared in this function so far, which type information
-		// does not know about.
-		declared := map[string]bool{}
+		// With a goto around, a new variable could be jumped over, so the
+		// parser is built inside the call instead.
+		//
+		// The parser's name must not clash with any name in the function.
+		used := map[string]bool{}
+		hasGoto := false
+		dst.Inspect(fd.Body, func(n dst.Node) bool {
+			switch n := n.(type) {
+			case *dst.Ident:
+				used[n.Name] = true
+			case *dst.BranchStmt:
+				hasGoto = hasGoto || n.Tok == token.GOTO
+			}
+			return true
+		})
+		if hasGoto {
+			continue
+		}
 		fd.Body.List = insertBefore(fd.Body.List, func(s dst.Stmt, calls []*dst.CallExpr) []dst.Stmt {
 			i := slices.IndexFunc(calls, func(call *dst.CallExpr) bool {
 				_, ok := call.Fun.(*dst.Ident)
@@ -1070,8 +1105,8 @@ func (c *converter) declareParsers(p *Package, f *dst.File) bool {
 			if i < 0 {
 				return nil
 			}
-			name := c.freeLocalBesides(p, s, declared, "parser", "kongParser")
-			declared[name] = true
+			name := c.freeLocalBesides(p, s, used, "parser", "kongParser")
+			used[name] = true
 			if c.main.parsers == nil {
 				c.main.parsers = map[*dst.CallExpr]string{}
 			}

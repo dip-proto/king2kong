@@ -101,6 +101,7 @@ func (in *interp) findRoots() []*types.Func {
 			return true
 		})
 	}
+	order := in.initOrder()
 	// A function registering on an application it did not create, such as
 	// kingpin.CommandLine or a package-level one, also runs from its callers.
 	// That way, the statements calling it are known to build grammar.
@@ -113,10 +114,11 @@ func (in *interp) findRoots() []*types.Func {
 		}
 		seen[fn] = true
 		others := slices.DeleteFunc(slices.Clone(callers[fn]), func(c *types.Func) bool { return c == fn })
-		slices.SortFunc(others, funcOrder)
+		slices.SortFunc(others, order)
 		switch {
-		case len(others) == 0 && in.initCalled[fn]:
-			// runPackageVars already ran it, as in var verbose = flag().
+		case in.initCalled[fn] && !slices.ContainsFunc(others, func(c *types.Func) bool { return !in.initCalled[c] }):
+			// Package variable setup already ran it, as in
+			// var verbose = flag(), and nothing else calls it.
 		case len(others) > 0 && (returnsApp(fn) || makers[fn] && !creates[fn]):
 			for _, c := range others {
 				visit(c)
@@ -125,19 +127,47 @@ func (in *interp) findRoots() []*types.Func {
 			roots = append(roots, fn)
 		}
 	}
-	for _, fn := range slices.SortedFunc(maps.Keys(makers), funcOrder) {
+	for _, fn := range slices.SortedFunc(maps.Keys(makers), order) {
 		visit(fn)
 	}
 	return roots
 }
 
-// funcOrder gives functions a stable order, by full name and then by
-// position, since all init functions share a name.
-func funcOrder(a, b *types.Func) int {
-	if a.FullName() != b.FullName() {
-		return strings.Compare(a.FullName(), b.FullName())
+// initOrder sorts functions in the order Go sets the program up.
+// Packages come after the ones they import.
+// Within a package, init functions come first, in source order, then the
+// rest by name.
+func (in *interp) initOrder() func(a, b *types.Func) int {
+	rank := map[*types.Package]int{}
+	var visit func(p *types.Package)
+	visit = func(p *types.Package) {
+		if _, seen := rank[p]; seen {
+			return
+		}
+		rank[p] = -1
+		for _, imp := range p.Imports() {
+			visit(imp)
+		}
+		rank[p] = len(rank)
 	}
-	return cmp.Compare(a.Pos(), b.Pos())
+	for _, p := range in.prog.Packages {
+		visit(p.Types)
+	}
+	return func(a, b *types.Func) int {
+		if c := cmp.Compare(rank[a.Pkg()], rank[b.Pkg()]); c != 0 {
+			return c
+		}
+		if ai, bi := a.Name() == "init", b.Name() == "init"; ai != bi {
+			if ai {
+				return -1
+			}
+			return 1
+		}
+		if a.FullName() != b.FullName() {
+			return strings.Compare(a.FullName(), b.FullName())
+		}
+		return cmp.Compare(a.Pos(), b.Pos())
+	}
 }
 
 // resolveInstances links each command to the struct that represents it.

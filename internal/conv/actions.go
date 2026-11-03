@@ -25,8 +25,8 @@ func (c *converter) convertActions() {
 	for _, n := range c.tree.nodes {
 		var calls []string
 		for _, fn := range n.cl.actions {
-			// A function given to Action through a variable, as in
-			// action := run, is used where that variable is too.
+			// A function passed to Action through a variable, as in
+			// action := run, may also be called through that variable.
 			used, direct := elsewhere[fn.fn]
 			if call := c.convertAction(n, fn, used || !direct); call != "" {
 				calls = append(calls, call)
@@ -224,11 +224,21 @@ func (c *converter) usedElsewhere() map[*types.Func]bool {
 		for _, f := range p.Syntax {
 			dst.Inspect(f, func(node dst.Node) bool {
 				call, ok := node.(*dst.CallExpr)
-				if !ok || len(call.Args) != 1 {
+				if !ok {
 					return true
 				}
-				if sel, ok := call.Fun.(*dst.SelectorExpr); ok && sel.Sel.Name == "Action" && c.prog.isKingpinType(p.typeOf(sel.X)) {
-					if fn, ok := p.objectOf(unparen(call.Args[0])).(*types.Func); ok {
+				sel, ok := call.Fun.(*dst.SelectorExpr)
+				if !ok || sel.Sel.Name != "Action" || !c.prog.isKingpinType(p.typeOf(sel.X)) {
+					return true
+				}
+				args := call.Args
+				// In (*kingpin.CmdClause).Action(cmd, run) the clause comes
+				// first.
+				if s := p.selection(sel); s != nil && s.Kind() == types.MethodExpr && len(args) > 0 {
+					args = args[1:]
+				}
+				if len(args) == 1 {
+					if fn, ok := p.objectOf(unparen(args[0])).(*types.Func); ok {
 						registered[fn]++
 					}
 				}

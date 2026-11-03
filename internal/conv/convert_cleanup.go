@@ -120,7 +120,7 @@ func setHeader(cur *dstutil.Cursor, s dst.Stmt) bool {
 
 // labelJumps maps each label of body to the kinds of branch statements,
 // such as break or goto, that jump to it.
-// Only the branch statements keep accepts count.
+// Only branch statements accepted by keep are counted.
 func labelJumps(body *dst.BlockStmt, keep func(*dst.BranchStmt) bool) map[string]map[token.Token]bool {
 	jumps := map[string]map[token.Token]bool{}
 	dst.Inspect(body, func(n dst.Node) bool {

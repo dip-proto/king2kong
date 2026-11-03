@@ -97,6 +97,15 @@ func (c *converter) convertTree() {
 	for _, ch := range t.Root.children {
 		rootTaken[ch.field] = true
 	}
+	// The struct holding the app's flags is embedded under its type name,
+	// so no flag field may use that name.
+	for _, b := range c.appFlagBindings() {
+		if b.holder != nil {
+			if named, ok := b.holder.typ.(*types.Named); ok {
+				rootTaken[named.Obj().Name()] = true
+			}
+		}
+	}
 	rootStorage := c.storageFields(t.Root, root.Types, imports, c.cliVar, rootTaken)
 	if c.main != nil {
 		c.prepareMain(rootTaken)

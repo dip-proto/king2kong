@@ -206,6 +206,16 @@ type hookSet struct {
 	outer map[string]bool
 }
 
+// paramOfType returns the name of the parameter of type typ, or "".
+func (h *hookSet) paramOfType(typ string) string {
+	for n, t := range h.beforeParams {
+		if t == typ {
+			return n
+		}
+	}
+	return ""
+}
+
 // param adds a parameter to the BeforeApply hook and returns its name, with a
 // number appended when a parameter of another type already uses it.
 func (h *hookSet) param(name, typ string) string {
@@ -1277,7 +1287,14 @@ func (c *converter) convertConstructors() {
 				continue
 			}
 		}
-		pname := h.param(paramName(param.Name()), typeExpr(param.Type(), pkg, h.imports))
+		// kong passes hook values by type, so two values of the same type
+		// can't be told apart.
+		typ := typeExpr(param.Type(), pkg, h.imports)
+		if other := h.paramOfType(typ); other != "" && other != paramName(param.Name()) {
+			c.issue(list[0].ci.decl.pkg.position(list[0].ci.decl.decl), "constructor %s stores two %s values, %s and %s, which kong cannot tell apart; set %s by hand", list[0].ci.fn.Name(), typ, other, param.Name(), c.finalName(f))
+			continue
+		}
+		pname := h.param(paramName(param.Name()), typ)
 		h.before = append(h.before, fmt.Sprintf("%s.%s = %s", c.recvPlaceholder, c.finalName(f), pname))
 		if c.main == nil {
 			c.addInjected(param.Type())

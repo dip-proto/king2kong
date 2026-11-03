@@ -589,6 +589,9 @@ func (p *Plan) tagFor(b *binding, fieldName string) *kongtag.Tag {
 		// kingpin leaves the value empty when the flag is absent.
 		t.Set("default", "")
 	}
+	if slices.ContainsFunc(c.enum, func(v string) bool { return strings.Contains(v, ",") }) {
+		p.issue(c.pos, "%s %q: an enum value contains a comma, which kong's enum tag would split; check the values by hand", c.kind, c.name)
+	}
 	if len(c.enum) > 0 && !hookEnum {
 		vals := append([]string{}, c.enum...)
 		if !c.required && !c.hasDefault && !isSlice {

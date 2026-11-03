@@ -302,6 +302,8 @@ func (in *interp) kingpinMethod(fr *frame, c *dst.CallExpr, cl *clause, name str
 				}
 				cl.defaults = append(cl.defaults, s)
 			}
+			// Default with no values, as with an empty slice, sets none.
+			cl.hasDefault = len(cl.defaults) > 0
 			return self
 		case "PlaceHolder":
 			if s, ok := str(0); ok {

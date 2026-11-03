@@ -16,7 +16,7 @@ import (
 // convertVars gives kong the defaults and help texts only known at run
 // time, which the tags refer to as ${name}.
 // When the parser is built in main, the ones main can compute go in a
-// kong.Vars option.
+// kongcompat.Vars option.
 // The others go in a Vars method on the command type, or on a type it
 // embeds, in a package that can compute them.
 // kongcompat reads these methods when it builds the parser.
@@ -37,9 +37,16 @@ func (c *converter) convertVars() {
 	}
 	var hosted []runtimeVar
 	for _, n := range c.tree.nodes {
+		// A command hosts its own help and the help of its flags, not the
+		// help of its subcommands.
 		var vars []runtimeVar
+		if n.cl.kind == kindCommand {
+			vars = append(vars, byClause[n.cl]...)
+		}
 		for _, ch := range n.cl.children {
-			vars = append(vars, byClause[ch]...)
+			if ch.kind != kindCommand {
+				vars = append(vars, byClause[ch]...)
+			}
 		}
 		if len(vars) == 0 {
 			continue

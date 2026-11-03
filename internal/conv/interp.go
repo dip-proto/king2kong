@@ -72,9 +72,11 @@ type interp struct {
 	// evaluations counts the run-time defaults and help texts seen so far.
 	evaluations int
 	executed    map[dst.Stmt]bool
-	// initCalled are the functions that package-level initializers call.
-	// runPackageVars has already run them.
+	// initCalled are the functions that already ran while setting up
+	// package variables.
+	// inInit is true during that setup.
 	initCalled map[*types.Func]bool
+	inInit     bool
 	// globalWrites is the last value stored in each package-level variable.
 	// Unlike globals, it keeps any kind of value, such as what a flag's
 	// variable starts with.
@@ -310,15 +312,8 @@ func (in *interp) runPackageVars() {
 			return len(order)
 		}
 		slices.SortStableFunc(specs, func(a, b *dst.ValueSpec) int { return cmp.Compare(rank(a), rank(b)) })
+		in.inInit = true
 		for _, vs := range specs {
-			dst.Inspect(vs, func(n dst.Node) bool {
-				if c, ok := n.(*dst.CallExpr); ok {
-					if fn := in.staticCallee(p, c); fn != nil {
-						in.initCalled[fn] = true
-					}
-				}
-				return true
-			})
 			var vals []value
 			if len(vs.Values) == 1 && len(vs.Names) > 1 {
 				vals = in.multi(fr, vs.Values[0])
@@ -334,6 +329,7 @@ func (in *interp) runPackageVars() {
 				}
 			}
 		}
+		in.inInit = false
 	}
 }
 
@@ -431,6 +427,18 @@ func (in *interp) stmt(fr *frame, s dst.Stmt) {
 	case *dst.ForStmt, *dst.SwitchStmt, *dst.TypeSwitchStmt, *dst.SelectStmt, *dst.GoStmt, *dst.DeferStmt:
 		if in.mentionsBuilder(fr.pkg, s) {
 			in.escapes = append(in.escapes, escape{pos: fr.pkg.position(s), what: "kingpin registration inside a loop, switch, defer or goroutine, which the tool does not follow", report: true})
+		}
+		// We don't step into it, but if it parses, the values flag
+		// variables start with are the ones they hold now.
+		parses := false
+		dst.Inspect(s, func(n dst.Node) bool {
+			if c, ok := n.(*dst.CallExpr); ok && calleeName(c) == "Parse" && in.isKingpinCall(fr.pkg, c) {
+				parses = true
+			}
+			return !parses
+		})
+		if parses {
+			in.takePriors()
 		}
 	case *dst.LabeledStmt:
 		in.stmt(fr, s.Stmt)
@@ -1016,7 +1024,7 @@ func (in *interp) binary(fr *frame, b *dst.BinaryExpr) value {
 		op = token.QUO_ASSIGN
 	}
 	defer func() { _ = recover() }()
-	return vConst{constant.BinaryOp(xc.c, op, yc.c), t}
+	return fitType(constant.BinaryOp(xc.c, op, yc.c), t)
 }
 
 // convertConst converts a constant to the numeric, string or boolean type t,
@@ -1035,18 +1043,52 @@ func convertConst(v value, t types.Type) value {
 	info := basic.Info()
 	switch {
 	case info&types.IsInteger != 0 && isNumeric(c.c):
-		if n := constant.ToInt(c.c); n.Kind() == constant.Int {
-			return vConst{n, t}
+		n := constant.ToInt(c.c)
+		if n.Kind() != constant.Int {
+			f, _ := constant.Float64Val(c.c)
+			n = constant.MakeInt64(int64(f))
 		}
-		f, _ := constant.Float64Val(c.c)
-		return vConst{constant.MakeInt64(int64(f)), t}
+		return fitType(n, t)
 	case info&types.IsFloat != 0 && isNumeric(c.c):
-		return vConst{constant.ToFloat(c.c), t}
+		return fitType(constant.ToFloat(c.c), t)
 	case info&types.IsString != 0 && c.c.Kind() == constant.String,
 		info&types.IsBoolean != 0 && c.c.Kind() == constant.Bool:
 		return vConst{c.c, t}
 	}
 	return vUnknown{}
+}
+
+// fitType returns v the way a variable of type t would hold it.
+// A float32 is rounded, and a sized integer wraps around, as Go does.
+func fitType(v constant.Value, t types.Type) value {
+	b, ok := typeUnder(t).(*types.Basic)
+	if !ok || b.Info()&types.IsUntyped != 0 {
+		return vConst{v, t}
+	}
+	switch {
+	case b.Kind() == types.Float32:
+		f, _ := constant.Float64Val(constant.ToFloat(v))
+		return vConst{constant.MakeFloat64(float64(float32(f))), t}
+	case b.Info()&types.IsInteger != 0:
+		bits := map[types.BasicKind]uint{types.Int8: 8, types.Int16: 16, types.Int32: 32, types.Uint8: 8, types.Uint16: 16, types.Uint32: 32}[b.Kind()]
+		if bits == 0 {
+			bits = 64
+		}
+		v = constant.ToInt(v)
+		if v.Kind() != constant.Int {
+			return vUnknown{}
+		}
+		mod := constant.Shift(constant.MakeInt64(1), token.SHL, bits)
+		v = constant.BinaryOp(v, token.REM, mod)
+		if constant.Sign(v) < 0 {
+			v = constant.BinaryOp(v, token.ADD, mod)
+		}
+		half := constant.Shift(constant.MakeInt64(1), token.SHL, bits-1)
+		if b.Info()&types.IsUnsigned == 0 && !constant.Compare(v, token.LSS, half) {
+			v = constant.BinaryOp(v, token.SUB, mod)
+		}
+	}
+	return vConst{v, t}
 }
 
 func isUntyped(t types.Type) bool {
@@ -1275,6 +1317,9 @@ func simpleBody(fd *dst.FuncDecl) bool {
 }
 
 func (in *interp) inline(fr *frame, c *dst.CallExpr, fd funcDecl, fn *types.Func, recv value, args []value, packed bool) []value {
+	if in.inInit {
+		in.initCalled[fn] = true
+	}
 	count := 0
 	for _, s := range in.stack {
 		if s == fn {

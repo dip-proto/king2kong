@@ -1,6 +1,7 @@
 package kongcompat
 
 import (
+	"cmp"
 	"io"
 	"reflect"
 	"strings"
@@ -296,23 +297,33 @@ func newCmdClause(n *kong.Node) *CmdClause {
 	return &CmdClause{node: n, cmdMixin: cmdMixin{&flagGroup{long}}}
 }
 
-// CommandOf returns the command whose struct has the type of cmd, or nil.
-// cmd may be a pointer, such as the *BuildCommand a constructor returned.
+// CommandOf returns the command whose struct is cmd, or nil.
+//
+// Pass a pointer, such as the *BuildCommand a constructor returned, to tell
+// apart commands that share a type.
+// Otherwise the first command of that type is returned.
 func (a *Application) CommandOf(cmd any) *CmdClause {
+	v := reflect.ValueOf(cmd)
 	t := reflect.TypeOf(cmd)
 	if t != nil && t.Kind() == reflect.Pointer {
 		t = t.Elem()
 	}
-	var found *kong.Node
+	var byType, same *kong.Node
 	nodes(a.Kong.Model.Node, func(n *kong.Node) {
-		if found == nil && n.Type == kong.CommandNode && n.Target.IsValid() && n.Target.Type() == t {
-			found = n
+		if n.Type != kong.CommandNode || !n.Target.IsValid() || n.Target.Type() != t {
+			return
+		}
+		if byType == nil {
+			byType = n
+		}
+		if same == nil && v.Kind() == reflect.Pointer && n.Target.CanAddr() && n.Target.Addr().Pointer() == v.Pointer() {
+			same = n
 		}
 	})
-	if found == nil {
-		return nil
+	if found := cmp.Or(same, byType); found != nil {
+		return newCmdClause(found)
 	}
-	return newCmdClause(found)
+	return nil
 }
 
 // FullCommand returns the command's full name, as CommandName does.
