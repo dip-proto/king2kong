@@ -36,44 +36,7 @@ func (c *converter) convertRuntime() {
 	c.pointRemovedCalls()
 	c.declareListCLIs()
 	exports := c.compatExports()
-	// A hook value is bound where the program passes it, as in
-	// Define(app, cfg).
-	// Otherwise it is bound at kingpin.New, if a variable of its type is
-	// in scope there.
-	var passed []types.Type
-	for _, p := range c.prog.Packages {
-		for _, f := range p.Syntax {
-			dst.Inspect(f, func(n dst.Node) bool {
-				if s, ok := n.(dst.Stmt); ok {
-					if call := stmtCall(s); call != nil {
-						params, _, bound := c.atCall(p, call)
-						for _, i := range bound {
-							passed = append(passed, params.At(i).Type())
-						}
-					}
-				}
-				return true
-			})
-		}
-	}
-	for _, p := range c.prog.Packages {
-		for _, f := range p.Syntax {
-			dst.Inspect(f, func(n dst.Node) bool {
-				call, ok := n.(*dst.CallExpr)
-				if !ok {
-					return true
-				}
-				if id, ok := call.Fun.(*dst.Ident); ok && id.Name == "New" && c.prog.isKingpinPath(id.Path) {
-					for _, t := range c.injected {
-						if !containsType(passed, t) && c.variableOfType(p, call, t) != nil {
-							c.boundAtNew = append(c.boundAtNew, t)
-						}
-					}
-				}
-				return true
-			})
-		}
-	}
+	c.bindAtNew()
 	for _, p := range c.prog.Packages {
 		c.applyRuntime(p, func(cur *dstutil.Cursor) (bool, bool) {
 			if n, ok := cur.Node().(*dst.CallExpr); ok {
@@ -173,7 +136,67 @@ func (c *converter) applyRuntime(p *Package, pre, stmt func(*dstutil.Cursor) (bo
 	}
 }
 
-// bindAtCall adds app.Bind(cfg) before a call such as Define(app, cfg).
+// bindAtNew picks the hook values bound at kingpin.New: those a variable
+// in scope there holds, when it is also the value the program passes to
+// calls such as Define(app, cfg).
+// The others are bound at those calls.
+func (c *converter) bindAtNew() {
+	type passedValue struct {
+		t types.Type
+		v value
+	}
+	var passed []passedValue
+	for _, p := range c.prog.Packages {
+		for _, f := range p.Syntax {
+			dst.Inspect(f, func(n dst.Node) bool {
+				if s, ok := n.(dst.Stmt); ok {
+					if call := stmtCall(s); call != nil {
+						params, _, bound := c.atCall(p, call)
+						for _, i := range bound {
+							passed = append(passed, passedValue{params.At(i).Type(), c.g.in.paramVals[params.At(i)]})
+						}
+					}
+				}
+				return true
+			})
+		}
+	}
+	for _, p := range c.prog.Packages {
+		for _, f := range p.Syntax {
+			dst.Inspect(f, func(n dst.Node) bool {
+				call, ok := n.(*dst.CallExpr)
+				if !ok {
+					return true
+				}
+				id, ok := call.Fun.(*dst.Ident)
+				if !ok || id.Name != "New" || !c.prog.isKingpinPath(id.Path) {
+					return true
+				}
+				for _, t := range c.injected {
+					v := c.variableOfType(p, call, t)
+					if v == nil {
+						continue
+					}
+					held, ok := c.g.in.paramVals[v]
+					if !ok {
+						held = c.g.in.varVals[v]
+					}
+					same := !slices.ContainsFunc(passed, func(pv passedValue) bool {
+						eq, known := equalValues(held, pv.v)
+						return types.Identical(pv.t, t) && (!eq || !known)
+					})
+					if same {
+						c.boundAtNew = append(c.boundAtNew, t)
+					}
+				}
+				return true
+			})
+		}
+	}
+}
+
+// bindAtCall adds app.Bind(cfg) before a call such as Define(app, cfg),
+// for the values not bound at kingpin.New.
 func (c *converter) bindAtCall(p *Package, cur *dstutil.Cursor, s dst.Stmt) {
 	call := stmtCall(s)
 	if call == nil || cur.Index() < 0 {
@@ -301,13 +324,6 @@ func typeAt(t types.Type, from string) (dst.Expr, bool) {
 	case *types.Pointer:
 		elem, ok := typeAt(t.Elem(), from)
 		return &dst.StarExpr{X: elem}, ok
-	case *types.Slice:
-		elem, ok := typeAt(t.Elem(), from)
-		return &dst.ArrayType{Elt: elem}, ok
-	case *types.Map:
-		key, ok1 := typeAt(t.Key(), from)
-		elem, ok2 := typeAt(t.Elem(), from)
-		return &dst.MapType{Key: key, Value: elem}, ok1 && ok2
 	}
 	return nil, false
 }

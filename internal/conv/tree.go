@@ -237,12 +237,17 @@ func (p *Plan) embeddedTypes() map[*types.Named]bool {
 	return out
 }
 
+// generatedMethods returns the methods the conversion may add to a command
+// struct, as names its fields must not take.
+func generatedMethods() map[string]bool {
+	return map[string]bool{"Hints": true, "Vars": true, "BeforeApply": true, "AfterApply": true}
+}
+
 // nameFields picks each command's field name in its parent container and
 // renders its tag.
 func (p *Plan) nameFields(t *Tree) {
 	for _, n := range t.nodes {
-		// Methods the conversion may add to the struct.
-		taken := map[string]bool{"Hints": true, "Vars": true, "BeforeApply": true, "AfterApply": true}
+		taken := generatedMethods()
 		if n.containerOwn && n.typ != nil {
 			// An unexported field may get exported later, like config to
 			// Config.

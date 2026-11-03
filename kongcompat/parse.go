@@ -148,12 +148,10 @@ func Parse(k *kong.Kong, args []string, uc *UsageContext) (string, error) {
 		return "", err
 	}
 	// keepUnselected goes first and clears the variables of unselected
-	// values, so hideEnvars never looks them up.
+	// values, so readLikeKingpin never looks them up.
 	keep := keepUnselected(k, path)
-	restore := hideEnvars(k, scanned.given)
-	restoreGiven := takeGiven(scanned.given)
+	restore := readLikeKingpin(k, scanned.given)
 	kctx, err := k.Parse(args)
-	restoreGiven()
 	restore()
 	keep()
 	if err != nil {
@@ -214,15 +212,23 @@ func keepUnselected(k *kong.Kong, path []*kong.Node) (restore func()) {
 	}
 }
 
-// hideEnvars stops kong from reading the environment variables kingpin
-// ignored, until restore is called.
-// kingpin treated an empty variable as unset, and never read the variable of
-// a value given on the command line, so a bad variable could not break a
-// command line that overrides it.
+// readLikeKingpin makes kong read values the way kingpin did, until restore
+// is called.
+// kingpin ignored empty environment variables, and those of values given on
+// the command line, so a bad variable could not break a command line that
+// overrides it.
+// It also ignored the defaults of given values, and only split environment
+// variables and default lists at newlines, never a given value.
 // Only the parser's view changes, the environment is left as is.
-func hideEnvars(k *kong.Kong, given map[*kong.Value]bool) (restore func()) {
-	saved := map[*kong.Value][]string{}
+func readLikeKingpin(k *kong.Kong, given map[*kong.Value]bool) (restore func()) {
+	type saved struct {
+		envs        []string
+		hasDefault  bool
+		sep, mapSep rune
+	}
+	changed := map[*kong.Value]saved{}
 	values(k.Model.Node, func(v *kong.Value) {
+		before := saved{v.Tag.Envs, v.HasDefault, v.Tag.Sep, v.Tag.MapSep}
 		var keep []string
 		for _, e := range v.Tag.Envs {
 			if val, ok := os.LookupEnv(e); !ok || val != "" && !given[v] {
@@ -230,42 +236,23 @@ func hideEnvars(k *kong.Kong, given map[*kong.Value]bool) (restore func()) {
 			}
 		}
 		if len(keep) != len(v.Tag.Envs) {
-			saved[v] = v.Tag.Envs
 			v.Tag.Envs = keep
+			changed[v] = before
+		}
+		if given[v] {
+			v.HasDefault = false
+			if v.Tag.Sep == '\n' {
+				v.Tag.Sep = -1
+			}
+			if v.Tag.MapSep == '\n' {
+				v.Tag.MapSep = -1
+			}
+			changed[v] = before
 		}
 	})
 	return func() {
-		for v, envs := range saved {
-			v.Tag.Envs = envs
-		}
-	}
-}
-
-// takeGiven makes kong read the values given on the command line the way
-// kingpin did, until restore is called.
-// Their defaults are ignored, so a bad one is no error.
-// They are not split at newlines either: only environment variables and
-// default lists are.
-func takeGiven(given map[*kong.Value]bool) (restore func()) {
-	type saved struct {
-		v           *kong.Value
-		hasDefault  bool
-		sep, mapSep rune
-	}
-	var changed []saved
-	for v := range given {
-		changed = append(changed, saved{v, v.HasDefault, v.Tag.Sep, v.Tag.MapSep})
-		v.HasDefault = false
-		if v.Tag.Sep == '\n' {
-			v.Tag.Sep = -1
-		}
-		if v.Tag.MapSep == '\n' {
-			v.Tag.MapSep = -1
-		}
-	}
-	return func() {
-		for _, s := range changed {
-			s.v.HasDefault, s.v.Tag.Sep, s.v.Tag.MapSep = s.hasDefault, s.sep, s.mapSep
+		for v, s := range changed {
+			v.Tag.Envs, v.HasDefault, v.Tag.Sep, v.Tag.MapSep = s.envs, s.hasDefault, s.sep, s.mapSep
 		}
 	}
 }
@@ -478,14 +465,7 @@ func checkDefault(v *kong.Value) error {
 	if !ok {
 		return nil
 	}
-	texts := []string{text}
-	switch {
-	case v.Target.Kind() == reflect.Slice && v.Tag.Sep != -1:
-		texts = kong.SplitEscaped(text, v.Tag.Sep)
-	case v.Target.Kind() == reflect.Map && v.Tag.MapSep != -1:
-		texts = kong.SplitEscaped(text, v.Tag.MapSep)
-	}
-	for _, t := range texts {
+	for _, t := range valueParts(v, text) {
 		if err := checkValue(v, t); err != nil {
 			return err
 		}

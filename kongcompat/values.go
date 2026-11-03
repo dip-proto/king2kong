@@ -21,8 +21,7 @@ func checkValue(v *kong.Value, value string) error {
 	if !v.Target.IsValid() || v.IsCounter() {
 		return nil
 	}
-	switch v.Tag.Type {
-	case "existingfile", "existingdir":
+	if isPath(v) {
 		return checkPath(value, v.Tag.Type == "existingdir")
 	}
 	t := v.Target.Type()

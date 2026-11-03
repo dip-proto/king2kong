@@ -69,7 +69,7 @@ func (c *converter) convertTree() {
 			continue
 		}
 		if n.typ == nil {
-			taken := map[string]bool{}
+			taken := generatedMethods()
 			for _, ch := range n.children {
 				taken[ch.field] = true
 			}
@@ -84,7 +84,8 @@ func (c *converter) convertTree() {
 			names[n] = c.freeName(root, unexported(c.prog.identFromName(strings.ReplaceAll(n.cl.fullName(), " ", "-")))+"Command")
 		}
 	}
-	rootTaken := map[string]bool{"Help": true}
+	rootTaken := generatedMethods()
+	rootTaken["Help"] = true
 	for _, ch := range t.Root.children {
 		rootTaken[ch.field] = true
 	}

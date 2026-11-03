@@ -361,18 +361,24 @@ func clause(v *kong.Value, short rune, placeholder string, hidden bool) *ClauseM
 		Cumulative:  cumulative(v),
 	}
 	if v.HasDefault && !emptyEnumDefault(v) {
-		c.Default = []string{v.Default}
-		switch {
-		case v.IsMap() && v.Tag.MapSep != -1:
-			c.Default = strings.Split(v.Default, string(v.Tag.MapSep))
-		case cumulative(v) && v.Tag.Sep != -1:
-			c.Default = strings.Split(v.Default, string(v.Tag.Sep))
-		}
+		c.Default = valueParts(v, v.Default)
 	}
 	if len(v.Tag.Envs) > 0 {
 		c.Envar = v.Tag.Envs[0]
 	}
 	return c
+}
+
+// valueParts splits a default or an environment variable into the values
+// of a list or a map.
+func valueParts(v *kong.Value, text string) []string {
+	switch {
+	case v.IsMap() && v.Tag.MapSep != -1:
+		return kong.SplitEscaped(text, v.Tag.MapSep)
+	case cumulative(v) && v.Tag.Sep != -1:
+		return kong.SplitEscaped(text, v.Tag.Sep)
+	}
+	return []string{text}
 }
 
 // emptyEnumDefault reports whether v is an optional enum with an empty

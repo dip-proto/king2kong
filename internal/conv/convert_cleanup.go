@@ -29,6 +29,10 @@ import (
 // functions that wired commands together.
 // Locals and results that only carried kingpin values or command lists go too.
 func (c *converter) cleanupWiring() {
+	dests := map[*types.Var]bool{}
+	for _, b := range c.plan.bindings {
+		dests[b.field] = true
+	}
 	for _, p := range c.prog.Packages {
 		for _, f := range p.Syntax {
 			for _, d := range f.Decls {
@@ -43,7 +47,7 @@ func (c *converter) cleanupWiring() {
 				if c.regOnly[fn] && fd.Name.Name != "init" {
 					// removeDeadCode takes care of it, but never of init.
 					for _, s := range fd.Body.List {
-						c.reportDroppedFields(p, fd, s)
+						c.reportDroppedFields(p, fd, s, dests)
 					}
 					continue
 				}
@@ -52,7 +56,7 @@ func (c *converter) cleanupWiring() {
 					for _, s := range fd.Body.List {
 						dst.Inspect(s, func(n dst.Node) bool {
 							if s, ok := n.(dst.Stmt); ok && (del[s] || lowered[s] != nil) {
-								c.reportDroppedFields(p, fd, s)
+								c.reportDroppedFields(p, fd, s, dests)
 								return false
 							}
 							return true
@@ -97,13 +101,8 @@ func (c *converter) cleanupWiring() {
 // reportDroppedFields reports the fields a deleted statement sets in a
 // command struct literal, like cfg in h := &hello{cfg: cfg}.
 // Those values are lost, so code reading them would see zero values.
-func (c *converter) reportDroppedFields(p *Package, fd *dst.FuncDecl, s dst.Stmt) {
-	if c.destFields == nil {
-		c.destFields = map[*types.Var]bool{}
-		for _, b := range c.plan.bindings {
-			c.destFields[b.field] = true
-		}
-	}
+// Flag and argument fields, in dests, get their values from kong.
+func (c *converter) reportDroppedFields(p *Package, fd *dst.FuncDecl, s dst.Stmt, dests map[*types.Var]bool) {
 	dst.Inspect(s, func(n dst.Node) bool {
 		if _, ok := n.(*dst.FuncLit); ok {
 			return false
@@ -126,7 +125,7 @@ func (c *converter) reportDroppedFields(p *Package, fd *dst.FuncDecl, s dst.Stmt
 			} else if i < st.NumFields() {
 				f = st.Field(i)
 			}
-			if f == nil || c.prog.isKingpinType(f.Type()) || c.destFields[f] || isZeroValue(p, val) || !c.fieldRead(f) {
+			if f == nil || c.prog.isKingpinType(f.Type()) || dests[f] || isZeroValue(p, val) || !c.fieldRead(f) {
 				continue
 			}
 			c.issue(p.position(el), "%s builds a %s with %s set, which goes away with the registration; set %s in a hook by hand", fd.Name.Name, t.Obj().Name(), f.Name(), f.Name())
@@ -138,23 +137,7 @@ func (c *converter) reportDroppedFields(p *Package, fd *dst.FuncDecl, s dst.Stmt
 // isZeroValue reports whether e is nil or a zero constant.
 func isZeroValue(p *Package, e dst.Expr) bool {
 	tv, ok := p.tv(e)
-	if !ok {
-		return false
-	}
-	if tv.IsNil() {
-		return true
-	}
-	switch v := tv.Value; {
-	case v == nil:
-		return false
-	case v.Kind() == constant.String:
-		return constant.StringVal(v) == ""
-	case v.Kind() == constant.Bool:
-		return !constant.BoolVal(v)
-	case v.Kind() == constant.Int || v.Kind() == constant.Float:
-		return constant.Sign(v) == 0
-	}
-	return false
+	return ok && (tv.IsNil() || tv.Value != nil && isZeroConst(vConst{tv.Value, tv.Type}))
 }
 
 // singleStmt merges list into one statement, for spots such as an if header
@@ -1039,7 +1022,7 @@ func (c *converter) unusedOutside(p *Package, id *dst.Ident, list []dst.Stmt, de
 // the hooks.
 func (c *converter) boundLater(o types.Object) bool {
 	v, ok := o.(*types.Var)
-	return ok && c.main != nil && slices.Contains(c.main.bound, v)
+	return ok && c.main != nil && slices.ContainsFunc(c.main.bound, func(b boundVar) bool { return b.v == v })
 }
 
 func (c *converter) pureAssign(p *Package, s *dst.AssignStmt) bool {

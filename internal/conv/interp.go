@@ -57,6 +57,9 @@ type interp struct {
 	structVars map[*types.Var]bool
 	// varVals is the last value stored in each local variable.
 	varVals map[types.Object]value
+	// paramVals is the value each parameter got, or vUnknown when calls
+	// passed different ones.
+	paramVals map[types.Object]value
 	// eltVals is the value of each element of the slice literals that ran,
 	// or vUnknown when it changed from one run to another.
 	eltVals map[dst.Expr]value
@@ -130,6 +133,7 @@ func newInterp(prog *Program) *interp {
 		structVars:   map[*types.Var]bool{},
 		specVals:     map[*dst.ValueSpec][]value{},
 		varVals:      map[types.Object]value{},
+		paramVals:    map[types.Object]value{},
 		valueCallees: map[*dst.CallExpr]*types.Func{},
 		globalWrites: map[*types.Var]value{},
 		initCalled:   map[*types.Func]bool{},
@@ -361,12 +365,23 @@ func (in *interp) bindUnknownParams(fr *frame, fd funcDecl) {
 			for _, nm := range f.Names {
 				if o := fd.pkg.objectOf(nm); o != nil {
 					fr.vars[o] = in.opaque(o.Type(), "param "+nm.Name)
+					in.recordParam(o, fr.vars[o])
 				}
 			}
 		}
 	}
 	bind(fd.decl.Recv)
 	bind(fd.decl.Type.Params)
+}
+
+func (in *interp) recordParam(o types.Object, v value) {
+	if prev, ok := in.paramVals[o]; ok {
+		if eq, known := equalValues(prev, v); !eq || !known {
+			in.paramVals[o] = vUnknown{}
+		}
+		return
+	}
+	in.paramVals[o] = v
 }
 
 // opaque returns a stand-in for a value the interpreter did not see being
@@ -606,31 +621,45 @@ func (in *interp) copyValue(v value) value {
 // copyStruct copies an object of plain data, nested structs included.
 // It returns false if the object holds anything else.
 func (in *interp) copyStruct(src *object) (*object, bool) {
-	if src.st == nil {
+	if !plainData(src) {
 		return nil, false
 	}
+	return in.copyPlain(src), true
+}
+
+// plainData reports whether o holds only plain data, in structs it holds by
+// value included.
+func plainData(o *object) bool {
+	if o.st == nil {
+		return false
+	}
+	for _, v := range o.fields {
+		if inner, ok := v.(vObj); ok {
+			if inner.o.parent != o || !plainData(inner.o) {
+				return false
+			}
+		} else if !isData(v) {
+			return false
+		}
+	}
+	return true
+}
+
+func (in *interp) copyPlain(src *object) *object {
 	o := in.newObject(src.typ, src.known, src.site)
 	for i := range src.st.NumFields() {
 		f := src.st.Field(i)
 		switch v := src.fields[f].(type) {
 		case nil:
-		case vConst, vSlice, vUnknown, vNil:
-			o.fields[f] = v
 		case vObj:
-			if v.o.parent != src {
-				return nil, false
-			}
-			inner, ok := in.copyStruct(v.o)
-			if !ok {
-				return nil, false
-			}
+			inner := in.copyPlain(v.o)
 			inner.parent, inner.pfield = o, f
 			o.fields[f] = vObj{inner}
 		default:
-			return nil, false
+			o.fields[f] = v
 		}
 	}
-	return o, true
+	return o
 }
 
 func (in *interp) store(fr *frame, lhs dst.Expr, v value) {
@@ -806,7 +835,7 @@ func (in *interp) ifStmt(fr *frame, s *dst.IfStmt) {
 	// Grammar values keep what the last branch left.
 	for i, l := range written {
 		v := afterElse[i]
-		if !sameValue(afterBody[i], afterElse[i]) && isData(afterBody[i]) && isData(afterElse[i]) {
+		if eq, _ := equalValues(afterBody[i], afterElse[i]); !eq && isData(afterBody[i]) && isData(afterElse[i]) {
 			v = vUnknown{}
 		} else if s.Else == nil {
 			v = afterBody[i]
@@ -859,51 +888,65 @@ func (in *interp) writeAll(fr *frame, exprs []dst.Expr, vals []value) {
 
 // isData reports whether v is plain data, not grammar.
 func isData(v value) bool {
-	switch v.(type) {
+	switch v := v.(type) {
 	case vConst, vNil, vUnknown:
 		return true
 	case vSlice:
-		for _, e := range v.(vSlice).elems {
-			if !isData(e) {
-				return false
-			}
-		}
-		return true
+		return !slices.ContainsFunc(v.elems, func(e value) bool { return !isData(e) })
 	}
 	return false
 }
 
-// sameValue reports whether a and b are known to be the same value.
-func sameValue(a, b value) bool {
+// equalValues compares a and b, and reports whether it could tell.
+func equalValues(a, b value) (equal, known bool) {
 	switch a := a.(type) {
 	case vConst:
 		b, ok := b.(vConst)
-		return ok && a.c.Kind() == b.c.Kind() && constant.Compare(a.c, token.EQL, b.c)
+		if !ok {
+			return false, false
+		}
+		if a.c.Kind() != b.c.Kind() && !(isNumeric(a.c) && isNumeric(b.c)) {
+			return false, true
+		}
+		return constant.Compare(a.c, token.EQL, b.c), true
 	case vNil:
-		_, ok := b.(vNil)
-		return ok
+		switch b.(type) {
+		case vNil:
+			return true, true
+		case vPtr:
+			return false, true
+		}
+	case vPtr:
+		switch b := b.(type) {
+		case vPtr:
+			return a.o == b.o, true
+		case vNil:
+			return false, true
+		}
+	case vObj:
+		if b, ok := b.(vObj); ok && a.o == b.o {
+			return true, true
+		}
+	case vClause:
+		if b, ok := b.(vClause); ok {
+			return a.c == b.c, true
+		}
 	case vSlice:
 		b, ok := b.(vSlice)
-		if !ok || len(a.elems) != len(b.elems) {
-			return false
+		if !ok {
+			return false, false
+		}
+		if len(a.elems) != len(b.elems) {
+			return false, true
 		}
 		for i := range a.elems {
-			if !sameValue(a.elems[i], b.elems[i]) {
-				return false
+			if eq, known := equalValues(a.elems[i], b.elems[i]); !eq || !known {
+				return false, known
 			}
 		}
-		return true
-	case vObj:
-		b, ok := b.(vObj)
-		return ok && a.o == b.o
-	case vPtr:
-		b, ok := b.(vPtr)
-		return ok && a.o == b.o
-	case vClause:
-		b, ok := b.(vClause)
-		return ok && a.c == b.c
+		return true, true
 	}
-	return false
+	return false, false
 }
 
 // forgetWrites drops what the interpreter knows of the variables n assigns,
@@ -917,11 +960,8 @@ func (in *interp) forgetWrites(fr *frame, n dst.Node) {
 		if v.IsField() {
 			// A field, as in cfg.Remote = true.
 			if sel, ok := unparen(l).(*dst.SelectorExpr); ok && plainExpr(sel.X) {
-				switch o := in.eval(fr, sel.X).(type) {
-				case vObj:
-					o.o.fields[v] = vUnknown{}
-				case vPtr:
-					o.o.fields[v] = vUnknown{}
+				if o, f := in.fieldLoc(fr, sel); o != nil {
+					o.fields[f] = vUnknown{}
 				}
 			}
 			return
@@ -949,7 +989,7 @@ func (in *interp) forgetWrites(fr *frame, n dst.Node) {
 			var args []value
 			for _, a := range n.Args {
 				v := value(vUnknown{})
-				if u, ok := unparen(a).(*dst.UnaryExpr); ok && u.Op == token.AND && plainExpr(u.X) {
+				if isAddress(a) && plainExpr(a) {
 					v = in.eval(fr, a)
 				}
 				args = append(args, v)
@@ -1754,6 +1794,7 @@ func (in *interp) inline(fr *frame, c *dst.CallExpr, fd funcDecl, fn *types.Func
 		}
 		if po != nil {
 			nf.vars[po] = v
+			in.recordParam(po, v)
 		}
 	}
 	if fd.decl.Type.Results != nil {

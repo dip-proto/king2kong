@@ -50,12 +50,9 @@ type mainProgram struct {
 	// packageSettings are the Terminate and writer calls on the
 	// package-level application that became kong options.
 	packageSettings map[*dst.CallExpr]bool
-	// binds go to kong.Bind, for hooks that now do what constructors did.
-	// bound are the variables they name, and boundAs the types the hooks
-	// take them as.
-	binds   []dst.Expr
-	bound   []*types.Var
-	boundAs []types.Type
+	// bound are the variables bound for hooks that now do what
+	// constructors did.
+	bound []boundVar
 	// structSpecs declare the package-level command structs the CLI
 	// replaces, and cliSpec is the one whose place a package-level cli takes
 	// when it starts with their values.
@@ -122,6 +119,12 @@ func (c *converter) runtimeCall(p *Package, call *dst.CallExpr) string {
 		}
 	}
 	return ""
+}
+
+// boundVar is a variable bound for the hooks, as the type they take.
+type boundVar struct {
+	v  *types.Var
+	as types.Type
 }
 
 // storageFields returns, as Go source lines, the fields holding the values of
@@ -1661,8 +1664,8 @@ func (c *converter) parserArgs(name, help dst.Expr) []dst.Expr {
 	}
 	var binds []dst.Expr
 	var typs []types.Type
-	for i, b := range mp.binds {
-		binds, typs = append(binds, dst.Clone(b).(dst.Expr)), append(typs, mp.boundAs[i])
+	for _, b := range mp.bound {
+		binds, typs = append(binds, dst.NewIdent(b.v.Name())), append(typs, b.as)
 	}
 	args = append(args, c.bindCalls(c.tree.Root.cl.pos, binds, typs, c.tree.RootPkg.PkgPath, kongOption)...)
 	if mp.exit != nil {

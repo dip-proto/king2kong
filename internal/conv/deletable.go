@@ -152,8 +152,10 @@ func (c *converter) deletableStmts(p *Package, body *dst.BlockStmt) (map[dst.Stm
 		calls, ok := lowered[u]
 		return !ok || slices.ContainsFunc(calls, func(k dst.Stmt) bool { return c.usedIn(p, k, o) })
 	}
-	usedOnlyByDeletable := func(s dst.Stmt) bool {
-		for _, o := range defines(s) {
+	// onlyDeletableRead reports whether the statements other than s that
+	// read objs are all deletable.
+	onlyDeletableRead := func(s dst.Stmt, objs ...types.Object) bool {
+		for _, o := range objs {
 			for _, u := range uses[o] {
 				if u != s && !d[u] && stillReads(u, o) {
 					return false
@@ -161,6 +163,9 @@ func (c *converter) deletableStmts(p *Package, body *dst.BlockStmt) (map[dst.Stm
 			}
 		}
 		return true
+	}
+	usedOnlyByDeletable := func(s dst.Stmt) bool {
+		return onlyDeletableRead(s, defines(s)...)
 	}
 	for changed := true; changed; {
 		// A statement newly lowered to calls may free the locals it read.
@@ -226,7 +231,7 @@ func (c *converter) deletableStmts(p *Package, body *dst.BlockStmt) (map[dst.Stm
 				} else if root := localRoot(p, s.Lhs); pure && root != nil && !hasCallBesides(p, in, s) {
 					// Changing a local only registrations read, as in
 					// spec.Name += "-copy".
-					ok = !slices.ContainsFunc(uses[root], func(u dst.Stmt) bool { return u != s && !d[u] && stillReads(u, root) })
+					ok = onlyDeletableRead(s, root)
 				}
 			case *dst.DeclStmt:
 				vals := in.stmtVals[s]
