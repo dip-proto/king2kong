@@ -169,12 +169,6 @@ func (s *checker) next() token {
 	return token{tokArg, arg}
 }
 
-func (s *checker) peek() token {
-	t := s.next()
-	s.pushed = append(s.pushed, t)
-	return t
-}
-
 func (s *checker) run() error {
 	for {
 		t := s.next()
@@ -375,9 +369,8 @@ func hasCommands(n *kong.Node) bool {
 	return false
 }
 
-// finish runs the checks kingpin made once all arguments were read: a
-// missing subcommand, missing required flags and arguments, then a missing
-// command.
+// finish runs the checks kingpin did after reading all arguments, in the
+// same order: missing subcommand, missing required values, missing command.
 func (s *checker) finish() error {
 	// After --help, kingpin did not enter default commands.
 	for s.node.DefaultCmd != nil && !s.sawHelp {
@@ -386,13 +379,14 @@ func (s *checker) finish() error {
 	if s.syntaxOnly || s.noRequired {
 		return nil
 	}
-	if hasCommands(s.node) && len(s.path) > 1 {
+	commands := hasCommands(s.node)
+	if commands && len(s.path) > 1 {
 		return fmt.Errorf("must select a subcommand of '%s'", fullCommand(s.node))
 	}
 	if err := s.missingRequired(); err != nil {
 		return err
 	}
-	if hasCommands(s.node) {
+	if commands {
 		return ErrCommandNotSpecified
 	}
 	return nil

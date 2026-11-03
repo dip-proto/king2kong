@@ -13,7 +13,7 @@ import (
 
 	"github.com/dave/dst"
 
-	"kingpin2kong/kongtag"
+	"king2kong/kongtag"
 )
 
 type bindMode int
@@ -103,6 +103,7 @@ type Plan struct {
 	vars    []runtimeVar
 	markers map[*types.Named]*wrapperType
 	Issues  []Issue
+	issued  map[Issue]bool
 	// failed are the registrations the conversion could not handle.
 	failed []failure
 }
@@ -116,7 +117,6 @@ type fieldTag struct {
 	field    *types.Var
 	tag      string
 	bindings []*binding
-	rename   string
 }
 
 // Issue is something the conversion cannot do on its own.
@@ -127,8 +127,9 @@ type Issue struct {
 
 func (p *Plan) issue(pos token.Position, format string, args ...any) {
 	is := Issue{Pos: pos, Reason: fmt.Sprintf(format, args...)}
-	// A tag is worked out more than once.
-	if !slices.Contains(p.Issues, is) {
+	// Tags get worked out more than once, so the same issue comes up again.
+	if !p.issued[is] {
+		p.issued[is] = true
 		p.Issues = append(p.Issues, is)
 	}
 }
@@ -140,6 +141,7 @@ func NewPlan(g *Grammar) *Plan {
 		fieldTags: map[*types.Var]*fieldTag{},
 		wrappers:  map[*types.Named]*wrapperType{},
 		markers:   map[*types.Named]*wrapperType{},
+		issued:    map[Issue]bool{},
 	}
 	// Discover the was-set wrapper types first, so a registration of a
 	// wrapper's value without its Set action is recognized wherever it is.
@@ -169,9 +171,6 @@ func NewPlan(g *Grammar) *Plan {
 
 // bind works out where a flag's value lands relative to its command.
 func (p *Plan) bind(c *clause) *binding {
-	if c.localHelp {
-		c.issue("help text is computed from local values")
-	}
 	for _, is := range append(c.issues, c.notes...) {
 		p.issue(c.pos, "%s %q: %s", c.kind, c.name, is)
 	}
@@ -557,15 +556,12 @@ func (p *Plan) tagFor(b *binding, fieldName string) *kongtag.Tag {
 	}
 	if !c.hasDefault && !c.required && !isSlice {
 		// kingpin left a destination alone when its flag was absent, but
-		// kong resets it.
-		// The value it held becomes the default, hidden behind the usual
-		// placeholder since kingpin never displayed it.
+		// kong resets it, so the value it held becomes the default.
+		// It hides behind the usual placeholder, since kingpin never
+		// displayed it.
 		prior, ok := c.prior, c.hasPrior
-		if !c.priorTaken {
-			prior, ok = p.g.in.priorDefault(c.dst)
-		}
-		// kong checks a default as it checks a value, which kingpin never
-		// did for what it left alone.
+		// kong validates a default like any value, but kingpin never checked
+		// what it left alone.
 		checked := len(c.enum) > 0 && !slices.Contains(c.enum, prior) || strings.HasPrefix(c.bind, "Existing")
 		switch {
 		case ok && checked:
@@ -579,7 +575,7 @@ func (p *Plan) tagFor(b *binding, fieldName string) *kongtag.Tag {
 	}
 	if c.defaultExpr != nil && c.registeredUnderCondition() {
 		// kong would compute it whether or not the condition holds.
-		c.issue("its default value is computed at run time under a condition; the flag lost its default, give it back by hand")
+		p.issue(c.pos, "%s %q: its default value is computed at run time under a condition; the flag lost its default, give it back by hand", c.kind, c.name)
 	} else if c.defaultExpr != nil {
 		t.Set("default", "${"+p.runtimeVar(c, "default", c.defaultExpr)+"}")
 	} else if c.hasDefault {
@@ -615,7 +611,7 @@ func (p *Plan) tagFor(b *binding, fieldName string) *kongtag.Tag {
 	}
 	if len(c.hints) > 0 {
 		// kongcompat's completion offers them, as kingpin did.
-		t.Set("hints", kongtag.Interpolated(joinComma(c.hints)))
+		t.Set("hints", kongtag.Interpolated(strings.Join(c.hints, ",")))
 	}
 	if c.hasFormat {
 		t.Set("format", c.format)
@@ -645,13 +641,7 @@ func (p *Plan) tagFor(b *binding, fieldName string) *kongtag.Tag {
 	if c.hidden {
 		t.Flag("hidden")
 	}
-	if c.helpExpr != nil && c.registeredUnderCondition() {
-		c.issue("its help text is computed at run time under a condition; the flag lost its help, give it back by hand")
-	} else if c.helpExpr != nil {
-		t.Set("help", "${"+p.runtimeVar(c, "help", c.helpExpr)+"}")
-	} else if c.help != "" {
-		t.Set("help", kongtag.Interpolated(c.help))
-	}
+	p.helpTag(t, c)
 	return t
 }
 
@@ -695,6 +685,19 @@ func (p *Plan) runtimeVar(c *clause, what string, e dst.Expr) string {
 	}
 	p.vars = append(p.vars, runtimeVar{name: name, expr: e, pkg: pkg, cl: c, what: desc, seq: seq})
 	return name
+}
+
+// helpTag sets the help of c's tag, through a kong variable when the program
+// computes it.
+func (p *Plan) helpTag(t *kongtag.Tag, c *clause) {
+	switch {
+	case c.helpExpr != nil && c.registeredUnderCondition():
+		p.issue(c.pos, "%s %q: its help text is computed at run time under a condition; it lost its help, give it back by hand", c.kind, c.name)
+	case c.helpExpr != nil:
+		t.Set("help", "${"+p.runtimeVar(c, "help", c.helpExpr)+"}")
+	case c.help != "":
+		t.Set("help", kongtag.Interpolated(c.help))
+	}
 }
 
 // runtimeVar is a kong variable whose value the program computes at run

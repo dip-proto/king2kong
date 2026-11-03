@@ -56,6 +56,16 @@ func (p *Package) tv(n dst.Expr) (types.TypeAndValue, bool) {
 	return tv, ok
 }
 
+// importName returns the path an import names and the name the file uses
+// for it.
+func (p *Package) importName(imp *dst.ImportSpec) (path, name string) {
+	path, _ = strconv.Unquote(imp.Path.Value)
+	if imp.Name != nil {
+		return path, imp.Name.Name
+	}
+	return path, p.names[path]
+}
+
 func (p *Package) objectOf(n dst.Node) types.Object {
 	switch a := p.astOf(n).(type) {
 	case *ast.Ident:

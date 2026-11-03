@@ -5,10 +5,11 @@ import (
 	"go/token"
 	"go/types"
 	"sort"
+	"strings"
 
 	"github.com/dave/dst"
 
-	"kingpin2kong/kongtag"
+	"king2kong/kongtag"
 )
 
 // node is a command in the kong grammar.
@@ -298,7 +299,7 @@ func (p *Plan) commandTag(n *node, field string) *kongtag.Tag {
 		t.Set("name", c.name)
 	}
 	if len(c.aliases) > 0 {
-		t.Set("aliases", joinComma(c.aliases))
+		t.Set("aliases", strings.Join(c.aliases, ","))
 	}
 	if c.defaultCmd {
 		// kingpin parsed whatever followed into the default command, which
@@ -312,23 +313,8 @@ func (p *Plan) commandTag(n *node, field string) *kongtag.Tag {
 	if c.hidden {
 		t.Flag("hidden")
 	}
-	if c.helpExpr != nil {
-		t.Set("help", "${"+p.runtimeVar(c, "help", c.helpExpr)+"}")
-	} else if c.help != "" {
-		t.Set("help", kongtag.Interpolated(c.help))
-	}
+	p.helpTag(t, c)
 	return t
-}
-
-func joinComma(s []string) string {
-	out := ""
-	for i, v := range s {
-		if i > 0 {
-			out += ","
-		}
-		out += v
-	}
-	return out
 }
 
 // outermostSite returns the outermost call that returned the command's

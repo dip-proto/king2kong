@@ -3,6 +3,7 @@ package conv
 import (
 	"go/token"
 	"go/types"
+	"slices"
 
 	"github.com/dave/dst"
 )
@@ -48,9 +49,7 @@ type clause struct {
 	builtinHelp bool
 	// helpFlag is the application's built-in --help flag, set when the
 	// program changes it, for example to add -h.
-	helpFlag   *clause
-	version    string
-	hasVersion bool
+	helpFlag *clause
 	// versionFlag is the --version flag, set when the program changes it.
 	versionFlag *clause
 	// defaultEnvars is set when the application gives every flag an
@@ -58,8 +57,7 @@ type clause struct {
 	defaultEnvars bool
 	// versionAt is the id of the last clause registered before Version was
 	// called, to keep --version at the same place among the flags.
-	versionAt     int
-	runtimeConfig []string
+	versionAt int
 	// dstExpr is the destination argument of a binder, in dstPkg.
 	dstExpr dst.Expr
 	dstPkg  *Package
@@ -80,8 +78,8 @@ type clause struct {
 	hasSep      bool
 	// hints are the constant values given to HintOptions.
 	hints []string
-	// defaultExpr and helpExpr, in exprPkg, compute a default value and a
-	// help text only known at run time.
+	// defaultExpr, in exprPkg, and helpExpr, in helpPkg, compute a default
+	// value and a help text only known at run time.
 	// kong gets them through variables.
 	defaultExpr, helpExpr dst.Expr
 	// defaultSeq and helpSeq keep those expressions evaluated in program
@@ -89,7 +87,8 @@ type clause struct {
 	defaultSeq, helpSeq int
 	exprPkg             *Package
 	helpPkg             *Package
-	// localHelp is set for a help text computed from local values.
+	// localHelp is set when the help text is computed from local values, so
+	// it cannot move to where the parser is built.
 	localHelp bool
 	// hintExpr, in hintPkg, computes the hints given to HintOptions or
 	// HintAction at run time.
@@ -101,7 +100,8 @@ type clause struct {
 	action  value
 	bind    string
 	dst     value
-	// prior is what dst held when the program parsed, once priorTaken.
+	// prior is what dst held when the program parsed, if hasPrior.
+	// priorTaken is set once that has been looked at.
 	prior      string
 	hasPrior   bool
 	priorTaken bool
@@ -126,12 +126,9 @@ type clause struct {
 }
 
 func (c *clause) issue(msg string) {
-	for _, m := range c.issues {
-		if m == msg {
-			return
-		}
+	if !slices.Contains(c.issues, msg) {
+		c.issues = append(c.issues, msg)
 	}
-	c.issues = append(c.issues, msg)
 }
 
 // fullName returns the command path the way kingpin's FullCommand does.
@@ -197,13 +194,6 @@ type cond struct {
 	neg  bool
 	fn   *types.Func
 	pkg  *Package
-}
-
-// stmtSite identifies a statement in a decorated file.
-type stmtSite struct {
-	pkg  *Package
-	fn   *dst.FuncDecl
-	stmt dst.Stmt
 }
 
 // callSite is a call that created kingpin clauses and returned a struct

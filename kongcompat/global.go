@@ -10,20 +10,21 @@ import (
 )
 
 // ErrorReporter prints errors and exits the way kingpin's Application did.
-// kong's methods of the same names differ a little: they indent multi-line
-// messages and return the parser, and FatalIfErrorf takes the exit status
-// from the error and may print the usage.
+//
+// kong has methods with the same names, but they behave a bit differently.
+// They indent multi-line messages and return the parser, and FatalIfErrorf
+// takes the exit status from the error and may print the usage.
 type ErrorReporter struct {
 	k *kong.Kong
 }
 
-// Errors returns the error reporter of k.
+// Errors returns the error reporter for k.
 func Errors(k *kong.Kong) ErrorReporter {
 	return ErrorReporter{k}
 }
 
-// kingpin's default application took its name and error writer when the
-// program started.
+// Name and writer used when there is no kong.Kong.
+// Like kingpin's default application, they are set once at startup.
 var (
 	defaultName             = filepath.Base(os.Args[0])
 	defaultStderr io.Writer = os.Stderr
@@ -44,8 +45,9 @@ func (r ErrorReporter) Fatalf(format string, args ...any) {
 	r.exit(1)
 }
 
-// FatalIfError prints err, after the formatted prefix if there is one, and
-// exits with status 1, when err is not nil.
+// FatalIfError does nothing if err is nil.
+// Otherwise it prints err, prefixed with the formatted message when format
+// is not empty, and exits with status 1.
 func (r ErrorReporter) FatalIfError(err error, format string, args ...any) {
 	if err == nil {
 		return
@@ -66,18 +68,18 @@ func (r ErrorReporter) exit(code int) {
 	os.Exit(code)
 }
 
-// Errorf is kingpin's package-level Errorf, which printed through its
-// default application, named after the program.
+// Errorf replaces kingpin.Errorf.
+// Like kingpin's default application, it prints under the program's name.
 func Errorf(format string, args ...any) {
 	ErrorReporter{}.Errorf(format, args...)
 }
 
-// Fatalf is kingpin's package-level Fatalf.
+// Fatalf replaces kingpin.Fatalf.
 func Fatalf(format string, args ...any) {
 	ErrorReporter{}.Fatalf(format, args...)
 }
 
-// FatalIfError is kingpin's package-level FatalIfError.
+// FatalIfError replaces kingpin.FatalIfError.
 func FatalIfError(err error, format string, args ...any) {
 	ErrorReporter{}.FatalIfError(err, format, args...)
 }

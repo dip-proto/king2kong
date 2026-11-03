@@ -8,7 +8,7 @@ import (
 	"github.com/xhit/go-str2duration/v2"
 )
 
-// kingpin2kong only copies this file into programs converted from kingpin
+// king2kong only copies this file into programs converted from kingpin
 // v2.3.0 or later, the only ones that need str2duration.
 
 func init() {

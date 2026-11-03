@@ -23,14 +23,21 @@ type pkgFlags struct {
 	pkg      *Package
 	typeName string // name of the generated struct
 	varName  string // name of the variable holding the values
-	bindings []*binding
-	specs    map[*binding]*dst.ValueSpec
-	vars     map[*binding]*types.Var
-	// specDecls are the declarations holding the specs.
-	specDecls map[*dst.ValueSpec]*dst.GenDecl
-	file      *dst.File
-	decl      *dst.GenDecl // the struct is inserted right before it
-	order     int          // earliest registration, to sort the CLI fields
+	flags    []pkgFlag
+	file     *dst.File
+	decl     *dst.GenDecl // the struct is inserted right before it
+	order    int          // earliest registration, to sort the CLI fields
+}
+
+// pkgFlag is a flag of a pkgFlags and the variable holding its value.
+type pkgFlag struct {
+	b    *binding
+	v    *types.Var
+	spec *dst.ValueSpec
+	decl *dst.GenDecl
+	file *dst.File
+	// field is its name in the struct.
+	field string
 }
 
 // collectPkgFlags groups by package the application flags held in
@@ -48,12 +55,10 @@ func (c *converter) collectPkgFlags() map[*Package]*pkgFlags {
 		}
 		g := out[p]
 		if g == nil {
-			g = &pkgFlags{pkg: p, specs: map[*binding]*dst.ValueSpec{}, vars: map[*binding]*types.Var{}, specDecls: map[*dst.ValueSpec]*dst.GenDecl{}, file: file, decl: gd, order: 2 * b.cl.id}
+			g = &pkgFlags{pkg: p, file: file, decl: gd, order: 2 * b.cl.id}
 			out[p] = g
 		}
-		g.bindings = append(g.bindings, b)
-		g.specs[b] = spec
-		g.vars[b], g.specDecls[spec] = v, gd
+		g.flags = append(g.flags, pkgFlag{b: b, v: v, spec: spec, decl: gd, file: file})
 		if 2*b.cl.id < g.order {
 			g.order, g.file, g.decl = 2*b.cl.id, file, gd
 		}
@@ -100,21 +105,22 @@ func (c *converter) storageVar(cl *clause) (*types.Var, *Package, *dst.ValueSpec
 	return nil, nil, nil, nil, nil
 }
 
-// pointIntoFlags makes the variable of b start as field, the address of its
+// pointIntoFlags makes pf's variable start out as field, the address of its
 // value in the package's flags struct.
-// A variable declared with others and no values gets a declaration of its
-// own, and the assignment that gave it the flag's value goes.
-func (c *converter) pointIntoFlags(g *pkgFlags, b *binding, field dst.Expr) {
-	spec, v := g.specs[b], g.vars[b]
-	i := slices.IndexFunc(spec.Names, func(nm *dst.Ident) bool { return g.pkg.objectOf(nm) == v })
+// A variable without a value got the flag from an assignment, which cleanup
+// removes, and gets a spec of its own if it shares one with other names.
+func (c *converter) pointIntoFlags(p *Package, pf pkgFlag, field dst.Expr) {
+	spec, v := pf.spec, pf.v
+	c.ed.touch(p, pf.file)
+	i := slices.IndexFunc(spec.Names, func(nm *dst.Ident) bool { return p.objectOf(nm) == v })
 	if len(spec.Values) > 0 {
-		c.reportInitWork(g.pkg, v.Name(), spec.Values[i])
+		c.reportInitWork(p, v.Name(), spec.Values[i])
 		spec.Values[i] = field
 		return
 	}
 	c.pkgFlagVars[v] = true
 	if len(spec.Names) == 1 {
-		if t := g.pkg.typeOf(spec.Type); t != nil && types.Identical(t, types.NewPointer(b.cl.storageType)) {
+		if t := p.typeOf(spec.Type); t != nil && types.Identical(t, types.NewPointer(pf.b.cl.storageType)) {
 			spec.Type = nil
 		}
 		spec.Values = []dst.Expr{field}
@@ -122,10 +128,9 @@ func (c *converter) pointIntoFlags(g *pkgFlags, b *binding, field dst.Expr) {
 	}
 	own := &dst.ValueSpec{Names: []*dst.Ident{spec.Names[i]}, Values: []dst.Expr{field}}
 	spec.Names = slices.Delete(spec.Names, i, i+1)
-	gd := g.specDecls[spec]
-	at := slices.Index(gd.Specs, dst.Spec(spec))
-	gd.Specs = slices.Insert(gd.Specs, at, dst.Spec(own))
-	gd.Lparen = true
+	at := slices.Index(pf.decl.Specs, dst.Spec(spec))
+	pf.decl.Specs = slices.Insert(pf.decl.Specs, at, dst.Spec(own))
+	pf.decl.Lparen = true
 }
 
 // convertPkgFlags writes each package's flags struct, points its variables
@@ -149,14 +154,14 @@ func (c *converter) convertPkgFlags(groups map[*Package]*pkgFlags, imports map[s
 		pkgImports := map[string]string{}
 		var fields []string
 		taken := map[string]bool{}
-		names := map[*binding]string{}
-		for _, b := range g.bindings {
+		for i := range g.flags {
+			b := g.flags[i].b
 			name := c.prog.identFromName(b.cl.name)
 			for taken[name] {
 				name += "Value"
 			}
 			taken[name] = true
-			names[b] = name
+			g.flags[i].field = name
 			tag := c.plan.tagFor(b, name)
 			fields = append(fields, fmt.Sprintf("%s %s %s", name, typeExpr(b.cl.storageType, g.pkg.Types, pkgImports), tagLiteral(tag.String())))
 		}
@@ -171,30 +176,12 @@ var %[2]s %[1]s
 `, g.typeName, g.varName, g.pkg.Name, strings.Join(fields, "\n"))
 		decls, err := snippet(g.pkg.Name, pkgImports, src)
 		if err != nil {
-			c.issue(g.bindings[0].cl.pos, "%v", err)
+			c.issue(g.flags[0].b.cl.pos, "%v", err)
 			continue
 		}
 		c.ed.insertBefore(g.pkg, g.file, g.decl, decls)
-		for _, b := range g.bindings {
-			c.pointIntoFlags(g, b, &dst.UnaryExpr{Op: token.AND, X: &dst.SelectorExpr{X: dst.NewIdent(g.varName), Sel: dst.NewIdent(names[b])}})
-		}
-		for _, f := range g.pkg.Syntax {
-			if f == g.file {
-				c.ed.touch(g.pkg, f)
-			}
-		}
-		for _, b := range g.bindings {
-			for _, f := range g.pkg.Syntax {
-				for _, d := range f.Decls {
-					if gd, ok := d.(*dst.GenDecl); ok {
-						for _, sp := range gd.Specs {
-							if sp == g.specs[b] {
-								c.ed.touch(g.pkg, f)
-							}
-						}
-					}
-				}
-			}
+		for _, pf := range g.flags {
+			c.pointIntoFlags(g.pkg, pf, &dst.UnaryExpr{Op: token.AND, X: &dst.SelectorExpr{X: dst.NewIdent(g.varName), Sel: dst.NewIdent(pf.field)}})
 		}
 		pkgName := importName(imports, g.pkg.PkgPath, g.pkg.Name)
 		line := fmt.Sprintf("*%s.%s", pkgName, g.typeName)

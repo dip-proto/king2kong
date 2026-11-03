@@ -31,6 +31,14 @@ type editor struct {
 	// appended records structs that already received new fields, so later
 	// additions join the same group.
 	appended map[*dst.StructType]bool
+	// fieldUses lists where each field is named, built on the first rename.
+	fieldUses map[*types.Var][]identRef
+}
+
+type identRef struct {
+	pkg  *Package
+	file *dst.File
+	id   *dst.Ident
 }
 
 type typeLoc struct {
@@ -265,24 +273,24 @@ func tagLiteral(tag string) string {
 // renameField renames a field everywhere it is used in the loaded packages.
 // Test files are handled separately.
 func (e *editor) renameField(v *types.Var, name string) {
-	for _, p := range e.prog.Packages {
-		for _, f := range p.Syntax {
-			changed := false
-			dst.Inspect(f, func(n dst.Node) bool {
-				id, ok := n.(*dst.Ident)
-				if !ok || id.Name != v.Name() {
+	if e.fieldUses == nil {
+		e.fieldUses = map[*types.Var][]identRef{}
+		for _, p := range e.prog.Packages {
+			for _, f := range p.Syntax {
+				dst.Inspect(f, func(n dst.Node) bool {
+					if id, ok := n.(*dst.Ident); ok {
+						if fv, ok := p.objectOf(id).(*types.Var); ok && fv.IsField() {
+							e.fieldUses[fv] = append(e.fieldUses[fv], identRef{p, f, id})
+						}
+					}
 					return true
-				}
-				if p.objectOf(id) == v {
-					id.Name = name
-					changed = true
-				}
-				return true
-			})
-			if changed {
-				e.touch(p, f)
+				})
 			}
 		}
+	}
+	for _, r := range e.fieldUses[v] {
+		r.id.Name = name
+		e.touch(r.pkg, r.file)
 	}
 }
 

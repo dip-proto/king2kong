@@ -5,6 +5,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
@@ -181,32 +182,10 @@ func kongV2Parser(t *testing.T, opts ...kong.Option) *kong.Kong {
 
 func TestCheckMatchesKingpinV2(t *testing.T) {
 	t.Setenv("TOOL_TOKEN", "")
-	cases := [][]string{
-		{"store", "create", "--name", "x"},
-		{"store", "create"},
-		{"store", "create", "--name"},
-		{"store", "create", "--name", "x", "--location", "MARS"},
-		{"store", "create", "-n", "x", "--tag", "a", "--tag", "b"},
-		{"store", "create", "-nx", "-v"},
-		{"stores", "list"},
-		{"store", "list", "--limit=10", "extra"},
-		{"store", "delete"},
-		{"store", "delete", "abc", "def"},
+	cases := slices.Concat(checkCases, [][]string{
 		{"store", "delete", "abc", "--no-force"},
-		{"store"},
-		{"bogus"},
-		{"store", "bogus"},
-		{"--bogus"},
-		{"-x"},
-		{"upload"},
-		{"upload", "a", "b", "c"},
-		{"store", "create", "--name", "x", "--", "rest"},
 		{"--no-verbose", "store", "list"},
-		{"store", "list", "-v", "-t", "abc"},
-		{"secret"},
-		{"help"},
-		{"help", "store"},
-	}
+	})
 	forEachV2(t, func(t *testing.T, r kingpinV2Release) {
 		k := kongV2Parser(t)
 		for _, args := range cases {

@@ -32,7 +32,6 @@ type interp struct {
 	relevant map[*types.Func]bool
 
 	stack []*types.Func
-	depth int
 
 	// touched holds every statement, at any call depth, that was running
 	// when a kingpin builder was called.
@@ -66,18 +65,23 @@ type interp struct {
 	// moved are the arguments of grammar calls the conversion computes
 	// elsewhere, such as a default value only known at run time.
 	moved map[dst.Expr]bool
-	// superseded are the moved arguments a later call replaced, as Help
-	// replaces the help given to Flag.
+	// superseded are the moved arguments a later call overrides, as Help
+	// overrides the help given to Flag.
 	// They no longer feed the parser, but what they do still runs.
 	superseded map[dst.Expr]bool
 	// evaluations counts the run-time defaults and help texts seen so far.
 	evaluations int
 	executed    map[dst.Stmt]bool
-	// globalWrites is the last value interpreted code stored in each
-	// package-level variable.
+	// initCalled are the functions that package-level initializers call.
+	// runPackageVars has already run them.
+	initCalled map[*types.Func]bool
+	// globalWrites is the last value stored in each package-level variable.
+	// Unlike globals, it keeps any kind of value, such as what a flag's
+	// variable starts with.
 	globalWrites map[*types.Var]value
 	// valueCallees are the functions called through function values, as in
-	// cb(app) after cb := setup, or nil when that changed between runs.
+	// cb(app) after cb := setup, or nil when different runs called different
+	// functions.
 	valueCallees map[*dst.CallExpr]*types.Func
 
 	nextID int
@@ -120,6 +124,7 @@ func newInterp(prog *Program) *interp {
 		varVals:      map[types.Object]value{},
 		valueCallees: map[*dst.CallExpr]*types.Func{},
 		globalWrites: map[*types.Var]value{},
+		initCalled:   map[*types.Func]bool{},
 	}
 	in.relevant = in.computeRelevant()
 	return in
@@ -271,7 +276,7 @@ func (in *interp) staticCallee(p *Package, c *dst.CallExpr) *types.Func {
 
 // runPackageVars interprets the package-level variable declarations that
 // build grammar, such as `var verbose = kingpin.Flag("verbose", "").Bool()`,
-// in source order.
+// in the order Go runs them.
 func (in *interp) runPackageVars() {
 	for _, p := range in.prog.Packages {
 		fr := &frame{pkg: p, vars: map[types.Object]value{}}
@@ -290,8 +295,8 @@ func (in *interp) runPackageVars() {
 				}
 			}
 		}
-		// Go runs them in dependency order, as in var verbose =
-		// app.Flag(...).Bool() declared before var app = kingpin.New(...).
+		// var verbose = app.Flag(...).Bool() may be declared before
+		// var app = kingpin.New(...), but Go runs it after.
 		order := map[ast.Expr]int{}
 		for i, init := range p.TypesInfo.InitOrder {
 			order[init.Rhs] = i
@@ -306,6 +311,14 @@ func (in *interp) runPackageVars() {
 		}
 		slices.SortStableFunc(specs, func(a, b *dst.ValueSpec) int { return cmp.Compare(rank(a), rank(b)) })
 		for _, vs := range specs {
+			dst.Inspect(vs, func(n dst.Node) bool {
+				if c, ok := n.(*dst.CallExpr); ok {
+					if fn := in.staticCallee(p, c); fn != nil {
+						in.initCalled[fn] = true
+					}
+				}
+				return true
+			})
 			var vals []value
 			if len(vs.Values) == 1 && len(vs.Names) > 1 {
 				vals = in.multi(fr, vs.Values[0])
@@ -522,9 +535,9 @@ func (in *interp) store(fr *frame, lhs dst.Expr, v value) {
 			if vr, ok := o.(*types.Var); ok && vr.Parent() == vr.Pkg().Scope() {
 				// A package-level variable keeps the flag value or clause a
 				// function gave it, as in verbose = kingpin.Flag(...).Bool()
-				// in init, unless it is given another.
-				// Any other value only tells what a flag writing into it
-				// starts with.
+				// in init, and becomes unknown if it gets a different one.
+				// Any other value only matters as the starting value of a
+				// flag writing into it.
 				in.globalWrites[vr] = v
 				switch v.(type) {
 				case vStorage, vClause:
@@ -999,7 +1012,7 @@ func (in *interp) binary(fr *frame, b *dst.BinaryExpr) value {
 	}
 	op := b.Op
 	if op == token.QUO && isInteger(t) {
-		// Integers divide with truncation.
+		// go/constant spells integer division QUO_ASSIGN.
 		op = token.QUO_ASSIGN
 	}
 	defer func() { _ = recover() }()
@@ -1007,7 +1020,9 @@ func (in *interp) binary(fr *frame, b *dst.BinaryExpr) value {
 }
 
 // convertConst converts a constant to the numeric, string or boolean type t,
-// truncating a float made an integer; other values are kept as they are.
+// truncating a float converted to an integer.
+// Non-constants and non-basic types are returned as they are, and any other
+// conversion gives vUnknown.
 func convertConst(v value, t types.Type) value {
 	c, ok := v.(vConst)
 	if !ok || c.c == nil {
@@ -1040,10 +1055,7 @@ func isUntyped(t types.Type) bool {
 }
 
 func isInteger(t types.Type) bool {
-	if t == nil {
-		return false
-	}
-	b, ok := t.Underlying().(*types.Basic)
+	b, ok := typeUnder(t).(*types.Basic)
 	return ok && b.Info()&types.IsInteger != 0
 }
 
@@ -1595,7 +1607,7 @@ func (in *interp) priorDefault(dst value) (string, bool) {
 	if !ok || c.c == nil || t == nil {
 		return "", false
 	}
-	// Written the way the destination's type reads it.
+	// A time.Duration is written the way kong parses it, as in 1m30s.
 	if named, ok := types.Unalias(t).(*types.Named); ok && named.Obj().Pkg() != nil && named.Obj().Pkg().Path() == "time" && named.Obj().Name() == "Duration" {
 		n, exact := constant.Int64Val(constant.ToInt(c.c))
 		if !exact || n == 0 {

@@ -2,6 +2,7 @@ package kongcompat
 
 import (
 	"bytes"
+	"slices"
 	"strings"
 	"testing"
 
@@ -87,37 +88,44 @@ func kongParser(t *testing.T) *kong.Kong {
 	return k
 }
 
+// checkCases are the command lines the Check tests compare with every kingpin
+// release.
+// Each test adds the ones about boolean flags, which the releases spell
+// differently.
+var checkCases = [][]string{
+	{"store", "create", "--name", "x"},
+	{"store", "create"},
+	{"store", "create", "--name"},
+	{"store", "create", "--name", "x", "--location", "MARS"},
+	{"store", "create", "-n", "x", "--tag", "a", "--tag", "b"},
+	{"store", "create", "-nx", "-v"},
+	{"stores", "list"},
+	{"store", "list", "--limit=10", "extra"},
+	{"store", "delete"},
+	{"store", "delete", "abc", "def"},
+	{"store"},
+	{"bogus"},
+	{"store", "bogus"},
+	{"--bogus"},
+	{"-x"},
+	{"upload"},
+	{"upload", "a", "b", "c"},
+	{"store", "create", "--name", "x", "--", "rest"},
+	{"store", "list", "-v", "-t", "abc"},
+	{"secret"},
+	{"help"},
+	{"help", "store"},
+}
+
 func TestCheckMatchesKingpin(t *testing.T) {
-	cases := [][]string{
-		{"store", "create", "--name", "x"},
-		{"store", "create"},
-		{"store", "create", "--name"},
+	cases := slices.Concat(checkCases, [][]string{
 		{"store", "create", "--name", "x", "--name", "y"},
-		{"store", "create", "--name", "x", "--location", "MARS"},
-		{"store", "create", "-n", "x", "--tag", "a", "--tag", "b"},
-		{"store", "create", "-nx", "-v"},
-		{"stores", "list"},
-		{"store", "list", "--limit=10", "extra"},
-		{"store", "delete"},
-		{"store", "delete", "abc", "def"},
 		{"store", "delete", "abc", "--force"},
-		{"store"},
-		{"bogus"},
-		{"store", "bogus"},
-		{"--bogus"},
-		{"-x"},
 		{"store", "delete", "abc", "--force=false"},
-		{"upload"},
-		{"upload", "a", "b", "c"},
 		{"upload", "a", "--verbose", "b"},
-		{"store", "create", "--name", "x", "--", "rest"},
 		{"--verbose", "store", "list"},
-		{"store", "list", "-v", "-t", "abc"},
-		{"secret"},
-		{"help"},
-		{"help", "store"},
 		{"store", "create", "--help"},
-	}
+	})
 	k := kongParser(t)
 	for _, args := range cases {
 		var st kpState

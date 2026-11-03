@@ -1,7 +1,7 @@
-// Command kingpin2kong rewrites a Go program that builds its command line
+// Command king2kong rewrites a Go program that builds its command line
 // with kingpin so that it declares it as a kong grammar instead.
 //
-//	kingpin2kong [-dir DIR] [-write] [-v] [-dump] [packages...]
+//	king2kong [-dir DIR] [-write] [-v] [-dump] [packages...]
 //
 // Without -write, it only reports what it would change.
 // Packages default to ./... under -dir, the module to convert.
@@ -18,7 +18,7 @@ import (
 	"path/filepath"
 	"sort"
 
-	"kingpin2kong/internal/conv"
+	"king2kong/internal/conv"
 )
 
 // compatSources is the kongcompat package, written into converted modules.
@@ -43,14 +43,14 @@ func main() {
 	if *dump {
 		prog, err := conv.Load(*dir, patterns...)
 		if err != nil {
-			fmt.Fprintln(os.Stderr, "kingpin2kong:", err)
+			fmt.Fprintln(os.Stderr, "king2kong:", err)
 			os.Exit(1)
 		}
 		conv.Analyze(prog).Dump(os.Stdout)
 		return
 	}
 	if err := run(*dir, patterns, *write, *verbose, os.Stdout); err != nil {
-		fmt.Fprintln(os.Stderr, "kingpin2kong:", err)
+		fmt.Fprintln(os.Stderr, "king2kong:", err)
 		os.Exit(1)
 	}
 }

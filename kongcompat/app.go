@@ -1,7 +1,6 @@
 package kongcompat
 
 import (
-	"fmt"
 	"io"
 	"reflect"
 	"strings"
@@ -184,27 +183,22 @@ func (a *Application) usageFor(ctx *ParseContext, uc *UsageContext) error {
 
 // Errorf prints "<name>: error: <message>" on the error writer.
 func (a *Application) Errorf(format string, args ...any) {
-	fmt.Fprintf(a.Kong.Stderr, a.Name+": error: "+format+"\n", args...)
+	a.sync()
+	Errors(a.Kong).Errorf(format, args...)
 }
 
 // Fatalf prints an error and terminates with status 1.
 func (a *Application) Fatalf(format string, args ...any) {
-	a.Errorf(format, args...)
-	a.Kong.Exit(1)
+	a.sync()
+	Errors(a.Kong).Fatalf(format, args...)
 }
 
-// FatalIfError prints err, after the formatted prefix if there is one, and
-// terminates with status 1, when err is not nil.
+// FatalIfError does nothing if err is nil.
+// Otherwise it prints err, prefixed with the formatted message when format
+// is not empty, and terminates with status 1.
 func (a *Application) FatalIfError(err error, format string, args ...any) {
-	if err == nil {
-		return
-	}
-	prefix := ""
-	if format != "" {
-		prefix = fmt.Sprintf(format, args...) + ": "
-	}
-	a.Errorf(prefix+"%s", err)
-	a.Kong.Exit(1)
+	a.sync()
+	Errors(a.Kong).FatalIfError(err, format, args...)
 }
 
 // FatalUsage prints an error and the application's usage, and terminates

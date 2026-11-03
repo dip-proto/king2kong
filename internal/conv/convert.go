@@ -100,8 +100,6 @@ type converter struct {
 	recvPlaceholder string
 	ifaceMethods    map[string]bool
 	callsTo         map[*types.Func][]callRef
-	// toCalls are the definitions lowered to the helper calls they make.
-	toCalls map[dst.Stmt]bool
 	// funcWork caches doesSomething for the bodies of the program's
 	// functions.
 	funcWork   map[*types.Func]bool
@@ -109,15 +107,12 @@ type converter struct {
 	imports    *importGraph
 	// genErr is why a file the conversion generates could not be written.
 	genErr error
-	// jumpTargets are the labels of the function being cleaned up that
-	// branch statements still use.
-	jumpTargets map[string]bool
-	jumpKinds   map[string]map[token.Token]bool
+	// jumpKinds are the labels of the function being cleaned up that branch
+	// statements still use, with the kinds of those branches.
+	jumpKinds map[string]map[token.Token]bool
 	// reassigned are its locals assigned somewhere other than where they
 	// are declared.
 	reassigned map[types.Object]bool
-	// rootTaken are the names of the CLI's fields.
-	rootTaken map[string]bool
 	// pkgFlagVars are the package-level variables of other packages that
 	// now point into their package's flags struct, whose assignments go.
 	pkgFlagVars map[types.Object]bool
@@ -202,7 +197,6 @@ type hookSet struct {
 	beforeParams map[string]string // parameter name -> type source
 	after        []string
 	checks       []string
-	validate     []string
 	// actions are calls of former kingpin Actions, run last in AfterApply.
 	actions []string
 	imports map[string]string
@@ -240,7 +234,6 @@ func Convert(prog *Program, opts Options) (*Result, error) {
 		res:            &Result{Files: map[string]string{}, NewFiles: map[string]string{}},
 		tagged:         map[*types.Var]bool{},
 		pureCalls:      map[*types.Func]bool{},
-		toCalls:        map[dst.Stmt]bool{},
 		pkgFlagVars:    map[types.Object]bool{},
 		funcWork:       map[*types.Func]bool{},
 		hooks:          map[*types.Named]*hookSet{},
@@ -271,7 +264,7 @@ func Convert(prog *Program, opts Options) (*Result, error) {
 		return c.res, fmt.Errorf("the command tree could not be recovered")
 	}
 	c.ctors = c.plan.analyzeCtors(c.tree)
-	c.recvPlaceholder = firstFree(c.programUses, "kingpin2kongRecv")
+	c.recvPlaceholder = firstFree(c.programUses, "king2kongRecv")
 	renderPackage = prog.packageOf
 	if c.detectMain() {
 		c.main = &mainProgram{repl: map[types.Object]replacement{}, instances: map[types.Object]*object{}}
@@ -672,7 +665,7 @@ func (c *converter) markFailures() {
 		if i := strings.Index(reason, ": "); i >= 0 {
 			reason = reason[i+2:]
 		}
-		loc.field.Decs.Start.Append("// TODO: kingpin2kong could not convert this flag (" + reason + ").")
+		loc.field.Decs.Start.Append("// TODO: king2kong could not convert this flag (" + reason + ").")
 		loc.field.Decs.Start.Append("// The kingpin registration was:")
 		loc.field.Decs.Start.Append("// " + quoted)
 		loc.field.Decs.Before = dst.NewLine
@@ -1200,7 +1193,7 @@ func (c *converter) convertConstructors() {
 	for _, fn := range fns {
 		ci := c.ctors[fn]
 		ok := true
-		deletable := c.deletableStmts(ci.decl.pkg, ci.decl.decl.Body)
+		deletable, _ := c.deletableStmts(ci.decl.pkg, ci.decl.decl.Body)
 		for i, it := range ci.items {
 			if it.kind == ctorResidue && it.stmt != nil && it.field == nil && deletable[it.stmt] {
 				// Registration through a local clause, such as

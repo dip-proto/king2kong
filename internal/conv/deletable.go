@@ -49,11 +49,25 @@ func isPureValue(v value) bool {
 
 // deletableStmts finds the statements of a function body that only served
 // kingpin registration.
-// That covers statements declaring or storing grammar, calls to functions that
-// only register grammar, pure values only used by such statements, and ifs or
-// blocks made only of such statements.
-func (c *converter) deletableStmts(p *Package, body *dst.BlockStmt) map[dst.Stmt]bool {
+// That covers statements declaring or storing grammar, calls to functions
+// that only register grammar, pure values only used by such statements, and
+// ifs or blocks made only of such statements.
+//
+// It also returns the statements to lower instead: definitions of kingpin
+// values that call helpers doing other work, as in f := setup(app) where
+// setup prints.
+// Those are replaced by the calls they keep, so the blocks holding them
+// are not deletable.
+func (c *converter) deletableStmts(p *Package, body *dst.BlockStmt) (map[dst.Stmt]bool, map[dst.Stmt][]dst.Stmt) {
 	d := map[dst.Stmt]bool{}
+	lowered := map[dst.Stmt][]dst.Stmt{}
+	lowers := func(s dst.Stmt) bool {
+		calls := c.keptCalls(p, s)
+		if len(calls) > 0 {
+			lowered[s] = calls
+		}
+		return len(calls) > 0
+	}
 	in := c.g.in
 	var all []dst.Stmt
 	dst.Inspect(body, func(n dst.Node) bool {
@@ -65,11 +79,6 @@ func (c *converter) deletableStmts(p *Package, body *dst.BlockStmt) map[dst.Stmt
 		}
 		return true
 	})
-	// What an earlier look decided, before the CLI replaced its variables,
-	// may no longer hold.
-	for _, s := range all {
-		delete(c.toCalls, s)
-	}
 	// uses maps a local to the statements reading it.
 	uses := map[types.Object][]dst.Stmt{}
 	for _, s := range all {
@@ -118,9 +127,9 @@ func (c *converter) deletableStmts(p *Package, body *dst.BlockStmt) map[dst.Stmt
 		}
 		return out
 	}
-	// readElsewhere reports whether a command struct, or a list of them, s
-	// stores in a local of a converted main is still read by code that
-	// stays: that local then keeps pointing into the CLI.
+	// readElsewhere reports whether s stores a command struct, or a list of
+	// them, in a local of a converted main that kept code still reads.
+	// That local then stays, pointing into the CLI.
 	readElsewhere := func(s dst.Stmt, lhs []dst.Expr) bool {
 		if c.main == nil {
 			return false
@@ -140,10 +149,8 @@ func (c *converter) deletableStmts(p *Package, body *dst.BlockStmt) map[dst.Stmt
 	}
 	// A statement lowered to the calls it kept reads only what they read.
 	stillReads := func(u dst.Stmt, o types.Object) bool {
-		if !c.toCalls[u] {
-			return true
-		}
-		return slices.ContainsFunc(c.keptCalls(p, u), func(k dst.Stmt) bool { return c.usedIn(p, k, o) })
+		calls, ok := lowered[u]
+		return !ok || slices.ContainsFunc(calls, func(k dst.Stmt) bool { return c.usedIn(p, k, o) })
 	}
 	usedOnlyByDeletable := func(s dst.Stmt) bool {
 		for _, o := range defines(s) {
@@ -157,7 +164,7 @@ func (c *converter) deletableStmts(p *Package, body *dst.BlockStmt) map[dst.Stmt
 	}
 	for changed := true; changed; {
 		// A statement newly lowered to calls may free the locals it read.
-		lowered := len(c.toCalls)
+		before := len(lowered)
 		changed = false
 		for _, s := range all {
 			if d[s] || c.keepStmts[s] {
@@ -174,9 +181,9 @@ func (c *converter) deletableStmts(p *Package, body *dst.BlockStmt) map[dst.Stmt
 					if !ok && !in.ran(s) {
 						ok = c.staticGrammarCall(p, call)
 					}
-					// Arguments that do something are kept, so what holds
-					// the call stays too.
-					if ok && c.lowersToCalls(p, s) {
+					// If some arguments do something, the call is lowered
+					// to them instead.
+					if ok && lowers(s) {
 						ok = false
 					}
 				}
@@ -211,7 +218,7 @@ func (c *converter) deletableStmts(p *Package, body *dst.BlockStmt) map[dst.Stmt
 					// Storing a clause or a command struct, such as
 					// c.CmdClause = parent.Command(...) or a constructor call.
 					ok = !c.linksCommands(p, body, s) && !c.initializesCommand(p, s.Lhs, s.Rhs) && !readElsewhere(s, s.Lhs)
-					if ok && c.lowersToCalls(p, s) {
+					if ok && lowers(s) {
 						ok = false
 					}
 				} else if pure && s.Tok == token.DEFINE && !hasCallBesides(p, in, s) {
@@ -226,7 +233,7 @@ func (c *converter) deletableStmts(p *Package, body *dst.BlockStmt) map[dst.Stmt
 							grammar = false
 						}
 					}
-					ok = grammar && !c.declaresCommand(p, s) && !readElsewhere(s, declaredNames(s)) && !c.lowersToCalls(p, s)
+					ok = grammar && !c.declaresCommand(p, s) && !readElsewhere(s, declaredNames(s)) && !lowers(s)
 				}
 				if !ok {
 					ok = c.declaresKingpin(p, s) && usedOnlyByDeletable(s)
@@ -250,9 +257,9 @@ func (c *converter) deletableStmts(p *Package, body *dst.BlockStmt) map[dst.Stmt
 				changed = true
 			}
 		}
-		changed = changed || len(c.toCalls) > lowered
+		changed = changed || len(lowered) > before
 	}
-	return d
+	return d, lowered
 }
 
 // linksCommands reports whether an assignment outside a constructor hands a
@@ -424,7 +431,7 @@ func callsBesides(p *Package, in *interp, r dst.Expr) bool {
 			if tv, ok := p.tv(call.Fun); ok && tv.IsType() {
 				return true
 			}
-			if id, ok := call.Fun.(*dst.Ident); ok && foldable[id.Path+"."+id.Name] && in.prog.formatsPlainly(p, call) {
+			if foldsPlainly(p, call) {
 				return true
 			}
 			found = true
@@ -440,11 +447,14 @@ var foldable = map[string]bool{
 	"strings.Join": true, "strings.ToLower": true, "strings.ToUpper": true, "strings.TrimSpace": true,
 }
 
-// formatsPlainly reports whether a foldable call, such as fmt.Sprintf, runs
-// no method but those of plainFormatters: fmt calls the String, Error,
-// Format and GoString methods of what it formats, fields and elements
-// included.
-func (prog *Program) formatsPlainly(p *Package, call *dst.CallExpr) bool {
+// foldsPlainly reports whether call is one the interpreter folds, such as
+// fmt.Sprintf, and cannot run any method outside plainFormatters.
+// fmt calls the String, Error, Format and GoString methods of what it
+// formats, down to fields and elements, so all those types are checked.
+func foldsPlainly(p *Package, call *dst.CallExpr) bool {
+	if id, ok := call.Fun.(*dst.Ident); !ok || !foldable[id.Path+"."+id.Name] {
+		return false
+	}
 	seen := map[types.Type]bool{}
 	var plain func(t types.Type) bool
 	plain = func(t types.Type) bool {
@@ -524,7 +534,7 @@ func (c *converter) computeRegOnly() {
 			if fd.decl.Type.Results != nil && len(fd.decl.Type.Results.List) > 0 {
 				continue
 			}
-			d := c.deletableStmts(fd.pkg, fd.decl.Body)
+			d, _ := c.deletableStmts(fd.pkg, fd.decl.Body)
 			if allIn(d, fd.decl.Body.List) {
 				c.regOnly[fn] = true
 				changed = true

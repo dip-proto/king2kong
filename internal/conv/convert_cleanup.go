@@ -40,24 +40,14 @@ func (c *converter) cleanupWiring() {
 					// removeDeadCode takes care of it, but never of init.
 					continue
 				}
-				del := c.deletableStmts(p, fd.Body)
+				del, lowered := c.deletableStmts(p, fd.Body)
 				dead := map[types.Object]bool{}
-				c.jumpTargets = map[string]bool{}
-				c.jumpKinds = map[string]map[token.Token]bool{}
+				c.jumpKinds = labelJumps(fd.Body, func(br *dst.BranchStmt) bool { return !del[br] })
 				c.reassigned = map[types.Object]bool{}
 				c.fixedResults = c.fixedSignature(p, fd)
 				dst.Inspect(fd.Body, func(n dst.Node) bool {
-					switch n := n.(type) {
-					case *dst.BranchStmt:
-						if n.Label != nil && !del[n] {
-							c.jumpTargets[n.Label.Name] = true
-							if c.jumpKinds[n.Label.Name] == nil {
-								c.jumpKinds[n.Label.Name] = map[token.Token]bool{}
-							}
-							c.jumpKinds[n.Label.Name][n.Tok] = true
-						}
-					case *dst.AssignStmt:
-						for _, l := range n.Lhs {
+					if as, ok := n.(*dst.AssignStmt); ok {
+						for _, l := range as.Lhs {
 							if !c.declares(p, l) {
 								c.reassigned[p.objectOf(l)] = true
 							}
@@ -65,9 +55,8 @@ func (c *converter) cleanupWiring() {
 					}
 					return true
 				})
-				fd.Body.List = c.pruneStmts(p, fd.Body.List, del, dead)
+				fd.Body.List = c.pruneStmts(p, fd.Body.List, del, lowered, dead)
 				for changed := true; changed; {
-					changed = false
 					fd.Body.List, changed = c.pruneDeadUses(p, fd.Body.List, dead)
 				}
 				hadResults := fd.Type.Results != nil && len(fd.Type.Results.List) > 0
@@ -87,9 +76,10 @@ func (c *converter) cleanupWiring() {
 	c.dropEmptiedCalls()
 }
 
-// singleStmt is the statements as one, as a header or post statement must
-// be: a function literal running them in order when there are several, or
-// nil.
+// singleStmt merges list into one statement, for spots such as an if header
+// that only take one.
+// Several statements become a function literal called on the spot, and an
+// empty list gives nil.
 func singleStmt(list []dst.Stmt) dst.Stmt {
 	switch len(list) {
 	case 0:
@@ -100,8 +90,9 @@ func singleStmt(list []dst.Stmt) dst.Stmt {
 	return &dst.ExprStmt{X: &dst.CallExpr{Fun: &dst.FuncLit{Type: &dst.FuncType{}, Body: &dst.BlockStmt{List: list}}}}
 }
 
-// setHeader replaces the init or post statement cur is at with s, which may
-// be nil, and tells whether it could.
+// setHeader puts s, which may be nil, in place of the statement at cur when
+// that is the header of an if, switch or for, or the statement of a label.
+// It reports false for any other spot.
 func setHeader(cur *dstutil.Cursor, s dst.Stmt) bool {
 	switch par := cur.Parent().(type) {
 	case *dst.IfStmt:
@@ -127,9 +118,27 @@ func setHeader(cur *dstutil.Cursor, s dst.Stmt) bool {
 	return true
 }
 
-// dropIfEmpty removes a function with nothing left in it, along with its
-// calls, and tells whether it did.
-// An init has none; main and a function used as a value stay.
+// labelJumps maps each label of body to the kinds of branch statements,
+// such as break or goto, that jump to it.
+// Only the branch statements keep accepts count.
+func labelJumps(body *dst.BlockStmt, keep func(*dst.BranchStmt) bool) map[string]map[token.Token]bool {
+	jumps := map[string]map[token.Token]bool{}
+	dst.Inspect(body, func(n dst.Node) bool {
+		if br, ok := n.(*dst.BranchStmt); ok && br.Label != nil && keep(br) {
+			if jumps[br.Label.Name] == nil {
+				jumps[br.Label.Name] = map[token.Token]bool{}
+			}
+			jumps[br.Label.Name][br.Tok] = true
+		}
+		return true
+	})
+	return jumps
+}
+
+// dropIfEmpty removes fd when nothing is left in its body, and reports
+// whether it did.
+// dropEmptiedCalls removes the calls to it later; an init has none.
+// main, methods, and functions with results or used as values are kept.
 func (c *converter) dropIfEmpty(p *Package, f *dst.File, fd *dst.FuncDecl) bool {
 	fn, ok := p.objectOf(fd.Name).(*types.Func)
 	if !ok || len(fd.Body.List) > 0 || fd.Type.Results != nil || fd.Recv != nil || fd.Name.Name == "main" || c.funcValues()[fn] {
@@ -140,12 +149,12 @@ func (c *converter) dropIfEmpty(p *Package, f *dst.File, fd *dst.FuncDecl) bool 
 	return true
 }
 
-// dropEmptiedCalls removes the calls to the functions cleanup emptied and
-// removed that their callers, cleaned up first, still make, keeping what
-// their arguments do.
-// A function left empty by that goes too, until nothing changes.
+// dropEmptiedCalls removes the calls still made to functions dropIfEmpty
+// deleted, keeping any argument that does something.
+// That can leave a caller empty in turn, so it repeats until nothing
+// changes.
 func (c *converter) dropEmptiedCalls() {
-	for changed := true; changed; {
+	for changed := len(c.emptied) > 0; changed; {
 		changed = false
 		for _, p := range c.prog.Packages {
 			for _, f := range p.Syntax {
@@ -175,8 +184,7 @@ func (c *converter) dropEmptiedCalls() {
 							}
 						}
 						if cur.Index() < 0 {
-							// The init or post statement of an if, switch or
-							// for, which takes a single statement or none.
+							// A header takes a single statement or none.
 							if !setHeader(cur, singleStmt(left)) {
 								return true
 							}
@@ -264,8 +272,9 @@ func (c *converter) nilDeadRefs(p *Package, s dst.Node, dead map[types.Object]bo
 	}, nil)
 }
 
-// evaluation is a statement computing e for what it does: the call itself
-// when it is one, which may return several values, or _ = e.
+// evaluation returns a statement that evaluates e for its side effects.
+// A call stands on its own, since it may return several values; anything
+// else, conversions and builtins included, becomes _ = e.
 func (c *converter) evaluation(p *Package, e dst.Expr) dst.Stmt {
 	if call, ok := unparen(e).(*dst.CallExpr); ok {
 		_, builtin := p.objectOf(call.Fun).(*types.Builtin)
@@ -276,20 +285,8 @@ func (c *converter) evaluation(p *Package, e dst.Expr) dst.Stmt {
 	return &dst.AssignStmt{Lhs: []dst.Expr{dst.NewIdent("_")}, Tok: token.ASSIGN, Rhs: []dst.Expr{e}}
 }
 
-// lowersToCalls reports whether a definition of kingpin values also calls a
-// helper doing other work, as in f := setup(app) where setup prints: it is
-// not deleted, so what holds it stays, but lowered to those calls.
-func (c *converter) lowersToCalls(p *Package, s dst.Stmt) bool {
-	if len(c.keptCalls(p, s)) == 0 {
-		return false
-	}
-	c.toCalls[s] = true
-	return true
-}
-
-// keptCalls returns the calls of a removed definition to helpers that also
-// do other work, as in f := setup(app) where setup prints too, as
-// statements in their order.
+// keptCalls returns, in order, what a removed statement must still run,
+// such as setup(app) in f := setup(app) when setup also prints something.
 func (c *converter) keptCalls(p *Package, s dst.Stmt) []dst.Stmt {
 	var values []dst.Expr
 	var out []dst.Stmt
@@ -322,9 +319,9 @@ func (c *converter) keptCalls(p *Package, s dst.Stmt) []dst.Stmt {
 	return out
 }
 
-// targetOperands returns what an assignment evaluates of its target before
-// storing: the operands of an index expression or of a pointer indirection,
-// implicit ones in selectors included.
+// targetOperands returns the parts of an assignment target that get
+// evaluated before the store, such as m and k in m[k] = v.
+// A selector counts too, since it may go through a pointer.
 func targetOperands(l dst.Expr) []dst.Expr {
 	switch l := unparen(l).(type) {
 	case *dst.IndexExpr:
@@ -337,10 +334,12 @@ func targetOperands(l dst.Expr) []dst.Expr {
 	return nil
 }
 
-// effectsLeft returns the statements computing what a removed value did:
-// the call itself for a helper that also does other work, or else, along
-// a chain of removed calls, receivers first, the parts that do something,
-// as in builder().Register(app) or app.Flag("x", help()).Bool().
+// effectsLeft returns the statements that must still run once the value v
+// is removed.
+// A call to a helper that also does other work is kept whole.
+// In a chain of removed calls, such as builder().Register(app) or
+// app.Flag("x", help()).Bool(), the receivers and arguments that do
+// something are kept, receivers first.
 func (c *converter) effectsLeft(p *Package, v dst.Expr) []dst.Stmt {
 	switch e := unparen(v).(type) {
 	case *dst.CallExpr:
@@ -366,7 +365,8 @@ func (c *converter) effectsLeft(p *Package, v dst.Expr) []dst.Stmt {
 			return c.effectsLeft(p, e.X)
 		}
 	case *dst.BinaryExpr:
-		// The right operand of && and || may not run, so it stays whole.
+		// The right operand of && and || only runs under a condition, so it
+		// is reported rather than kept.
 		if e.Op == token.LAND || e.Op == token.LOR {
 			out := c.effectsLeft(p, e.X)
 			if c.doesSomething(p, e.Y) {
@@ -409,8 +409,8 @@ func (c *converter) effectsLeft(p *Package, v dst.Expr) []dst.Stmt {
 	return out
 }
 
-// doesOtherWork reports whether call calls a function of the program that
-// does more than register grammar, and stays.
+// doesOtherWork reports whether call runs a function of the program that
+// does more than register grammar, and is therefore kept.
 func (c *converter) doesOtherWork(p *Package, call *dst.CallExpr) bool {
 	fn := c.g.in.staticCallee(p, call)
 	if fn == nil {
@@ -643,20 +643,22 @@ func (c *converter) hasTouched(n dst.Node) bool {
 	return found
 }
 
-// pruneStmts drops the deletable statements, descending into blocks and if
-// statements so the other work inside them survives.
-func (c *converter) pruneStmts(p *Package, list []dst.Stmt, del map[dst.Stmt]bool, dead map[types.Object]bool) []dst.Stmt {
+// pruneStmts drops the statements in del, descending into blocks and
+// control statements so the other work inside them survives.
+// The statements in lowered go too, but leave their kept calls behind.
+func (c *converter) pruneStmts(p *Package, list []dst.Stmt, del map[dst.Stmt]bool, lowered map[dst.Stmt][]dst.Stmt, dead map[types.Object]bool) []dst.Stmt {
 	var out []dst.Stmt
 	for _, s := range list {
-		if del[s] || c.toCalls[s] {
+		if del[s] || lowered[s] != nil {
 			c.markDefinedDead(p, s, dead)
 			out = append(out, c.callsLeft(p, s, dead)...)
 			continue
 		}
 		switch s := s.(type) {
 		case *dst.ReturnStmt:
-			// A helper returning a clause, as in return app.Flag(...),
-			// returns nothing any more, but what the clause's arguments did.
+			// A helper returning a clause, as in return app.Flag(...), now
+			// returns nothing, or nil if its signature must stay.
+			// What the clause's arguments did still runs.
 			if vals := c.g.in.stmtVals[s]; len(vals) > 0 && len(vals) == len(s.Results) && !slices.ContainsFunc(vals, func(v value) bool {
 				cl, ok := v.(vClause)
 				return !ok || cl.c.kind == kindApp
@@ -678,13 +680,13 @@ func (c *converter) pruneStmts(p *Package, list []dst.Stmt, del map[dst.Stmt]boo
 			c.foldNils(p, s, dead)
 			c.nilDeadRefs(p, s, dead)
 		}
-		prune := func(list []dst.Stmt) []dst.Stmt { return c.pruneStmts(p, list, del, dead) }
-		// A registration in an if, for or switch header goes too, but for
-		// the helper calls that also do other work: one stays in the
-		// header, more go right before the statement.
+		prune := func(list []dst.Stmt) []dst.Stmt { return c.pruneStmts(p, list, del, lowered, dead) }
+		// A registration in an if, for or switch header goes too.
+		// A single kept call stays in the header, and several go right
+		// before the statement.
 		var before []dst.Stmt
 		dropHeader := func(st *dst.Stmt) {
-			if *st == nil || !del[*st] && !c.toCalls[*st] {
+			if *st == nil || !del[*st] && lowered[*st] == nil {
 				return
 			}
 			c.markDefinedDead(p, *st, dead)
@@ -697,10 +699,10 @@ func (c *converter) pruneStmts(p *Package, list []dst.Stmt, del map[dst.Stmt]boo
 				before = append(before, calls...)
 			}
 		}
-		// A for post statement runs after each iteration, so its calls stay
-		// there, in a function literal when there are several.
+		// A for post statement runs after each iteration, so its kept calls
+		// must stay there.
 		dropPost := func(st *dst.Stmt) {
-			if *st == nil || !del[*st] && !c.toCalls[*st] {
+			if *st == nil || !del[*st] && lowered[*st] == nil {
 				return
 			}
 			c.markDefinedDead(p, *st, dead)
@@ -780,8 +782,9 @@ func (c *converter) pruneStmts(p *Package, list []dst.Stmt, del map[dst.Stmt]boo
 			rest := prune([]dst.Stmt{s.Stmt})
 			switch {
 			case len(rest) > 1:
-				// A goto runs them all from the first; break and continue
-				// need the label on the loop or switch, which comes last.
+				// A goto must land on the first of them, but break and
+				// continue need the label on the loop or switch, which
+				// comes last.
 				jumps := c.jumpKinds[s.Label.Name]
 				if jumps[token.GOTO] && (jumps[token.BREAK] || jumps[token.CONTINUE]) {
 					c.issue(p.position(s), "label %s is the target of both goto and break or continue, and its statement's header now runs before it; check the jumps by hand", s.Label.Name)
@@ -796,7 +799,7 @@ func (c *converter) pruneStmts(p *Package, list []dst.Stmt, del map[dst.Stmt]boo
 				continue
 			case len(rest) > 0:
 				s.Stmt = rest[0]
-			case c.jumpTargets[s.Label.Name]:
+			case c.jumpKinds[s.Label.Name] != nil:
 				// A jump still goes there.
 				s.Stmt = &dst.EmptyStmt{Implicit: true}
 			default:
@@ -1014,12 +1017,14 @@ func (c *converter) grammarCall(call *dst.CallExpr) bool {
 	return c.g.in.grammarCalls[call]
 }
 
-// doesSomething reports whether evaluating a registration argument does
-// more than compute its value: call, directly or through the program's own
-// functions, something outside the program besides kingpin and the pure
-// standard functions, send or receive on a channel, start a goroutine, or
-// write anything but a local variable, as writesOutside tells.
-// Methods building option structs, as JSONFlag() does, are plumbing.
+// doesSomething reports whether evaluating e, typically a registration
+// argument, does more than compute a value.
+// That means calling something outside the program other than kingpin or a
+// pure standard function, directly or through the program's own functions,
+// using a channel, starting a goroutine, or writing anything but a local
+// variable.
+//
+// Methods that only build option structs, as JSONFlag() does, don't count.
 func (c *converter) doesSomething(p *Package, e dst.Node) bool {
 	found := false
 	dst.Inspect(e, func(n dst.Node) bool {
@@ -1039,9 +1044,7 @@ func (c *converter) doesSomething(p *Package, e dst.Node) bool {
 				break
 			}
 			if b, ok := p.objectOf(n.Fun).(*types.Builtin); ok {
-				// print, panic, close, delete, copy and clear do something,
-				// and so does append, which may write into the array of the
-				// slice it is given.
+				// append may write into the array of the slice it is given.
 				switch b.Name() {
 				case "print", "println", "panic", "close", "delete", "copy", "clear":
 					found = true
@@ -1050,8 +1053,7 @@ func (c *converter) doesSomething(p *Package, e dst.Node) bool {
 				}
 				break
 			}
-			id, isIdent := n.Fun.(*dst.Ident)
-			if c.grammarCall(n) || isIdent && foldable[id.Path+"."+id.Name] && c.prog.formatsPlainly(p, n) {
+			if c.grammarCall(n) || foldsPlainly(p, n) {
 				break
 			}
 			fn := c.g.in.staticCallee(p, n)
@@ -1069,7 +1071,6 @@ func (c *converter) doesSomething(p *Package, e dst.Node) bool {
 		case *dst.SendStmt, *dst.GoStmt:
 			found = true
 		case *dst.RangeStmt:
-			// Ranging over a channel receives, and over a function calls it.
 			found = rangeCalls(p, n)
 		case *dst.IncDecStmt:
 			found = c.writesOutside(p, n.X)
@@ -1091,8 +1092,9 @@ func rangeCalls(p *Package, r *dst.RangeStmt) bool {
 	return false
 }
 
-// freshSlice reports whether e is a slice nothing else shares, which append
-// may write into: nil or a literal.
+// freshSlice reports whether e is nil or a slice literal.
+// Nothing else shares such a slice, so appending to it changes nothing
+// anyone sees.
 func freshSlice(p *Package, e dst.Expr) bool {
 	_, lit := unparen(e).(*dst.CompositeLit)
 	return lit || isNilIdent(p, e)
@@ -1107,7 +1109,8 @@ func formatsStd(fn *types.Func) bool {
 }
 
 // plainFormatters are the standard packages whose String, Error and Format
-// methods only format their values; expvar's Func, for one, calls back.
+// methods only format their values.
+// That rules out packages such as expvar, whose Func calls back.
 var plainFormatters = map[string]bool{
 	"bytes": true, "errors": true, "fmt": true, "io/fs": true, "math/big": true, "net": true,
 	"net/netip": true, "net/url": true, "os": true, "reflect": true, "regexp": true, "strings": true,
@@ -1295,7 +1298,7 @@ func (c *converter) effectsBesides(p *Package, e dst.Node, pure bool, skip func(
 		case *dst.FuncLit:
 			return false
 		case *dst.CallExpr:
-			// Its arguments still count, and the calls it is chained on.
+			// A skipped call's arguments and receiver still count.
 			if skip != nil && skip(n) {
 				parts := append([]dst.Expr{}, n.Args...)
 				if sel, ok := n.Fun.(*dst.SelectorExpr); ok {
@@ -1305,7 +1308,7 @@ func (c *converter) effectsBesides(p *Package, e dst.Node, pure bool, skip func(
 				return false
 			}
 			if tv, ok := p.tv(n.Fun); ok && tv.IsType() {
-				// Converting a slice to an array checks its length.
+				// Converting a slice to an array panics if it is too short.
 				found = len(n.Args) == 1 && isSlice(p.typeOf(n.Args[0])) && !isSlice(tv.Type)
 				break
 			}
@@ -1341,9 +1344,10 @@ func (c *converter) effectsBesides(p *Package, e dst.Node, pure bool, skip func(
 		case *dst.IndexExpr, *dst.IndexListExpr, *dst.SliceExpr, *dst.StarExpr, *dst.TypeAssertExpr:
 			found = true
 		case *dst.SelectorExpr:
-			// So does taking a method from a nil interface. A kingpin
-			// clause reached through the command, as in c.CmdClause, is
-			// grammar plumbing.
+			// Going through a nil pointer or taking a method from a nil
+			// interface panics too.
+			// A kingpin clause reached through a command, as in
+			// c.CmdClause, is just grammar plumbing.
 			if sel := p.selection(n); sel != nil && (sel.Indirect() && !c.prog.isKingpinType(sel.Type()) || sel.Kind() == types.MethodVal && types.IsInterface(sel.Recv())) {
 				found = true
 			}
@@ -1432,6 +1436,8 @@ func (c *converter) pureCall(p *Package, e dst.Expr) bool {
 
 // pruneSignature drops parameters of kingpin types that are no longer used,
 // and results that only returned removed values.
+// When fd must keep its signature, its callers pass nil to those
+// parameters instead.
 func (c *converter) pruneSignature(p *Package, fd *dst.FuncDecl, dead map[types.Object]bool) {
 	fn, _ := p.objectOf(fd.Name).(*types.Func)
 	sig := prunedSig{params: map[int]bool{}, nils: map[int]bool{}}
@@ -1440,7 +1446,7 @@ func (c *converter) pruneSignature(p *Package, fd *dst.FuncDecl, dead map[types.
 			c.pruned[fn] = sig
 		}
 	}()
-	fixed := c.fixedSignature(p, fd)
+	fixed := c.fixedResults
 	if fd.Type.Params != nil {
 		var kept []*dst.Field
 		idx := 0
@@ -1452,7 +1458,8 @@ func (c *converter) pruneSignature(p *Package, fd *dst.FuncDecl, dead map[types.
 			for _, nm := range f.Names {
 				o := p.objectOf(nm)
 				idx++
-				// A parameter whose argument does something stays with it.
+				// The parameter stays if some caller passes an argument
+				// that does something.
 				if o != nil && (c.prog.isKingpinType(o.Type()) || c.registersOnly(o.Type())) && !c.usedIn(p, fd.Body, o) && !c.listParams[o] && !c.argumentDoesWork(fn, idx-1) {
 					if fixed {
 						sig.nils[idx-1] = true
@@ -1471,37 +1478,36 @@ func (c *converter) pruneSignature(p *Package, fd *dst.FuncDecl, dead map[types.
 		}
 		fd.Type.Params.List = kept
 	}
-	if !fixed && c.deadNamedResults(p, fd) {
+	// Results go once no return gives them a value.
+	// Named ones must also be unused, since a bare return returns them.
+	results := fd.Type.Results
+	if !fixed && results != nil && len(results.List) > 0 && !returnsValues(fd.Body) &&
+		(len(results.List[0].Names) == 0 || c.deadNamedResults(p, fd)) {
 		fd.Type.Results = nil
 		sig.results = true
 	}
-	// Named results are returned by a bare return too.
-	if !fixed && fd.Type.Results != nil && len(fd.Type.Results.List) > 0 && len(fd.Type.Results.List[0].Names) == 0 {
-		returnsSomething := false
-		dst.Inspect(fd.Body, func(n dst.Node) bool {
-			if _, ok := n.(*dst.FuncLit); ok {
-				return false
-			}
-			if r, ok := n.(*dst.ReturnStmt); ok && len(r.Results) > 0 {
-				returnsSomething = true
-			}
-			return true
-		})
-		if !returnsSomething {
-			fd.Type.Results = nil
-			sig.results = true
-		}
-	}
 }
 
-// deadNamedResults reports whether fd's results are named kingpin values
-// that nothing assigns or reads any more, only returned by bare returns.
+// returnsValues reports whether body has a return with values, not counting
+// function literals.
+func returnsValues(body *dst.BlockStmt) bool {
+	found := false
+	dst.Inspect(body, func(n dst.Node) bool {
+		if _, ok := n.(*dst.FuncLit); ok {
+			return false
+		}
+		if r, ok := n.(*dst.ReturnStmt); ok && len(r.Results) > 0 {
+			found = true
+		}
+		return !found
+	})
+	return found
+}
+
+// deadNamedResults reports whether fd's named results are all kingpin
+// values that nothing uses any more.
 func (c *converter) deadNamedResults(p *Package, fd *dst.FuncDecl) bool {
-	results := fd.Type.Results
-	if results == nil || len(results.List) == 0 || len(results.List[0].Names) == 0 {
-		return false
-	}
-	for _, f := range results.List {
+	for _, f := range fd.Type.Results.List {
 		for _, nm := range f.Names {
 			o := p.objectOf(nm)
 			if o == nil || !c.prog.isKingpinType(o.Type()) || c.usedIn(p, fd.Body, o) {
@@ -1509,21 +1515,11 @@ func (c *converter) deadNamedResults(p *Package, fd *dst.FuncDecl) bool {
 			}
 		}
 	}
-	bare := true
-	dst.Inspect(fd.Body, func(n dst.Node) bool {
-		if _, ok := n.(*dst.FuncLit); ok {
-			return false
-		}
-		if r, ok := n.(*dst.ReturnStmt); ok && len(r.Results) > 0 {
-			bare = false
-		}
-		return bare
-	})
-	return bare
+	return true
 }
 
-// fixedSignature reports whether fd keeps its signature: it is used as a
-// value, or it is a method an interface may call.
+// fixedSignature reports whether fd must keep its signature, because it is
+// used as a value or is a method an interface may call.
 func (c *converter) fixedSignature(p *Package, fd *dst.FuncDecl) bool {
 	fn, _ := p.objectOf(fd.Name).(*types.Func)
 	return fn != nil && (c.funcValues()[fn] || fd.Recv != nil && c.interfaceMethods()[fn.Name()])
@@ -1945,6 +1941,10 @@ func (c *converter) newFile(p *Package, name string, imports map[string]string, 
 // render turns every changed file back into source.
 func (c *converter) render() error {
 	var errs []string
+	reported := map[string]bool{}
+	for _, is := range c.res.Issues {
+		reported[is.Pos.Filename] = true
+	}
 	for f, p := range c.ed.dirty {
 		var decls []dst.Decl
 		for _, d := range f.Decls {
@@ -1953,7 +1953,9 @@ func (c *converter) render() error {
 			}
 		}
 		f.Decls = decls
-		c.reportKingpinLeft(p, f)
+		if name := p.filename(f); !reported[name] && !strings.HasSuffix(name, "_test.go") {
+			c.reportKingpinLeft(p, f)
+		}
 		src, err := p.renderFile(f)
 		if err != nil {
 			errs = append(errs, err.Error())
@@ -1998,13 +2000,10 @@ func (p *Package) renderFileWithAliases(f *dst.File, aliases map[string]string) 
 }
 
 // reportKingpinLeft reports the first use of kingpin left in a converted
-// file that no other report points into.
-// Tests are left to the test conversion.
+// file.
+// render skips files that already have an issue, and test files, which the
+// test conversion handles.
 func (c *converter) reportKingpinLeft(p *Package, f *dst.File) {
-	name := p.filename(f)
-	if strings.HasSuffix(name, "_test.go") || slices.ContainsFunc(c.res.Issues, func(is Issue) bool { return is.Pos.Filename == name }) {
-		return
-	}
 	var left *dst.Ident
 	dst.Inspect(f, func(n dst.Node) bool {
 		if id, ok := n.(*dst.Ident); ok && left == nil && c.prog.isKingpinPath(id.Path) {
@@ -2017,16 +2016,19 @@ func (c *converter) reportKingpinLeft(p *Package, f *dst.File) {
 	}
 	pos := p.position(left)
 	if !pos.IsValid() {
-		pos = token.Position{Filename: name}
+		pos = token.Position{Filename: p.filename(f)}
 	}
 	c.issue(pos, "this file still uses kingpin's %s after the conversion; finish it by hand", left.Name)
 }
 
-// sharedImportNames picks one name for each package f imports under several,
-// a dot import included, as the restorer writes a single import per package:
-// the first of its names that nothing in f declares and no other import of f
-// uses, falling back to a numbered one.
-// The package's own name is given as "", which leaves the import unaliased.
+// sharedImportNames picks a single name for each package f imports under
+// several names, a dot import included.
+// The restorer writes only one import per package, so every reference has
+// to use the same name.
+//
+// It is the first name that f doesn't declare and no other import uses,
+// or a numbered one when none is free.
+// "" stands for the package's own name, which needs no alias.
 func sharedImportNames(p *Package, f *dst.File) map[string]string {
 	names := map[string][]string{}
 	var paths []string
@@ -2037,11 +2039,7 @@ func sharedImportNames(p *Package, f *dst.File) map[string]string {
 		}
 		for _, s := range gd.Specs {
 			imp := s.(*dst.ImportSpec)
-			path, _ := strconv.Unquote(imp.Path.Value)
-			name := p.names[path]
-			if imp.Name != nil {
-				name = imp.Name.Name
-			}
+			path, name := p.importName(imp)
 			if names[path] == nil {
 				paths = append(paths, path)
 			}

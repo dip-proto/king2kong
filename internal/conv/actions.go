@@ -18,21 +18,14 @@ import (
 // it.
 func (c *converter) convertActions() {
 	c.checkSharedTypes()
-	registered := map[*types.Func]int{}
-	for _, n := range c.tree.nodes {
-		for _, fn := range n.cl.actions {
-			if _, ok := registered[fn.fn]; !ok {
-				registered[fn.fn] = c.actionRegistrations(fn.fn)
-			}
-		}
-	}
+	elsewhere := c.usedElsewhere()
 	// Commands sharing a struct share its AfterApply, which runs their
 	// actions once.
 	ran := map[*types.Named]bool{}
 	for _, n := range c.tree.nodes {
 		var calls []string
 		for _, fn := range n.cl.actions {
-			if call := c.convertAction(n, fn, registered[fn.fn]); call != "" {
+			if call := c.convertAction(n, fn, elsewhere[fn.fn]); call != "" {
 				calls = append(calls, call)
 			}
 		}
@@ -62,7 +55,7 @@ func (c *converter) convertActions() {
 
 // convertAction prepares the Action fn of n for a hook, returning the call
 // to add to the AfterApply of n's struct when it has one.
-func (c *converter) convertAction(n *node, fn vFunc, registrations int) string {
+func (c *converter) convertAction(n *node, fn vFunc, elsewhere bool) string {
 	cl := n.cl
 	what := fmt.Sprintf("the Action of %s", describeClause(cl))
 	fd, ok := c.prog.funcs[fn.fn]
@@ -80,7 +73,7 @@ func (c *converter) convertAction(n *node, fn vFunc, registrations int) string {
 		c.issue(fd.pkg.position(fd.decl), "%s, %s, reads its *kingpin.ParseContext; run it by hand after parsing", what, fn.fn.Name())
 		return ""
 	}
-	if c.countUses(fn.fn) != registrations {
+	if elsewhere {
 		c.issue(fd.pkg.position(fd.decl), "%s, %s, is also used elsewhere with its kingpin signature", what, fn.fn.Name())
 		return ""
 	}
@@ -114,11 +107,7 @@ func (c *converter) convertAction(n *node, fn vFunc, registrations int) string {
 			c.issue(cl.pos, "%s, %s, is declared in another package than the CLI; call it from an AfterApply method of the command by hand", what, fn.fn.Name())
 			return ""
 		}
-		g := c.genActions[n]
-		if g == nil {
-			g = &genActions{}
-			c.genActions[n] = g
-		}
+		g := c.actionsOf(n)
 		g.steps = append(g.steps, actionStep{call: fn.fn.Name() + "()"})
 	}
 	fd.decl.Type.Params.List = nil
@@ -220,11 +209,14 @@ func (c *converter) usesObject(fd funcDecl, o types.Object) bool {
 	return false
 }
 
-// actionRegistrations counts the Action calls of the source naming fn, as
-// in cmd.Action(run), however many times they run, if ever: a helper
-// registering it on several commands names it once.
-func (c *converter) actionRegistrations(fn *types.Func) int {
-	n := 0
+// usedElsewhere reports, for each function passed to Action as in
+// cmd.Action(run), whether the source also refers to it somewhere else.
+// Those other uses still need the kingpin signature that the hook drops.
+//
+// Both sides are counted in the source, so code that never runs counts too,
+// and a helper registering one function on several commands counts once.
+func (c *converter) usedElsewhere() map[*types.Func]bool {
+	registered := map[*types.Func]int{}
 	for _, p := range c.prog.Packages {
 		for _, f := range p.Syntax {
 			dst.Inspect(f, func(node dst.Node) bool {
@@ -232,35 +224,38 @@ func (c *converter) actionRegistrations(fn *types.Func) int {
 				if !ok || len(call.Args) != 1 {
 					return true
 				}
-				sel, ok := call.Fun.(*dst.SelectorExpr)
-				if !ok || sel.Sel.Name != "Action" || !c.prog.isKingpinType(p.typeOf(sel.X)) {
-					return true
-				}
-				var ref dst.Node = unparen(call.Args[0])
-				if s, ok := ref.(*dst.SelectorExpr); ok {
-					ref = s.Sel
-				}
-				if p.objectOf(ref) == fn {
-					n++
+				if sel, ok := call.Fun.(*dst.SelectorExpr); ok && sel.Sel.Name == "Action" && c.prog.isKingpinType(p.typeOf(sel.X)) {
+					if fn, ok := p.objectOf(unparen(call.Args[0])).(*types.Func); ok {
+						registered[fn]++
+					}
 				}
 				return true
 			})
 		}
 	}
-	return n
-}
-
-// countUses counts the references to o in the converted packages.
-func (c *converter) countUses(o types.Object) int {
-	n := 0
+	uses := map[*types.Func]int{}
 	for _, p := range c.prog.Packages {
 		for _, used := range p.TypesInfo.Uses {
-			if used == o {
-				n++
+			if fn, ok := used.(*types.Func); ok && registered[fn] > 0 {
+				uses[fn]++
 			}
 		}
 	}
-	return n
+	out := map[*types.Func]bool{}
+	for fn, n := range registered {
+		out[fn] = uses[fn] != n
+	}
+	return out
+}
+
+// actionsOf returns the actions run by the generated AfterApply of n.
+func (c *converter) actionsOf(n *node) *genActions {
+	g := c.genActions[n]
+	if g == nil {
+		g = &genActions{}
+		c.genActions[n] = g
+	}
+	return g
 }
 
 func describeClause(cl *clause) string {
@@ -270,15 +265,15 @@ func describeClause(cl *clause) string {
 	return fmt.Sprintf("command %q", cl.fullName())
 }
 
-// genActions is what the generated AfterApply of the CLI, or of a command
-// without its own struct, runs: calls to the former Action functions, in
-// registration order.
+// genActions lists the calls to former Action functions that a generated
+// AfterApply makes, in registration order.
+// It is used for the CLI and for commands without a struct of their own.
 type genActions struct {
 	steps []actionStep
 }
 
-// actionStep is a call such as run(), made from a function literal when
-// moved is set.
+// actionStep is a call such as run().
+// moved is set when the function used to be a literal.
 type actionStep struct {
 	call  string
 	moved bool
@@ -314,11 +309,7 @@ func (c *converter) convertActionLits() {
 				name = c.moveActionLit(n.cl, al, uses[al.lit] > 1, moved)
 				names[al.lit] = name
 			}
-			g := c.genActions[n]
-			if g == nil {
-				g = &genActions{}
-				c.genActions[n] = g
-			}
+			g := c.actionsOf(n)
 			// It goes after the named actions registered before it.
 			at, named := 0, 0
 			for at < len(g.steps) && (named < al.before || g.steps[at].moved) {
@@ -332,8 +323,8 @@ func (c *converter) convertActionLits() {
 	}
 }
 
-// actionLitProblem tells why an Action function literal cannot become a
-// function of its own, or returns "".
+// actionLitProblem says why an Action function literal cannot become a
+// function of its own, or returns "" if it can.
 func (c *converter) actionLitProblem(al actionLit) string {
 	p := al.pkg
 	lit := al.lit
@@ -371,37 +362,34 @@ func (c *converter) actionLitProblem(al actionLit) string {
 	return why
 }
 
-// declOf returns the top-level declaration of p holding n, with its file.
+// declOf returns the file of p holding n, and the index of the top-level
+// declaration that contains it.
 func (c *converter) declOf(p *Package, n dst.Node) (*dst.File, int) {
 	for _, f := range p.Syntax {
-		for i, d := range f.Decls {
-			found := false
-			dst.Inspect(d, func(x dst.Node) bool {
-				found = found || x == n
-				return !found
-			})
-			if found {
-				return f, i
-			}
+		if i := slices.IndexFunc(f.Decls, func(d dst.Decl) bool { return containsNode(d, n) }); i >= 0 {
+			return f, i
 		}
 	}
 	return nil, -1
 }
 
-// moveActionLit turns an Action function literal into a function declared
-// after the one registering it and the literals moved before, and returns its
-// name.
-// A literal shared by several commands is named after the function
-// registering them.
-// The literal itself goes with the registration.
+// moveActionLit moves the body of an Action function literal into a new
+// function and returns its name.
+// The function goes right after the one registering it, and after the
+// literals moved there before.
+// A literal shared by several commands is named after the function that
+// registers them.
+//
+// The emptied literal is removed later, along with the registration.
 func (c *converter) moveActionLit(cl *clause, al actionLit, shared bool, moved map[dst.Decl]bool) string {
 	p, lit := al.pkg, al.lit
 	f, i := c.declOf(p, lit)
+	anchor := f.Decls[i]
 	base, doc := "app", "the command line"
 	switch {
 	case shared:
 		base, doc = "shared", "one of the commands sharing it"
-		if fd, ok := f.Decls[i].(*dst.FuncDecl); ok {
+		if fd, ok := anchor.(*dst.FuncDecl); ok {
 			base, doc = fd.Name.Name, "a command registered by "+fd.Name.Name
 		}
 	case cl.kind != kindApp:
@@ -417,15 +405,14 @@ func (c *converter) moveActionLit(cl *clause, al actionLit, shared bool, moved m
 		Type: &dst.FuncType{Func: true, Params: &dst.FieldList{}, Results: results},
 		Body: lit.Body,
 	}
-	fd.Decs.Before = dst.EmptyLine
 	fd.Decs.Start.Append(fmt.Sprintf("// %s runs once %s is parsed.", name, doc))
 	lit.Type.Results, lit.Body = nil, &dst.BlockStmt{}
 	for i+1 < len(f.Decls) && moved[f.Decls[i+1]] {
 		i++
+		anchor = f.Decls[i]
 	}
-	f.Decls = slices.Insert(f.Decls, i+1, dst.Decl(fd))
+	c.ed.insertAfter(p, f, anchor, []dst.Decl{fd})
 	moved[fd] = true
-	c.ed.touch(p, f)
 	return name
 }
 
@@ -433,7 +420,7 @@ func (c *converter) moveActionLit(cl *clause, al actionLit, shared bool, moved m
 // typeName, which runs a node's former Actions.
 func afterApplySource(typeName string, g *genActions) string {
 	var b strings.Builder
-	b.WriteString("// AfterApply runs the command, as kingpin ran its Action after parsing.\n")
+	b.WriteString(afterDoc(false, false, true))
 	fmt.Fprintf(&b, "func (*%s) AfterApply() error {\n", typeName)
 	var calls []string
 	for _, st := range g.steps {

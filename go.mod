@@ -1,4 +1,4 @@
-module kingpin2kong
+module king2kong
 
 go 1.26.4
 

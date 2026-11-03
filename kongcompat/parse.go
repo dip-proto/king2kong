@@ -236,10 +236,10 @@ func hideEnvars(k *kong.Kong, given map[*kong.Value]bool) (restore func()) {
 // MustParse is Parse that stops on errors, like kingpin.MustParse.
 // It prints "<program>: error: <message>, try --help" and exits with
 // status 1.
-// kingpin.MustParse reported through kingpin.CommandLine, not the
-// application, so the program is named after its executable and the message
-// goes to the standard error the program started with, as with Fatalf.
-// The parser's Exit is bypassed.
+//
+// kingpin reported this through kingpin.CommandLine, not the application.
+// So, as with Fatalf, the name comes from the executable, the message goes
+// to the stderr the program started with, and k's Exit is not used.
 func MustParse(k *kong.Kong, args []string, uc *UsageContext) string {
 	cmd, err := Parse(k, args, uc)
 	if err != nil {

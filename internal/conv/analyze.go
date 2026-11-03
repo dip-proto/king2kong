@@ -3,9 +3,9 @@ package conv
 import (
 	"cmp"
 	"fmt"
-	"go/token"
 	"go/types"
 	"io"
+	"maps"
 	"slices"
 	"strings"
 
@@ -31,6 +31,7 @@ func Analyze(prog *Program) *Grammar {
 	for _, r := range roots {
 		in.run(r)
 	}
+	in.finish()
 	g := &Grammar{prog: prog, in: in, Apps: in.apps, roots: roots, touched: in.touched}
 	in.resolveInstances()
 	return g
@@ -100,39 +101,9 @@ func (in *interp) findRoots() []*types.Func {
 			return true
 		})
 	}
-	// runPackageVars already ran the functions package-level initializers
-	// call, as in var verbose = flag().
-	for _, p := range in.prog.Packages {
-		for _, f := range p.Syntax {
-			for _, d := range f.Decls {
-				gd, ok := d.(*dst.GenDecl)
-				if !ok || gd.Tok != token.VAR {
-					continue
-				}
-				for _, sp := range gd.Specs {
-					if !in.mentionsBuilder(p, sp) {
-						continue
-					}
-					dst.Inspect(sp, func(n dst.Node) bool {
-						if c, ok := n.(*dst.CallExpr); ok {
-							if callee := in.staticCallee(p, c); callee != nil {
-								callers[callee] = append(callers[callee], nil)
-							}
-						}
-						return true
-					})
-				}
-			}
-		}
-	}
-	for fn := range callers {
-		// Several init functions share a name, and nil stands for a
-		// package initializer.
-		slices.SortStableFunc(callers[fn], funcOrder)
-	}
 	// A function registering on an application it did not create, such as
-	// kingpin.CommandLine or a package-level one, is run from its callers
-	// too, so the statements calling it are known to build grammar.
+	// kingpin.CommandLine or a package-level one, also runs from its callers.
+	// That way, the statements calling it are known to build grammar.
 	seen := map[*types.Func]bool{}
 	var roots []*types.Func
 	var visit func(fn *types.Func)
@@ -142,40 +113,28 @@ func (in *interp) findRoots() []*types.Func {
 		}
 		seen[fn] = true
 		others := slices.DeleteFunc(slices.Clone(callers[fn]), func(c *types.Func) bool { return c == fn })
-		if len(others) > 0 && !slices.ContainsFunc(others, func(c *types.Func) bool { return c != nil }) {
-			return
-		}
-		if (returnsApp(fn) || makers[fn] && !creates[fn]) && len(others) > 0 {
+		slices.SortFunc(others, funcOrder)
+		switch {
+		case len(others) == 0 && in.initCalled[fn]:
+			// runPackageVars already ran it, as in var verbose = flag().
+		case len(others) > 0 && (returnsApp(fn) || makers[fn] && !creates[fn]):
 			for _, c := range others {
-				if c != nil {
-					visit(c)
-				}
+				visit(c)
 			}
-			return
+		default:
+			roots = append(roots, fn)
 		}
-		roots = append(roots, fn)
 	}
-	var makerList []*types.Func
-	for fn := range makers {
-		makerList = append(makerList, fn)
-	}
-	slices.SortFunc(makerList, funcOrder)
-	for _, fn := range makerList {
+	for _, fn := range slices.SortedFunc(maps.Keys(makers), funcOrder) {
 		visit(fn)
 	}
 	return roots
 }
 
-// funcOrder orders functions by name, then by position, with nil first.
+// funcOrder gives functions a stable order, by full name and then by
+// position, since all init functions share a name.
 func funcOrder(a, b *types.Func) int {
-	switch {
-	case a == b:
-		return 0
-	case a == nil:
-		return -1
-	case b == nil:
-		return 1
-	case a.FullName() != b.FullName():
+	if a.FullName() != b.FullName() {
 		return strings.Compare(a.FullName(), b.FullName())
 	}
 	return cmp.Compare(a.Pos(), b.Pos())

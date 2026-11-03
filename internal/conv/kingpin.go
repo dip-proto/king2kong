@@ -90,8 +90,9 @@ func (in *interp) kingpinFunc(fr *frame, c *dst.CallExpr, name string, args []va
 	return []value{vUnknown{}}
 }
 
-// setHelp applies Help(text): the last help given wins, computed or not.
-// The application's own help is its description, which stays constant.
+// setHelp applies Help(text), which replaces any help given before.
+// Only commands, flags and arguments can get a help computed at run time;
+// the application's help is its description.
 func (in *interp) setHelp(fr *frame, c *dst.CallExpr, cl *clause, str func(int) (string, bool)) {
 	cl.help, cl.helpOK = str(0)
 	if cl.helpExpr != nil {
@@ -104,16 +105,12 @@ func (in *interp) setHelp(fr *frame, c *dst.CallExpr, cl *clause, str func(int) 
 	}
 }
 
-// runtimeHelp records the help text of f computed at run time, which reaches
-// kong through a variable, as long as it can be computed where the parser is
-// built.
+// runtimeHelp records a help text of f computed at run time, which reaches
+// kong through a variable.
+// That only works if e can be computed where the parser is built.
 func (in *interp) runtimeHelp(fr *frame, f *clause, e dst.Expr) {
 	if !in.contextFree(fr.pkg, e) {
-		if f.kind == kindCommand {
-			f.issue("help text is computed from local values")
-			return
-		}
-		// Reported once no later Help replaces it.
+		// Reported at the end, unless a later Help replaces it.
 		f.localHelp = true
 		return
 	}
@@ -123,9 +120,22 @@ func (in *interp) runtimeHelp(fr *frame, f *clause, e dst.Expr) {
 	f.helpSeq = in.evaluations
 }
 
-// takePriors records, at the first parse, what each destination registered
-// so far holds, which kingpin left there when its flag was absent.
-// Writes after parsing don't count.
+// finish settles what is only known at the end of the run.
+// Destinations get their prior values if no parse was seen, and help texts
+// computed from locals that no later Help replaced are reported.
+func (in *interp) finish() {
+	in.takePriors()
+	for _, cl := range in.clauses {
+		if cl.localHelp {
+			cl.issue("help text is computed from local values")
+		}
+	}
+}
+
+// takePriors records what each destination registered so far holds when the
+// program first parses.
+// kingpin left that value alone when the flag was absent, so it acts as a
+// default; writes after parsing don't count.
 func (in *interp) takePriors() {
 	for _, cl := range in.clauses {
 		if cl.dst != nil && !cl.priorTaken {
@@ -164,32 +174,18 @@ func (in *interp) kingpinMethod(fr *frame, c *dst.CallExpr, cl *clause, name str
 	switch cl.kind {
 	case kindApp, kindCommand:
 		switch name {
-		case "Command":
-			cmd := in.newClause(kindCommand, cl, pos, fr)
-			cmd.name, cmd.nameOK = str(0)
-			cmd.help, cmd.helpOK = str(1)
-			if len(args) >= 2 && !cmd.helpOK && len(c.Args) >= 2 {
-				in.runtimeHelp(fr, cmd, c.Args[1])
+		case "Command", "Flag", "Arg":
+			kind := map[string]clauseKind{"Command": kindCommand, "Flag": kindFlag, "Arg": kindArg}[name]
+			nc := in.newClause(kind, cl, pos, fr)
+			nc.name, nc.nameOK = str(0)
+			nc.help, nc.helpOK = str(1)
+			if !nc.nameOK {
+				nc.issue(kind.String() + " name is not a constant")
 			}
-			if !cmd.nameOK {
-				cmd.issue("command name is not a constant")
+			if len(args) >= 2 && !nc.helpOK && len(c.Args) >= 2 {
+				in.runtimeHelp(fr, nc, c.Args[1])
 			}
-			return []value{vClause{cmd}}
-		case "Flag", "Arg":
-			kind := kindFlag
-			if name == "Arg" {
-				kind = kindArg
-			}
-			f := in.newClause(kind, cl, pos, fr)
-			f.name, f.nameOK = str(0)
-			f.help, f.helpOK = str(1)
-			if !f.nameOK {
-				f.issue(name + " name is not a constant")
-			}
-			if len(args) >= 2 && !f.helpOK && len(c.Args) >= 2 {
-				in.runtimeHelp(fr, f, c.Args[1])
-			}
-			return []value{vClause{f}}
+			return []value{vClause{nc}}
 		case "GetFlag":
 			n, _ := str(0)
 			for _, ch := range cl.flags() {
@@ -218,7 +214,6 @@ func (in *interp) kingpinMethod(fr *frame, c *dst.CallExpr, cl *clause, name str
 			in.setHelp(fr, c, cl, str)
 			return self
 		case "Version":
-			cl.version, cl.hasVersion = str(0)
 			cl.versionAt = in.nextID
 			return self
 		case "FullCommand", "Model", "Parse", "ParseContext", "Usage", "UsageForContext",
@@ -246,7 +241,7 @@ func (in *interp) kingpinMethod(fr *frame, c *dst.CallExpr, cl *clause, name str
 			cl.issue(name + " has no automatic kong translation")
 			return self
 		case "Writers", "Writer", "Terminate", "UsageTemplate", "UsageWriter", "ErrorWriter", "Author", "HelpFlag", "UsageContext":
-			cl.runtimeConfig = append(cl.runtimeConfig, name)
+			// Settings the application layer converts.
 			return self
 		}
 	case kindFlag, kindArg:

@@ -16,7 +16,7 @@ import (
 	"github.com/dave/dst"
 	"github.com/dave/dst/dstutil"
 
-	"kingpin2kong/kongtag"
+	"king2kong/kongtag"
 )
 
 // convertTree adds the subcommand fields to the command structs, generates
@@ -87,8 +87,8 @@ func (c *converter) convertTree() {
 		groups := c.collectPkgFlags()
 		c.pkgFlagsOf = map[*clause]bool{}
 		for _, g := range groups {
-			for _, b := range g.bindings {
-				c.pkgFlagsOf[b.cl] = true
+			for _, pf := range g.flags {
+				c.pkgFlagsOf[pf.b.cl] = true
 			}
 		}
 		pkgFlagLines = c.convertPkgFlags(groups, imports)
@@ -98,9 +98,8 @@ func (c *converter) convertTree() {
 		rootTaken[ch.field] = true
 	}
 	rootStorage := c.storageFields(t.Root, root.Types, imports, c.cliVar, rootTaken)
-	c.rootTaken = rootTaken
 	if c.main != nil {
-		c.prepareMain()
+		c.prepareMain(rootTaken)
 	}
 	c.convertActionLits()
 
@@ -159,9 +158,8 @@ func (c *converter) convertTree() {
 	if c.main != nil {
 		flagLines = append(flagLines, c.main.extraFields...)
 		if c.main.version != nil || c.hasVersionCall() {
-			// A command may already use the Version field.
+			// A command or flag may already be named Version.
 			field := firstFree(func(n string) bool { return rootTaken[n] }, "Version", "VersionFlag")
-			rootTaken[field] = true
 			line := field + " kong.VersionFlag " + tagLiteral(versionTag(t.Root.cl, field).String())
 			flagLines = append(flagLines, line)
 			c.fieldOrder[line] = 2*t.Root.cl.versionAt + 1
@@ -323,12 +321,7 @@ func (c *converter) freeName(p *Package, candidates ...string) string {
 		}
 		for _, f := range p.Syntax {
 			for _, imp := range f.Imports {
-				path, _ := strconv.Unquote(imp.Path.Value)
-				local := p.names[path]
-				if imp.Name != nil {
-					local = imp.Name.Name
-				}
-				if local == name {
+				if _, local := p.importName(imp); local == name {
 					return true
 				}
 			}

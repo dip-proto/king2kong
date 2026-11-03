@@ -7,10 +7,11 @@ import (
 	"github.com/alecthomas/kong"
 )
 
-// Vars holds defaults and help texts computed at run time, for flags,
-// arguments and commands whose tag names one of them, as in
+// Vars holds defaults and help texts that are only known at run time.
+// A flag, argument or command refers to one by name in its tag, as in
 // default:"${limit_default}".
-// Unlike kong.Vars, a value is used as is, and a $ in it stays a plain $.
+//
+// Unlike with kong.Vars, values are used as is, so a $ stays a $.
 // Only a default or help that is exactly ${name} gets replaced.
 type Vars map[string]string
 
@@ -26,29 +27,25 @@ func (v Vars) Apply(k *kong.Kong) error {
 }
 
 func (v Vars) fill(n *kong.Node) {
-	values(n, func(val *kong.Value) {
-		if s, ok := v.lookup(val.Default); ok {
-			val.Default = s
-		}
-		if s, ok := v.lookup(val.Help); ok {
-			val.Help = s
-		}
-	})
 	nodes(n, func(n *kong.Node) {
-		if s, ok := v.lookup(n.Help); ok {
-			n.Help = s
+		v.replace(&n.Help)
+		for _, val := range ownValues(n) {
+			v.replace(&val.Default)
+			v.replace(&val.Help)
 		}
 	})
 }
 
-// lookup returns the escaped variable that ref, such as ${name}, refers to.
-func (v Vars) lookup(ref string) (string, bool) {
-	name, ok := strings.CutPrefix(ref, "${")
+// replace substitutes the variable when *ref is exactly ${name}.
+// Its $ signs are doubled, since kong still interpolates the result once.
+func (v Vars) replace(ref *string) {
+	name, ok := strings.CutPrefix(*ref, "${")
 	if !ok || !strings.HasSuffix(name, "}") {
-		return "", false
+		return
 	}
-	s, ok := v[strings.TrimSuffix(name, "}")]
-	return strings.ReplaceAll(s, "$", "$$"), ok
+	if s, ok := v[strings.TrimSuffix(name, "}")]; ok {
+		*ref = strings.ReplaceAll(s, "$", "$$")
+	}
 }
 
 // CommandVars applies the Vars returned by every command struct that has a

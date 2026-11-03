@@ -155,9 +155,10 @@ func (c *converter) storageFields(n *node, pkg *types.Package, imports map[strin
 // prepareMain decides which variables of a main-style program become CLI
 // fields: those holding a value, a command, a command struct or a flag
 // destination.
-func (c *converter) prepareMain() {
+// taken holds the CLI field names already in use.
+func (c *converter) prepareMain(taken map[string]bool) {
 	mp := c.main
-	// (a) = x assigns a like a = x does, and is easier to follow as such.
+	// (a) = x is just a = x, and simpler to match that way.
 	for _, f := range c.tree.RootPkg.Syntax {
 		dst.Inspect(f, func(n dst.Node) bool {
 			if as, ok := n.(*dst.AssignStmt); ok {
@@ -191,15 +192,14 @@ func (c *converter) prepareMain() {
 			}
 		case vObj:
 			// A copy of a command struct, as in snapshot := cmd, stays a
-			// copy; only the variable kingpin wrote into is replaced.
+			// copy.
+			// Only the variable kingpin wrote into is replaced.
 			if p, ok := c.instancePath(val.o); ok && !c.copiesVariable(obj) {
 				mp.repl[obj] = replacement{p, false}
 			}
 		}
 	}
-	// Flags written into plain variables become fields of the CLI, named
-	// apart from its commands and flag values.
-	taken := c.rootTaken
+	// Flags written into plain variables become fields of the CLI.
 	writers := map[*types.Var]*binding{}
 	for _, b := range c.plan.bindings {
 		if b.dstVar == nil || b.inst != nil {
@@ -600,10 +600,13 @@ func (c *converter) rewriteMain() {
 	c.findPointers()
 	wired := c.main.flags == nil
 	for _, f := range root.Syntax {
-		changed := c.declareParsers(root, f)
+		// The flags struct is wired first, so the parser declared right
+		// before kingpin.Parse() comes after it.
+		changed := false
 		if !wired && c.wireFlags(root, f) {
 			wired, changed = true, true
 		}
+		changed = c.declareParsers(root, f) || changed
 		for _, d := range f.Decls {
 			if c.ed.removed[d] {
 				continue
@@ -658,14 +661,14 @@ func (c *converter) rewriteMain() {
 						c.ed.touch(p, f)
 					}
 				case *dst.CallExpr:
-					// Calls in the other packages follow the parameters their
-					// callees lost too.
+					// Calls in other packages also drop the arguments of
+					// pruned parameters.
 					if p != root && c.followPrunedCall(p, n) {
 						c.ed.touch(p, f)
 					}
-					// A conversion read from, as in
-					// (*kingpin.Application)(nil).Name, stays a kingpin one,
-					// since the kong parser has none of its fields.
+					// A conversion whose result is read from, as in
+					// (*kingpin.Application)(nil).Name, keeps the kingpin
+					// type, since the kong parser has none of its fields.
 					if tv, ok := p.tv(n.Fun); ok && tv.IsType() && read[n] != "" {
 						if c.isAppType(tv.Type) && slices.ContainsFunc(n.Args, func(a dst.Expr) bool { return c.isAppType(p.typeOf(a)) && !isNilIdent(p, a) }) {
 							c.issue(p.position(n), "this reads the kingpin application's %s, which the kong parser that replaced it does not have; rewrite it by hand", read[n])
@@ -676,8 +679,8 @@ func (c *converter) rewriteMain() {
 						return false
 					}
 				case *dst.Ident:
-					// The code the conversion keeps passes the application
-					// around as the kong parser it now is.
+					// Kept code now passes the kong parser around where it
+					// passed the application.
 					if n.Name == "Application" && c.prog.isKingpinPath(n.Path) {
 						n.Name, n.Path = "Kong", "github.com/alecthomas/kong"
 						c.ed.touch(p, f)
@@ -772,9 +775,10 @@ func (c *converter) rewriteGlobals(p *Package, gd *dst.GenDecl) bool {
 	return changed
 }
 
-// adaptErrors makes the application's Errorf, Fatalf and FatalIfError, called
-// or used as values, go through kongcompat.Errors: kong's methods of the same
-// names print and exit a little differently, and return the parser.
+// adaptErrors routes the application's Errorf, Fatalf and FatalIfError
+// through kongcompat.Errors, whether they are called or used as values.
+// kong's methods with the same names print and exit a little differently,
+// and return the parser.
 func (c *converter) adaptErrors(p *Package, sel *dst.SelectorExpr) bool {
 	switch sel.Sel.Name {
 	case "Errorf", "Fatalf", "FatalIfError":
@@ -797,8 +801,8 @@ func (c *converter) adaptErrors(p *Package, sel *dst.SelectorExpr) bool {
 	return true
 }
 
-// reportInitWork reports a package-level initializer the conversion drops
-// that also does other work, and tells whether it did.
+// reportInitWork raises an issue when v, a package-level initializer the
+// conversion drops, also does other work, and reports whether it did.
 func (c *converter) reportInitWork(p *Package, name string, v dst.Expr) bool {
 	if !c.doesSomething(p, v) {
 		return false
@@ -851,9 +855,7 @@ func (c *converter) rewriteNode(p *Package, cur *dstutil.Cursor) bool {
 			n.X = pathExpr(r.path)
 			return true
 		}
-		if c.adaptErrors(p, n) {
-			return true
-		}
+		return c.adaptErrors(p, n)
 	case *dst.Ident:
 		// Only the names being declared stay; their uses are replaced.
 		if _, isDecl := cur.Parent().(*dst.ValueSpec); isDecl && cur.Name() == "Names" {
@@ -960,8 +962,8 @@ func exitFunc(arg dst.Expr) dst.Expr {
 // application flags are written to, and whether it holds a pointer to it.
 func (c *converter) holderVar(o *object) (*types.Var, bool) {
 	in := c.g.in
-	// The first variable declared with the struct's own type, as an
-	// interface holding it cannot be assigned to the CLI's field.
+	// Take the first variable declared with the struct's own type.
+	// One of an interface type couldn't be assigned to the CLI's field.
 	var best *types.Var
 	bestPtr := false
 	check := func(obj types.Object, val value) {
@@ -993,26 +995,12 @@ func (c *converter) holderVar(o *object) (*types.Var, bool) {
 }
 
 // wireFlags points the CLI's embedded flags struct at the program's own
-// variable, right before the statement of f that builds the parser, since
-// kong reads the struct at that point.
+// variable, right before the statement of f that builds the parser.
+// That is when kong reads the struct.
 // A package-level variable is wired where cli is declared instead.
-// buildsParser reports whether s calls kong.Must, as the declarations of
-// parsers the conversion adds do.
-func buildsParser(s dst.Stmt) bool {
-	found := false
-	dst.Inspect(s, func(n dst.Node) bool {
-		if id, ok := n.(*dst.Ident); ok && id.Path == kongPath && id.Name == "Must" {
-			found = true
-		}
-		return !found
-	})
-	return found
-}
-
 func (c *converter) wireFlags(p *Package, f *dst.File) bool {
 	w := c.main.flags
 	if w.v.Parent() == w.v.Pkg().Scope() && c.main.local == nil {
-		// Set in the declaration of cli.
 		return true
 	}
 	var rhs dst.Expr = dst.NewIdent(w.v.Name())
@@ -1025,53 +1013,23 @@ func (c *converter) wireFlags(p *Package, f *dst.File) bool {
 		Rhs: []dst.Expr{rhs},
 	}
 	done := false
-	var walk func(list []dst.Stmt) []dst.Stmt
-	walk = func(list []dst.Stmt) []dst.Stmt {
-		var out []dst.Stmt
-		for _, s := range list {
-			builds := false
-			dst.Inspect(s, func(n dst.Node) bool {
-				switch n := n.(type) {
-				case *dst.BlockStmt:
-					if !done {
-						n.List = walk(n.List)
-					}
-					return false
-				case *dst.CaseClause:
-					if !done {
-						n.Body = walk(n.Body)
-					}
-					return false
-				case *dst.CommClause:
-					if !done {
-						n.Body = walk(n.Body)
-					}
-					return false
-				case *dst.CallExpr:
-					_, packageLevel := n.Fun.(*dst.Ident)
-					if name := c.runtimeCall(p, n); name == "New" || name == "Parse" && packageLevel {
-						builds = true
-					}
-				}
-				return true
-			})
-			if builds && !done && c.namesAt(p, s, w.v) {
-				// Before the parsers declareParsers put right before s.
-				at := len(out)
-				for at > 0 && buildsParser(out[at-1]) {
-					at--
-				}
-				out = slices.Insert(out, at, dst.Stmt(assign))
-				done = true
-			}
-			out = append(out, s)
-		}
-		return out
-	}
 	for _, d := range f.Decls {
-		if fd, ok := d.(*dst.FuncDecl); ok && fd.Body != nil && !c.ed.removed[d] && !done {
-			fd.Body.List = walk(fd.Body.List)
+		fd, ok := d.(*dst.FuncDecl)
+		if !ok || fd.Body == nil || c.ed.removed[d] {
+			continue
 		}
+		fd.Body.List = insertBefore(fd.Body.List, func(s dst.Stmt, calls []*dst.CallExpr) []dst.Stmt {
+			builds := slices.ContainsFunc(calls, func(call *dst.CallExpr) bool {
+				_, packageLevel := call.Fun.(*dst.Ident)
+				name := c.runtimeCall(p, call)
+				return name == "New" || name == "Parse" && packageLevel
+			})
+			if done || !builds || !c.namesAt(p, s, w.v) {
+				return nil
+			}
+			done = true
+			return []dst.Stmt{assign}
+		})
 	}
 	// kong keeps the struct the variable held when the parser was built.
 	dst.Inspect(f, func(n dst.Node) bool {
@@ -1096,57 +1054,66 @@ func (c *converter) declareParsers(p *Package, f *dst.File) bool {
 		return false
 	}
 	changed := false
-	// Parsers declared in this function so far, which type information does
-	// not know about.
-	var declared map[string]bool
-	var walk func(list []dst.Stmt) []dst.Stmt
-	walk = func(list []dst.Stmt) []dst.Stmt {
-		var out []dst.Stmt
-		for _, s := range list {
-			var parse *dst.CallExpr
-			dst.Inspect(s, func(n dst.Node) bool {
-				switch n := n.(type) {
-				case *dst.BlockStmt:
-					n.List = walk(n.List)
-					return false
-				case *dst.CaseClause:
-					n.Body = walk(n.Body)
-					return false
-				case *dst.CommClause:
-					n.Body = walk(n.Body)
-					return false
-				case *dst.CallExpr:
-					if _, ok := n.Fun.(*dst.Ident); ok && parse == nil && c.runtimeCall(p, n) == "Parse" && len(n.Args) == 0 {
-						parse = n
-					}
-				}
-				return true
-			})
-			if parse != nil {
-				name := c.freeLocalBesides(p, s, declared, "parser", "kongParser")
-				declared[name] = true
-				out = append(out, &dst.AssignStmt{
-					Lhs: []dst.Expr{dst.NewIdent(name)},
-					Tok: token.DEFINE,
-					Rhs: []dst.Expr{c.parserExpr()},
-				})
-				if c.main.parsers == nil {
-					c.main.parsers = map[*dst.CallExpr]string{}
-				}
-				c.main.parsers[parse] = name
-				changed = true
-			}
-			out = append(out, s)
-		}
-		return out
-	}
 	for _, d := range f.Decls {
-		if fd, ok := d.(*dst.FuncDecl); ok && fd.Body != nil && !c.ed.removed[d] {
-			declared = map[string]bool{}
-			fd.Body.List = walk(fd.Body.List)
+		fd, ok := d.(*dst.FuncDecl)
+		if !ok || fd.Body == nil || c.ed.removed[d] {
+			continue
 		}
+		// Parsers declared in this function so far, which type information
+		// does not know about.
+		declared := map[string]bool{}
+		fd.Body.List = insertBefore(fd.Body.List, func(s dst.Stmt, calls []*dst.CallExpr) []dst.Stmt {
+			i := slices.IndexFunc(calls, func(call *dst.CallExpr) bool {
+				_, ok := call.Fun.(*dst.Ident)
+				return ok && c.runtimeCall(p, call) == "Parse" && len(call.Args) == 0
+			})
+			if i < 0 {
+				return nil
+			}
+			name := c.freeLocalBesides(p, s, declared, "parser", "kongParser")
+			declared[name] = true
+			if c.main.parsers == nil {
+				c.main.parsers = map[*dst.CallExpr]string{}
+			}
+			c.main.parsers[calls[i]] = name
+			changed = true
+			return []dst.Stmt{&dst.AssignStmt{
+				Lhs: []dst.Expr{dst.NewIdent(name)},
+				Tok: token.DEFINE,
+				Rhs: []dst.Expr{c.parserExpr()},
+			}}
+		})
 	}
 	return changed
+}
+
+// insertBefore inserts, right before each statement of list, the statements
+// that before returns for it, going into nested blocks and case clauses.
+// before only sees the calls a statement makes outside its nested
+// statements, which get their own turn first.
+func insertBefore(list []dst.Stmt, before func(s dst.Stmt, calls []*dst.CallExpr) []dst.Stmt) []dst.Stmt {
+	var out []dst.Stmt
+	for _, s := range list {
+		var calls []*dst.CallExpr
+		dst.Inspect(s, func(n dst.Node) bool {
+			switch n := n.(type) {
+			case *dst.BlockStmt:
+				n.List = insertBefore(n.List, before)
+				return false
+			case *dst.CaseClause:
+				n.Body = insertBefore(n.Body, before)
+				return false
+			case *dst.CommClause:
+				n.Body = insertBefore(n.Body, before)
+				return false
+			case *dst.CallExpr:
+				calls = append(calls, n)
+			}
+			return true
+		})
+		out = append(append(out, before(s, calls)...), s)
+	}
+	return out
 }
 
 // freeLocal returns the first candidate, or the first one with a number
@@ -1155,7 +1122,8 @@ func (c *converter) freeLocal(p *Package, s dst.Stmt, candidates ...string) stri
 	return c.freeLocalBesides(p, s, nil, candidates...)
 }
 
-// freeLocalBesides is freeLocal, also avoiding the names in added.
+// freeLocalBesides is freeLocal, also avoiding the names in added, which
+// the conversion declared and type information knows nothing about.
 func (c *converter) freeLocalBesides(p *Package, s dst.Stmt, added map[string]bool, candidates ...string) string {
 	n := p.astOf(s)
 	var scope *types.Scope
@@ -1556,10 +1524,10 @@ func (c *converter) rewriteCall(p *Package, cur *dstutil.Cursor, call *dst.CallE
 			return true
 		}
 	case "Fatalf", "Errorf", "FatalIfError":
-		// kingpin's own functions print through its default application,
-		// which nothing else uses here.
-		// The application's methods go through kongcompat.Errors, as the
-		// selector is rewritten.
+		// kingpin.Fatalf and friends print through the default application.
+		// When the program doesn't otherwise use it, kongcompat's functions
+		// do the same.
+		// Method calls are handled with their selector, by adaptErrors.
 		if sel == nil && c.g.in.cmdLine == nil {
 			call.Fun = c.compatIdent(name)
 			return true
@@ -1906,20 +1874,11 @@ func (c *converter) pointInto(p *Package, s dst.Stmt, vals []value) ([]dst.Stmt,
 
 // spliceMarker marks a block made only to carry statements into the list
 // around it.
-const spliceMarker = "// kingpin2kong:splice"
+const spliceMarker = "// king2kong:splice"
 
 func (c *converter) dropReplacedLocals(p *Package, body *dst.BlockStmt) bool {
 	changed := false
-	branches := map[string]map[token.Token]bool{}
-	dst.Inspect(body, func(n dst.Node) bool {
-		if br, ok := n.(*dst.BranchStmt); ok && br.Label != nil {
-			if branches[br.Label.Name] == nil {
-				branches[br.Label.Name] = map[token.Token]bool{}
-			}
-			branches[br.Label.Name][br.Tok] = true
-		}
-		return true
-	})
+	branches := labelJumps(body, func(*dst.BranchStmt) bool { return true })
 	// lower returns what replaces a statement defining variables the CLI
 	// replaces, and false for any other statement.
 	lower := func(s dst.Stmt) ([]dst.Stmt, bool) {
@@ -2317,9 +2276,9 @@ func (c *converter) definesOnlyReplaced(p *Package, s *dst.AssignStmt) bool {
 	return true
 }
 
-// rebinds reports whether an assignment gives variables the CLI replaces a
-// command struct built anew, as in a = &A{}, or what the CLI field already
-// is, as in verbose = app.Flag(...).Bool().
+// rebinds reports whether as gives variables the CLI replaces a value their
+// CLI field can take over: a new command struct, as in a = &A{}, or the
+// flag's own value, as in verbose = app.Flag(...).Bool().
 func (c *converter) rebinds(p *Package, as *dst.AssignStmt) bool {
 	if as.Tok != token.ASSIGN || len(as.Lhs) != len(as.Rhs) {
 		return false
