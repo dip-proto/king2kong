@@ -6,11 +6,13 @@ king2kong moves a Go program from [kingpin](https://github.com/alecthomas/kingpi
 
 It handles kingpin v2 (`github.com/alecthomas/kingpin/v2` and the older `gopkg.in/alecthomas/kingpin.v2`), and kingpin v3 snapshots
 
-Kingpin builds command lines with calls: `app.Command("x", "...").Flag("y", "...").StringVar(&dst)`.
+Kingpin builds command lines with chains of functions calls like `app.Command("x", "...").Flag("y", "...").StringVar(&dst)`. But Kong reads uses struct with tags instead.
 
-Kong reads it from a Go struct with tags. So the tool has to move what those calls say onto the fields they write to, turn the command tree into nested structs, and deal with everything around the calls: constructors, helpers, option structs, conditions, actions.
+So the tool moves what those calls say onto the fields they write to, turn the command tree into nested structs, and deal with everything around the calls: constructors, helpers, option structs, conditions, actions. Automagically.
 
-The result is meant to be read and kept by people, so it is plain kong. This command, written the way kingpin's README suggests:
+The result is meant to be readable any maintainable.
+
+This command, written as Kingpin documents it:
 
 ```go
 type lsCommand struct {
