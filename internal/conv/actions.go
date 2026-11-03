@@ -18,12 +18,13 @@ import (
 // it.
 func (c *converter) convertActions() {
 	c.checkSharedTypes()
-	// A helper registering the same function on several commands names it
-	// once in the source, which is what the other references are compared
-	// with.
 	registered := map[*types.Func]int{}
-	for fn, sites := range c.g.in.actionSites {
-		registered[fn] = len(sites)
+	for _, n := range c.tree.nodes {
+		for _, fn := range n.cl.actions {
+			if _, ok := registered[fn.fn]; !ok {
+				registered[fn.fn] = c.actionRegistrations(fn.fn)
+			}
+		}
 	}
 	// Commands sharing a struct share its AfterApply, which runs their
 	// actions once.
@@ -217,6 +218,36 @@ func (c *converter) usesObject(fd funcDecl, o types.Object) bool {
 		}
 	}
 	return false
+}
+
+// actionRegistrations counts the Action calls of the source naming fn, as
+// in cmd.Action(run), however many times they run, if ever: a helper
+// registering it on several commands names it once.
+func (c *converter) actionRegistrations(fn *types.Func) int {
+	n := 0
+	for _, p := range c.prog.Packages {
+		for _, f := range p.Syntax {
+			dst.Inspect(f, func(node dst.Node) bool {
+				call, ok := node.(*dst.CallExpr)
+				if !ok || len(call.Args) != 1 {
+					return true
+				}
+				sel, ok := call.Fun.(*dst.SelectorExpr)
+				if !ok || sel.Sel.Name != "Action" || !c.prog.isKingpinType(p.typeOf(sel.X)) {
+					return true
+				}
+				var ref dst.Node = unparen(call.Args[0])
+				if s, ok := ref.(*dst.SelectorExpr); ok {
+					ref = s.Sel
+				}
+				if p.objectOf(ref) == fn {
+					n++
+				}
+				return true
+			})
+		}
+	}
+	return n
 }
 
 // countUses counts the references to o in the converted packages.

@@ -1,12 +1,12 @@
 package conv
 
 import (
+	"cmp"
 	"fmt"
 	"go/token"
 	"go/types"
 	"io"
 	"slices"
-	"sort"
 	"strings"
 
 	"github.com/dave/dst"
@@ -125,6 +125,11 @@ func (in *interp) findRoots() []*types.Func {
 			}
 		}
 	}
+	for fn := range callers {
+		// Several init functions share a name, and nil stands for a
+		// package initializer.
+		slices.SortStableFunc(callers[fn], funcOrder)
+	}
 	// A function registering on an application it did not create, such as
 	// kingpin.CommandLine or a package-level one, is run from its callers
 	// too, so the statements calling it are known to build grammar.
@@ -154,11 +159,26 @@ func (in *interp) findRoots() []*types.Func {
 	for fn := range makers {
 		makerList = append(makerList, fn)
 	}
-	sort.Slice(makerList, func(i, j int) bool { return makerList[i].FullName() < makerList[j].FullName() })
+	slices.SortFunc(makerList, funcOrder)
 	for _, fn := range makerList {
 		visit(fn)
 	}
 	return roots
+}
+
+// funcOrder orders functions by name, then by position, with nil first.
+func funcOrder(a, b *types.Func) int {
+	switch {
+	case a == b:
+		return 0
+	case a == nil:
+		return -1
+	case b == nil:
+		return 1
+	case a.FullName() != b.FullName():
+		return strings.Compare(a.FullName(), b.FullName())
+	}
+	return cmp.Compare(a.Pos(), b.Pos())
 }
 
 // resolveInstances links each command to the struct that represents it.

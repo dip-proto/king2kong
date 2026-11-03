@@ -88,6 +88,9 @@ type clause struct {
 	// order.
 	defaultSeq, helpSeq int
 	exprPkg             *Package
+	helpPkg             *Package
+	// localHelp is set for a help text computed from local values.
+	localHelp bool
 	// hintExpr, in hintPkg, computes the hints given to HintOptions or
 	// HintAction at run time.
 	hintExpr dst.Expr

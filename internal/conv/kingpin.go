@@ -90,15 +90,34 @@ func (in *interp) kingpinFunc(fr *frame, c *dst.CallExpr, name string, args []va
 	return []value{vUnknown{}}
 }
 
+// setHelp applies Help(text): the last help given wins, computed or not.
+// The application's own help is its description, which stays constant.
+func (in *interp) setHelp(fr *frame, c *dst.CallExpr, cl *clause, str func(int) (string, bool)) {
+	cl.help, cl.helpOK = str(0)
+	if cl.helpExpr != nil {
+		in.superseded[cl.helpExpr] = true
+		cl.helpExpr = nil
+	}
+	cl.localHelp = false
+	if !cl.helpOK && cl.kind != kindApp && len(c.Args) == 1 {
+		in.runtimeHelp(fr, cl, c.Args[0])
+	}
+}
+
 // runtimeHelp records the help text of f computed at run time, which reaches
 // kong through a variable, as long as it can be computed where the parser is
 // built.
 func (in *interp) runtimeHelp(fr *frame, f *clause, e dst.Expr) {
 	if !in.contextFree(fr.pkg, e) {
-		f.issue("help text is computed from local values")
+		if f.kind == kindCommand {
+			f.issue("help text is computed from local values")
+			return
+		}
+		// Reported once no later Help replaces it.
+		f.localHelp = true
 		return
 	}
-	f.helpExpr, f.exprPkg = e, fr.pkg
+	f.helpExpr, f.helpPkg = e, fr.pkg
 	in.moved[e] = true
 	in.evaluations++
 	f.helpSeq = in.evaluations
@@ -149,6 +168,9 @@ func (in *interp) kingpinMethod(fr *frame, c *dst.CallExpr, cl *clause, name str
 			cmd := in.newClause(kindCommand, cl, pos, fr)
 			cmd.name, cmd.nameOK = str(0)
 			cmd.help, cmd.helpOK = str(1)
+			if len(args) >= 2 && !cmd.helpOK && len(c.Args) >= 2 {
+				in.runtimeHelp(fr, cmd, c.Args[1])
+			}
 			if !cmd.nameOK {
 				cmd.issue("command name is not a constant")
 			}
@@ -193,7 +215,7 @@ func (in *interp) kingpinMethod(fr *frame, c *dst.CallExpr, cl *clause, name str
 			cl.defaultCmd = true
 			return self
 		case "Help":
-			cl.help, cl.helpOK = str(0)
+			in.setHelp(fr, c, cl, str)
 			return self
 		case "Version":
 			cl.version, cl.hasVersion = str(0)
@@ -211,12 +233,6 @@ func (in *interp) kingpinMethod(fr *frame, c *dst.CallExpr, cl *clause, name str
 		case "Action":
 			if fn, ok := firstArg(args).(vFunc); ok {
 				cl.actions = append(cl.actions, fn)
-				if len(c.Args) == 1 {
-					if in.actionSites[fn.fn] == nil {
-						in.actionSites[fn.fn] = map[dst.Expr]bool{}
-					}
-					in.actionSites[fn.fn][c.Args[0]] = true
-				}
 			} else if lit, ok := c.Args[0].(*dst.FuncLit); ok && len(c.Args) == 1 {
 				cl.actionLits = append(cl.actionLits, actionLit{lit: lit, pkg: fr.pkg, before: len(cl.actions)})
 			} else {
@@ -311,15 +327,7 @@ func (in *interp) kingpinMethod(fr *frame, c *dst.CallExpr, cl *clause, name str
 			cl.noEnvar = true
 			return self
 		case "Help":
-			// The last help given wins, computed or not.
-			cl.help, cl.helpOK = str(0)
-			if cl.helpExpr != nil {
-				in.superseded[cl.helpExpr] = true
-				cl.helpExpr = nil
-			}
-			if !cl.helpOK && len(c.Args) == 1 {
-				in.runtimeHelp(fr, cl, c.Args[0])
-			}
+			in.setHelp(fr, c, cl, str)
 			return self
 		case "HintOptions":
 			// Hints only feed shell completion: losing them is reported but

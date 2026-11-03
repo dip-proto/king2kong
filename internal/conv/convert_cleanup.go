@@ -36,8 +36,8 @@ func (c *converter) cleanupWiring() {
 				if !c.hasTouched(fd.Body) {
 					continue
 				}
-				if fn, ok := p.objectOf(fd.Name).(*types.Func); ok && c.regOnly[fn] {
-					// removeDeadCode takes care of it.
+				if fn, ok := p.objectOf(fd.Name).(*types.Func); ok && c.regOnly[fn] && fd.Name.Name != "init" {
+					// removeDeadCode takes care of it, but never of init.
 					continue
 				}
 				del := c.deletableStmts(p, fd.Body)
@@ -87,6 +87,46 @@ func (c *converter) cleanupWiring() {
 	c.dropEmptiedCalls()
 }
 
+// singleStmt is the statements as one, as a header or post statement must
+// be: a function literal running them in order when there are several, or
+// nil.
+func singleStmt(list []dst.Stmt) dst.Stmt {
+	switch len(list) {
+	case 0:
+		return nil
+	case 1:
+		return list[0]
+	}
+	return &dst.ExprStmt{X: &dst.CallExpr{Fun: &dst.FuncLit{Type: &dst.FuncType{}, Body: &dst.BlockStmt{List: list}}}}
+}
+
+// setHeader replaces the init or post statement cur is at with s, which may
+// be nil, and tells whether it could.
+func setHeader(cur *dstutil.Cursor, s dst.Stmt) bool {
+	switch par := cur.Parent().(type) {
+	case *dst.IfStmt:
+		par.Init = s
+	case *dst.SwitchStmt:
+		par.Init = s
+	case *dst.TypeSwitchStmt:
+		par.Init = s
+	case *dst.ForStmt:
+		if cur.Name() == "Post" {
+			par.Post = s
+		} else {
+			par.Init = s
+		}
+	case *dst.LabeledStmt:
+		if s == nil {
+			s = &dst.EmptyStmt{Implicit: true}
+		}
+		par.Stmt = s
+	default:
+		return false
+	}
+	return true
+}
+
 // dropIfEmpty removes a function with nothing left in it, along with its
 // calls, and tells whether it did.
 // An init has none; main and a function used as a value stay.
@@ -125,15 +165,27 @@ func (c *converter) dropEmptiedCalls() {
 						case *dst.GoStmt:
 							call = s.Call
 						}
-						if call == nil || cur.Index() < 0 || !c.emptied[c.g.in.staticCallee(p, call)] {
+						if call == nil || !c.emptied[c.g.in.staticCallee(p, call)] {
 							return true
 						}
+						var left []dst.Stmt
 						for _, a := range call.Args {
 							if c.doesSomething(p, a) {
-								cur.InsertBefore(c.evaluation(p, a))
+								left = append(left, c.evaluation(p, a))
 							}
 						}
-						cur.Delete()
+						if cur.Index() < 0 {
+							// The init or post statement of an if, switch or
+							// for, which takes a single statement or none.
+							if !setHeader(cur, singleStmt(left)) {
+								return true
+							}
+						} else {
+							for _, st := range left {
+								cur.InsertBefore(st)
+							}
+							cur.Delete()
+						}
 						dropped = true
 						return false
 					}, nil)
@@ -652,16 +704,7 @@ func (c *converter) pruneStmts(p *Package, list []dst.Stmt, del map[dst.Stmt]boo
 				return
 			}
 			c.markDefinedDead(p, *st, dead)
-			calls := c.callsLeft(p, *st, dead)
-			*st = nil
-			switch {
-			case len(calls) == 1:
-				*st = calls[0]
-			case len(calls) > 1:
-				// A post statement is a single one, which a function
-				// literal running them in order is.
-				*st = &dst.ExprStmt{X: &dst.CallExpr{Fun: &dst.FuncLit{Type: &dst.FuncType{}, Body: &dst.BlockStmt{List: calls}}}}
-			}
+			*st = singleStmt(c.callsLeft(p, *st, dead))
 		}
 		switch s := s.(type) {
 		case *dst.IfStmt:

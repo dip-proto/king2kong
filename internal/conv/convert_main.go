@@ -1037,6 +1037,16 @@ func (c *converter) wireFlags(p *Package, f *dst.File) bool {
 						n.List = walk(n.List)
 					}
 					return false
+				case *dst.CaseClause:
+					if !done {
+						n.Body = walk(n.Body)
+					}
+					return false
+				case *dst.CommClause:
+					if !done {
+						n.Body = walk(n.Body)
+					}
+					return false
 				case *dst.CallExpr:
 					_, packageLevel := n.Fun.(*dst.Ident)
 					if name := c.runtimeCall(p, n); name == "New" || name == "Parse" && packageLevel {
@@ -1086,6 +1096,9 @@ func (c *converter) declareParsers(p *Package, f *dst.File) bool {
 		return false
 	}
 	changed := false
+	// Parsers declared in this function so far, which type information does
+	// not know about.
+	var declared map[string]bool
 	var walk func(list []dst.Stmt) []dst.Stmt
 	walk = func(list []dst.Stmt) []dst.Stmt {
 		var out []dst.Stmt
@@ -1096,6 +1109,12 @@ func (c *converter) declareParsers(p *Package, f *dst.File) bool {
 				case *dst.BlockStmt:
 					n.List = walk(n.List)
 					return false
+				case *dst.CaseClause:
+					n.Body = walk(n.Body)
+					return false
+				case *dst.CommClause:
+					n.Body = walk(n.Body)
+					return false
 				case *dst.CallExpr:
 					if _, ok := n.Fun.(*dst.Ident); ok && parse == nil && c.runtimeCall(p, n) == "Parse" && len(n.Args) == 0 {
 						parse = n
@@ -1104,7 +1123,8 @@ func (c *converter) declareParsers(p *Package, f *dst.File) bool {
 				return true
 			})
 			if parse != nil {
-				name := c.freeLocal(p, s, "parser", "kongParser")
+				name := c.freeLocalBesides(p, s, declared, "parser", "kongParser")
+				declared[name] = true
 				out = append(out, &dst.AssignStmt{
 					Lhs: []dst.Expr{dst.NewIdent(name)},
 					Tok: token.DEFINE,
@@ -1122,6 +1142,7 @@ func (c *converter) declareParsers(p *Package, f *dst.File) bool {
 	}
 	for _, d := range f.Decls {
 		if fd, ok := d.(*dst.FuncDecl); ok && fd.Body != nil && !c.ed.removed[d] {
+			declared = map[string]bool{}
 			fd.Body.List = walk(fd.Body.List)
 		}
 	}
@@ -1131,12 +1152,20 @@ func (c *converter) declareParsers(p *Package, f *dst.File) bool {
 // freeLocal returns the first candidate, or the first one with a number
 // appended, that names nothing visible at s.
 func (c *converter) freeLocal(p *Package, s dst.Stmt, candidates ...string) string {
+	return c.freeLocalBesides(p, s, nil, candidates...)
+}
+
+// freeLocalBesides is freeLocal, also avoiding the names in added.
+func (c *converter) freeLocalBesides(p *Package, s dst.Stmt, added map[string]bool, candidates ...string) string {
 	n := p.astOf(s)
-	if n == nil {
-		return candidates[0]
+	var scope *types.Scope
+	if n != nil {
+		scope = p.Types.Scope().Innermost(n.Pos())
 	}
-	scope := p.Types.Scope().Innermost(n.Pos())
 	taken := func(name string) bool {
+		if added[name] {
+			return true
+		}
 		if scope == nil {
 			return false
 		}

@@ -1,10 +1,14 @@
 package conv
 
 import (
+	"cmp"
 	"fmt"
+	"go/ast"
 	"go/constant"
 	"go/token"
 	"go/types"
+	"math"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -63,14 +67,12 @@ type interp struct {
 	// elsewhere, such as a default value only known at run time.
 	moved map[dst.Expr]bool
 	// superseded are the moved arguments a later call replaced, as Help
-	// replaces the help given to Flag, which go nowhere but what they do.
+	// replaces the help given to Flag.
+	// They no longer feed the parser, but what they do still runs.
 	superseded map[dst.Expr]bool
 	// evaluations counts the run-time defaults and help texts seen so far.
 	evaluations int
 	executed    map[dst.Stmt]bool
-	// actionSites are the expressions given to Action that named each
-	// function, however many times they ran.
-	actionSites map[*types.Func]map[dst.Expr]bool
 	// globalWrites is the last value interpreted code stored in each
 	// package-level variable.
 	globalWrites map[*types.Var]value
@@ -118,7 +120,6 @@ func newInterp(prog *Program) *interp {
 		varVals:      map[types.Object]value{},
 		valueCallees: map[*dst.CallExpr]*types.Func{},
 		globalWrites: map[*types.Var]value{},
-		actionSites:  map[*types.Func]map[dst.Expr]bool{},
 	}
 	in.relevant = in.computeRelevant()
 	return in
@@ -274,6 +275,7 @@ func (in *interp) staticCallee(p *Package, c *dst.CallExpr) *types.Func {
 func (in *interp) runPackageVars() {
 	for _, p := range in.prog.Packages {
 		fr := &frame{pkg: p, vars: map[types.Object]value{}}
+		var specs []*dst.ValueSpec
 		for _, f := range p.Syntax {
 			for _, d := range f.Decls {
 				gd, ok := d.(*dst.GenDecl)
@@ -282,23 +284,40 @@ func (in *interp) runPackageVars() {
 				}
 				for _, sp := range gd.Specs {
 					vs := sp.(*dst.ValueSpec)
-					if len(vs.Values) == 0 || !in.mentionsBuilder(p, vs) {
-						continue
+					if len(vs.Values) > 0 && in.mentionsBuilder(p, vs) {
+						specs = append(specs, vs)
 					}
-					var vals []value
-					if len(vs.Values) == 1 && len(vs.Names) > 1 {
-						vals = in.multi(fr, vs.Values[0])
-					} else {
-						for _, e := range vs.Values {
-							vals = append(vals, in.eval(fr, e))
-						}
-					}
-					in.specVals[vs] = vals
-					for i, nm := range vs.Names {
-						if v, ok := p.objectOf(nm).(*types.Var); ok && i < len(vals) {
-							in.globals[v] = vals[i]
-						}
-					}
+				}
+			}
+		}
+		// Go runs them in dependency order, as in var verbose =
+		// app.Flag(...).Bool() declared before var app = kingpin.New(...).
+		order := map[ast.Expr]int{}
+		for i, init := range p.TypesInfo.InitOrder {
+			order[init.Rhs] = i
+		}
+		rank := func(vs *dst.ValueSpec) int {
+			if a, ok := p.astOf(vs.Values[0]).(ast.Expr); ok {
+				if i, ok := order[a]; ok {
+					return i
+				}
+			}
+			return len(order)
+		}
+		slices.SortStableFunc(specs, func(a, b *dst.ValueSpec) int { return cmp.Compare(rank(a), rank(b)) })
+		for _, vs := range specs {
+			var vals []value
+			if len(vs.Values) == 1 && len(vs.Names) > 1 {
+				vals = in.multi(fr, vs.Values[0])
+			} else {
+				for _, e := range vs.Values {
+					vals = append(vals, in.eval(fr, e))
+				}
+			}
+			in.specVals[vs] = vals
+			for i, nm := range vs.Names {
+				if v, ok := p.objectOf(nm).(*types.Var); ok && i < len(vals) {
+					in.globals[v] = vals[i]
 				}
 			}
 		}
@@ -974,8 +993,58 @@ func (in *interp) binary(fr *frame, b *dst.BinaryExpr) value {
 	if xc.c.Kind() == constant.Unknown || yc.c.Kind() == constant.Unknown {
 		return vUnknown{}
 	}
+	t := xc.t
+	if t == nil || isUntyped(t) {
+		t = yc.t
+	}
+	op := b.Op
+	if op == token.QUO && isInteger(t) {
+		// Integers divide with truncation.
+		op = token.QUO_ASSIGN
+	}
 	defer func() { _ = recover() }()
-	return vConst{constant.BinaryOp(xc.c, b.Op, yc.c), xc.t}
+	return vConst{constant.BinaryOp(xc.c, op, yc.c), t}
+}
+
+// convertConst converts a constant to the numeric, string or boolean type t,
+// truncating a float made an integer; other values are kept as they are.
+func convertConst(v value, t types.Type) value {
+	c, ok := v.(vConst)
+	if !ok || c.c == nil {
+		return v
+	}
+	basic, ok := t.Underlying().(*types.Basic)
+	if !ok {
+		return v
+	}
+	info := basic.Info()
+	switch {
+	case info&types.IsInteger != 0 && isNumeric(c.c):
+		if n := constant.ToInt(c.c); n.Kind() == constant.Int {
+			return vConst{n, t}
+		}
+		f, _ := constant.Float64Val(c.c)
+		return vConst{constant.MakeInt64(int64(f)), t}
+	case info&types.IsFloat != 0 && isNumeric(c.c):
+		return vConst{constant.ToFloat(c.c), t}
+	case info&types.IsString != 0 && c.c.Kind() == constant.String,
+		info&types.IsBoolean != 0 && c.c.Kind() == constant.Bool:
+		return vConst{c.c, t}
+	}
+	return vUnknown{}
+}
+
+func isUntyped(t types.Type) bool {
+	b, ok := t.(*types.Basic)
+	return ok && b.Info()&types.IsUntyped != 0
+}
+
+func isInteger(t types.Type) bool {
+	if t == nil {
+		return false
+	}
+	b, ok := t.Underlying().(*types.Basic)
+	return ok && b.Info()&types.IsInteger != 0
 }
 
 func isNumeric(c constant.Value) bool {
@@ -1074,10 +1143,10 @@ func (in *interp) evalTyped(fr *frame, e dst.Expr, t types.Type) value {
 func (in *interp) call(fr *frame, c *dst.CallExpr) []value {
 	p := fr.pkg
 
-	// Type conversions keep the value.
+	// Type conversions keep the value, as the new type reads it.
 	if tv, ok := p.tv(c.Fun); ok && tv.IsType() {
 		if len(c.Args) == 1 {
-			return []value{in.eval(fr, c.Args[0])}
+			return []value{convertConst(in.eval(fr, c.Args[0]), tv.Type)}
 		}
 		return []value{vUnknown{}}
 	}
@@ -1505,8 +1574,10 @@ func calleeName(c *dst.CallExpr) string {
 // holds before parsing, written the way a kong default tag expects it.
 func (in *interp) priorDefault(dst value) (string, bool) {
 	var v value
+	var t types.Type
 	switch d := dst.(type) {
 	case vVarPtr:
+		t = d.v.Type()
 		if val, ok := in.varVals[d.v]; ok {
 			v = val
 		} else if val, ok := in.globalWrites[d.v]; ok {
@@ -1517,30 +1588,48 @@ func (in *interp) priorDefault(dst value) (string, bool) {
 			v = in.packageVar(d.v)
 		}
 	case vFieldPtr:
+		t = d.f.Type()
 		v = d.o.fields[d.f]
 	}
 	c, ok := v.(vConst)
-	if !ok || c.c == nil {
+	if !ok || c.c == nil || t == nil {
 		return "", false
 	}
-	if named, ok := c.t.(*types.Named); ok && named.Obj().Pkg() != nil && named.Obj().Pkg().Path() == "time" && named.Obj().Name() == "Duration" {
-		n, exact := constant.Int64Val(c.c)
+	// Written the way the destination's type reads it.
+	if named, ok := types.Unalias(t).(*types.Named); ok && named.Obj().Pkg() != nil && named.Obj().Pkg().Path() == "time" && named.Obj().Name() == "Duration" {
+		n, exact := constant.Int64Val(constant.ToInt(c.c))
 		if !exact || n == 0 {
 			return "", false
 		}
 		return time.Duration(n).String(), true
 	}
-	switch c.c.Kind() {
-	case constant.String:
+	basic, ok := t.Underlying().(*types.Basic)
+	if !ok {
+		return "", false
+	}
+	info := basic.Info()
+	switch {
+	case info&types.IsString != 0 && c.c.Kind() == constant.String:
 		s := constant.StringVal(c.c)
 		return s, s != ""
-	case constant.Bool:
+	case info&types.IsBoolean != 0 && c.c.Kind() == constant.Bool:
 		return "true", constant.BoolVal(c.c)
-	case constant.Int, constant.Float:
-		if constant.Sign(c.c) == 0 {
+	case info&types.IsInteger != 0:
+		n := constant.ToInt(c.c)
+		if n.Kind() != constant.Int || constant.Sign(n) == 0 {
 			return "", false
 		}
-		return c.c.ExactString(), true
+		return n.ExactString(), true
+	case info&types.IsFloat != 0:
+		f, _ := constant.Float64Val(constant.ToFloat(c.c))
+		if f == 0 || math.IsInf(f, 0) {
+			return "", false
+		}
+		bits := 64
+		if basic.Kind() == types.Float32 {
+			bits = 32
+		}
+		return strconv.FormatFloat(f, 'g', -1, bits), true
 	}
 	return "", false
 }

@@ -126,7 +126,11 @@ type Issue struct {
 }
 
 func (p *Plan) issue(pos token.Position, format string, args ...any) {
-	p.Issues = append(p.Issues, Issue{Pos: pos, Reason: fmt.Sprintf(format, args...)})
+	is := Issue{Pos: pos, Reason: fmt.Sprintf(format, args...)}
+	// A tag is worked out more than once.
+	if !slices.Contains(p.Issues, is) {
+		p.Issues = append(p.Issues, is)
+	}
 }
 
 // NewPlan decides how every registration maps onto kong.
@@ -165,6 +169,9 @@ func NewPlan(g *Grammar) *Plan {
 
 // bind works out where a flag's value lands relative to its command.
 func (p *Plan) bind(c *clause) *binding {
+	if c.localHelp {
+		c.issue("help text is computed from local values")
+	}
 	for _, is := range append(c.issues, c.notes...) {
 		p.issue(c.pos, "%s %q: %s", c.kind, c.name, is)
 	}
@@ -557,7 +564,13 @@ func (p *Plan) tagFor(b *binding, fieldName string) *kongtag.Tag {
 		if !c.priorTaken {
 			prior, ok = p.g.in.priorDefault(c.dst)
 		}
-		if ok {
+		// kong checks a default as it checks a value, which kingpin never
+		// did for what it left alone.
+		checked := len(c.enum) > 0 && !slices.Contains(c.enum, prior) || strings.HasPrefix(c.bind, "Existing")
+		switch {
+		case ok && checked:
+			p.issue(c.pos, "%s %q: kingpin kept %q when it was absent, which kong would check as a default and reject; set it after parsing by hand", c.kind, c.name, prior)
+		case ok:
 			c.defaults, c.hasDefault = []string{prior}, true
 			if !c.hasPlace && strings.TrimSuffix(c.bind, "Var") != "Bool" && c.kind == kindFlag {
 				c.placeholder, c.hasPlace = strings.ToUpper(c.name), true
@@ -676,7 +689,11 @@ func (p *Plan) runtimeVar(c *clause, what string, e dst.Expr) string {
 	if what == "help" {
 		seq = c.helpSeq
 	}
-	p.vars = append(p.vars, runtimeVar{name: name, expr: e, pkg: c.exprPkg, cl: c, what: desc, seq: seq})
+	pkg := c.exprPkg
+	if what == "help" {
+		pkg = c.helpPkg
+	}
+	p.vars = append(p.vars, runtimeVar{name: name, expr: e, pkg: pkg, cl: c, what: desc, seq: seq})
 	return name
 }
 

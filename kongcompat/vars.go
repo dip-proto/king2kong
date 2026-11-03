@@ -7,8 +7,9 @@ import (
 	"github.com/alecthomas/kong"
 )
 
-// Vars holds defaults and help texts computed at run time, for flags and
-// arguments whose tag names one of them, as in default:"${limit_default}".
+// Vars holds defaults and help texts computed at run time, for flags,
+// arguments and commands whose tag names one of them, as in
+// default:"${limit_default}".
 // Unlike kong.Vars, a value is used as is, and a $ in it stays a plain $.
 // Only a default or help that is exactly ${name} gets replaced.
 type Vars map[string]string
@@ -31,6 +32,11 @@ func (v Vars) fill(n *kong.Node) {
 		}
 		if s, ok := v.lookup(val.Help); ok {
 			val.Help = s
+		}
+	})
+	nodes(n, func(n *kong.Node) {
+		if s, ok := v.lookup(n.Help); ok {
+			n.Help = s
 		}
 	})
 }

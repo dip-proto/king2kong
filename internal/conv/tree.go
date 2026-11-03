@@ -253,7 +253,7 @@ func (p *Plan) nameFields(t *Tree) {
 			}
 			taken[name] = true
 			ch.field = name
-			ch.tag = commandTag(ch, name)
+			ch.tag = p.commandTag(ch, name)
 		}
 	}
 }
@@ -291,7 +291,7 @@ func memberNames(t *types.Named) []string {
 	return out
 }
 
-func commandTag(n *node, field string) *kongtag.Tag {
+func (p *Plan) commandTag(n *node, field string) *kongtag.Tag {
 	c := n.cl
 	t := new(kongtag.Tag).Flag("cmd")
 	if kongName(field) != c.name {
@@ -312,7 +312,9 @@ func commandTag(n *node, field string) *kongtag.Tag {
 	if c.hidden {
 		t.Flag("hidden")
 	}
-	if c.help != "" {
+	if c.helpExpr != nil {
+		t.Set("help", "${"+p.runtimeVar(c, "help", c.helpExpr)+"}")
+	} else if c.help != "" {
 		t.Set("help", kongtag.Interpolated(c.help))
 	}
 	return t
