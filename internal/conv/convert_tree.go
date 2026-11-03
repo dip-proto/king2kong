@@ -164,6 +164,13 @@ func (c *converter) convertTree() {
 			if g := c.genActions[n]; g != nil {
 				b.WriteString("\n" + afterApplySource(names[n], g))
 			}
+			if n.typ == nil {
+				if h, ok := c.hintsMethod(n, root.Types, names[n], "c", imports); !ok {
+					c.reportHints(n)
+				} else if h != "" {
+					b.WriteString("\n" + h)
+				}
+			}
 			generated = append(generated, b.String())
 		}
 	}

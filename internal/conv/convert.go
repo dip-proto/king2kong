@@ -302,8 +302,7 @@ func Convert(prog *Program, opts Options) (*Result, error) {
 				c.nm.claim(n.typ, ch.field)
 			}
 		}
-		// convertHints may add a Hints method to the command or a type it
-		// embeds.
+		// convertHints may add a Hints method here or on an embedded type.
 		if n.typ != nil && slices.ContainsFunc(n.cl.children, func(ch *clause) bool { return ch.hintExpr != nil }) {
 			for _, t := range append([]*types.Named{n.typ}, embeddedClosure(n.typ)...) {
 				c.nm.claim(t, "Hints")
@@ -955,7 +954,7 @@ func (c *converter) addDecode(w *wrapperType) {
 	if c.hasMethod(w.named, "Decode") {
 		return
 	}
-	recv := c.receiverName(w.named, "o")
+	recv := c.methodRecv(w.named, "o")
 	t := recvType(w.named)
 	v := w.value.Name()
 	imports := map[string]string{"github.com/alecthomas/kong": "kong"}
@@ -976,10 +975,11 @@ func (%[1]s *%[2]s) Decode(ctx *kong.DecodeContext) error {
 				imports["strings"] = "strings"
 				given = `!strings.HasPrefix(ctx.Value.Name, "no-")`
 			}
-			body = fmt.Sprintf(`// Decode implements kong.MapperValue, so the flag value lands in %[3]s.
-// The flag takes no value, but --flag=false is still understood.%[4]s
+			body = fmt.Sprintf(`// Decode implements kong.MapperValue, so the value lands in %[3]s.
+// A flag takes no value, but --flag=false is still understood, and an
+// argument is true or false.%[4]s
 func (%[1]s *%[2]s) Decode(ctx *kong.DecodeContext) error {
-	if ctx.Scan.Peek().Type != kong.FlagValueToken {
+	if ctx.Value.Flag != nil && ctx.Scan.Peek().Type != kong.FlagValueToken {
 		%[1]s.%[3]s = %[5]s
 		return nil
 	}
@@ -1111,7 +1111,7 @@ func (c *converter) addMarkerHook(m *types.Named, w *wrapperType) {
 	if !ok || c.hasMethod(m, "AfterApply") || c.hasMethod(w.named, "Decode") {
 		return
 	}
-	recv := c.receiverName(m, "o")
+	recv := c.methodRecv(m, "o")
 	imports := map[string]string{"github.com/alecthomas/kong": "kong", "slices": "slices"}
 	body := fmt.Sprintf(`// AfterApply records that the flag was given on the command line.
 // Kong also calls it for flags that only received a default or an environment
@@ -1154,6 +1154,22 @@ func recvType(t *types.Named) string {
 		names = append(names, params.At(i).Obj().Name())
 	}
 	return t.Obj().Name() + "[" + strings.Join(names, ", ") + "]"
+}
+
+// templateNames are the names used inside the generated Decode and
+// AfterApply methods.
+var templateNames = map[string]bool{
+	"ctx": true, "path": true, "value": true, "s": true, "v": true, "b": true, "n": true, "sep": true, "err": true,
+	"kong": true, "fmt": true, "strconv": true, "strings": true, "slices": true,
+}
+
+// methodRecv is receiverName for a generated method, avoiding the names
+// the method uses inside.
+func (c *converter) methodRecv(t *types.Named, fallback string) string {
+	if name := c.receiverName(t, fallback); !templateNames[name] {
+		return name
+	}
+	return firstFree(func(name string) bool { return templateNames[name] || isTypeParam(t, name) }, strings.ToLower(t.Obj().Name()[:1]), "o", "x", "recv")
 }
 
 // receiverName returns the receiver name most of t's methods already use, or
@@ -1316,27 +1332,34 @@ func (c *converter) convertConstructors() {
 	for _, f := range slices.SortedFunc(maps.Keys(c.valueEmbeds), byPos) {
 		c.embedByValue(f)
 	}
-	// argsOf returns the values the interpreter saw passed to an injected
-	// parameter, with the constructor they were passed to.
+	// argsOf returns what each call passed to an injected parameter.
 	type given struct {
 		v  value
 		fn *types.Func
+		// nilInterface is a nil interface, not a nil pointer inside one.
+		nilInterface bool
 	}
 	argsOf := func(list []inj) []given {
 		var out []given
 		for _, in := range list {
 			idx := in.ci.params[in.param]
 			for _, s := range c.g.in.sites {
-				if s.callee == in.ci.fn && idx < len(s.args) {
-					out = append(out, given{s.args[idx], in.ci.fn})
+				if s.callee != in.ci.fn || idx >= len(s.args) {
+					continue
 				}
+				_, isNil := s.args[idx].(vNil)
+				if isNil && idx < len(s.call.Args) {
+					t := s.pkg.typeOf(s.call.Args[idx])
+					isNil = t == nil || types.IsInterface(t) || t == types.Typ[types.UntypedNil]
+				}
+				out = append(out, given{s.args[idx], in.ci.fn, isNil})
 			}
 		}
 		return out
 	}
-	// kong hands every hook the one value bound for a type, so the
-	// constructors must all get the same one.
-	// Main mode checks the arguments themselves, below.
+	// kong gives every hook the same value for a type, so all constructors
+	// must get the same one.
+	// Main mode checks this itself, further down.
 	firstGiven := map[string]given{}
 	clashes := func(f *types.Var, list []inj) bool {
 		t := list[0].param.Type()
@@ -1359,10 +1382,10 @@ func (c *converter) convertConstructors() {
 		}
 		return false
 	}
-	// kong can't hand a nil interface to a hook.
-	// When every caller passes nil, the field is left alone, as it starts
-	// nil anyway.
-	nilInterface := func(f *types.Var, list []inj) bool {
+	// kong can't pass a nil interface to a hook.
+	// If every caller passes nil, the field is simply not set, since it
+	// starts out nil.
+	nilInterface := func(f *types.Var, list []inj, h *hookSet, pkg *types.Package) bool {
 		t := list[0].param.Type()
 		if !types.IsInterface(t) {
 			return false
@@ -1370,24 +1393,38 @@ func (c *converter) convertConstructors() {
 		args := argsOf(list)
 		nils := 0
 		for _, g := range args {
-			if _, ok := g.v.(vNil); ok {
+			if g.nilInterface {
 				nils++
 			}
 		}
-		if nils > 0 && nils < len(args) {
+		switch {
+		case nils == 0:
+			return false
+		case nils < len(args):
 			c.issue(list[0].ci.decl.pkg.position(list[0].ci.decl.decl), "constructor %s is sometimes given a nil %s, which kong can't hand to a hook; set %s by hand", list[0].ci.fn.Name(), types.TypeString(t, shortQual), c.finalName(f))
+		default:
+			// Setup moved from the constructor may still read it, as in
+			// quiet: out == nil.
+			name, typ := paramName(list[0].param.Name()), typeExpr(t, pkg, h.imports)
+			if h.beforeParams[name] == typ {
+				delete(h.beforeParams, name)
+				h.before = append([]string{fmt.Sprintf("var %s %s", name, typ)}, h.before...)
+			}
 		}
-		return nils > 0
+		return true
 	}
 	for _, f := range slices.SortedFunc(maps.Keys(injections), byPos) {
 		list := injections[f]
 		owner := c.nm.declaringType(f)
-		if owner == nil || nilInterface(f, list) || c.main == nil && clashes(f, list) {
+		if owner == nil {
+			continue
+		}
+		h := c.hookFor(owner)
+		pkg := owner.Obj().Pkg()
+		if nilInterface(f, list, h, pkg) || c.main == nil && clashes(f, list) {
 			continue
 		}
 		param := list[0].param
-		h := c.hookFor(owner)
-		pkg := owner.Obj().Pkg()
 		if c.main != nil {
 			// When main parses the command line, the hook uses the constant
 			// the constructor was called with, or binds the variable it came
@@ -1413,9 +1450,9 @@ func (c *converter) convertConstructors() {
 					lit = typeExpr(t, pkg, h.imports) + "(" + lit + ")"
 					n = t
 				}
-				// Code moved from the constructor may still read the
+				// Setup moved from the constructor may still read the
 				// parameter, as in prefix: strings.ToUpper(region), so it
-				// becomes a local holding the constant.
+				// becomes a local.
 				name, typ := paramName(param.Name()), typeExpr(param.Type(), pkg, h.imports)
 				if h.beforeParams[name] == typ {
 					delete(h.beforeParams, name)
@@ -1430,16 +1467,27 @@ func (c *converter) convertConstructors() {
 				continue
 			}
 			v, ok := sameVariable(argPkg, args)
-			// kong hands a hook the one value bound for its type.
-			i := slices.IndexFunc(c.main.bound, func(b *types.Var) bool { return ok && b != v && types.Identical(b.Type(), v.Type()) })
+			// kong gives a hook one value per type, and that type may be
+			// an interface the variable implements.
+			other, again := -1, false
+			for j, b := range c.main.bound {
+				if ok && types.Identical(c.main.boundAs[j], param.Type()) {
+					if b == v {
+						again = true
+					} else {
+						other = j
+					}
+				}
+			}
 			switch {
-			case ok && i >= 0:
-				c.issue(list[0].ci.decl.pkg.position(list[0].ci.decl.decl), "constructor %s stores %s, while another one stores %s of the same type, which kong cannot tell apart; set %s by hand", list[0].ci.fn.Name(), v.Name(), c.main.bound[i].Name(), c.finalName(f))
+			case ok && other >= 0:
+				c.issue(list[0].ci.decl.pkg.position(list[0].ci.decl.decl), "constructor %s stores %s, while another one stores %s of the same type, which kong cannot tell apart; set %s by hand", list[0].ci.fn.Name(), v.Name(), c.main.bound[other].Name(), c.finalName(f))
 				continue
 			case ok && c.visibleAtParser(v):
-				if !slices.Contains(c.main.bound, v) {
+				if !again {
 					c.main.binds = append(c.main.binds, dst.NewIdent(v.Name()))
 					c.main.bound = append(c.main.bound, v)
+					c.main.boundAs = append(c.main.boundAs, param.Type())
 				}
 			default:
 				c.issue(list[0].ci.decl.pkg.position(list[0].ci.decl.decl), "constructor %s stores its %s parameter, which no single constant or variable visible where the parser is built provides; set %s by hand", list[0].ci.fn.Name(), param.Name(), c.finalName(f))
@@ -1461,8 +1509,8 @@ func (c *converter) convertConstructors() {
 	}
 }
 
-// differentValues reports whether a and b are known to be different values,
-// such as pointers to two objects or two distinct constants.
+// differentValues reports whether a and b are known to differ, like two
+// different objects or constants.
 func differentValues(a, b value) bool {
 	switch a := a.(type) {
 	case vPtr:

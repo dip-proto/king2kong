@@ -135,6 +135,7 @@ func TestEndToEnd(t *testing.T) {
 			{"--port=1", "--conf=endtoend_test.go"},
 			{"--conf=endtoend_test.go", "true"},
 			{"--port=1", "true"},
+			{"--port=1"},
 			{"--port=1", "--conf=missing.toml", "true"},
 			{"--port=1", "--conf=endtoend_test.go", "--format=", "true"},
 			{"--port=1", "--conf=endtoend_test.go", "--format=xml", "true"},
@@ -143,6 +144,21 @@ func TestEndToEnd(t *testing.T) {
 			{"env:QUIRKS_DOCS=a\nb", "env:QUIRKS_LABELS=k=v\nl=w", "--port=1", "--conf=endtoend_test.go", "true"},
 			{"--port=x", "--bogus"},
 			{"--port=x", "--conf=endtoend_test.go", "true"},
+			{"--help"},
+			{"env:QUIRKS_VERBOSE=true", "--port=1", "--conf=endtoend_test.go", "true"},
+			{"env:QUIRKS_VERBOSE=3", "--port=1", "--conf=endtoend_test.go", "-vv", "true"},
+			{"--port=1", "--conf=endtoend_test.go", "--input=./endtoend_test.go", "true"},
+			{"--port=x", "--version"},
+			{"--help", "--version"},
+			{"env:QUIRKS_PORT=5", "--bogus", "--version"},
+			// kingpin checked the defaults in random order, so only one is
+			// bad here.
+			{"env:QUIRKS_PORT=x", "--conf=endtoend_test.go", "--bogus"},
+		},
+		"copies": {
+			{"--region=a", "--zone=b", "--tier=c", "--tier-name=d", "--region-copy=e", "--api-region=f"},
+			{"--token=x"},
+			{"env:COPIES_REMOTE=1", "--token=x", "--remote"},
 			{"--help"},
 		},
 		"conditional": {

@@ -171,9 +171,8 @@ func (s *checker) next() token {
 	return token{tokArg, arg}
 }
 
-// run reads the command line and checks it the way kingpin's Parse did:
-// the defaults of what was not given first, then the syntax, then the
-// values given, and last what is missing.
+// run checks the command line in kingpin's order: defaults first, then
+// syntax, then the values given, then what is missing.
 func (s *checker) run() error {
 	if err := s.scan(); err != nil {
 		if derr := s.checkDefaults(); derr != nil {
@@ -185,7 +184,7 @@ func (s *checker) run() error {
 }
 
 // scan reads the command line up to its end or to a syntax error.
-// Errors in the values given wait in valueErr.
+// Bad values are kept in valueErr for later.
 func (s *checker) scan() error {
 	for {
 		t := s.next()
@@ -301,8 +300,8 @@ func (s *checker) flag(t token) error {
 	return nil
 }
 
-// badValue records the first error in a value given, which kingpin only
-// reported once the whole command line was read.
+// badValue records the first bad value, which kingpin only reported after
+// reading the whole command line.
 func (s *checker) badValue(err error) {
 	if s.valueErr == nil {
 		s.valueErr = err
@@ -349,8 +348,8 @@ func (s *checker) checkEnum(v *kong.Value, value string) error {
 		return nil
 	}
 	options := v.EnumSlice()
-	// The conversion adds an empty option at the end of an optional enum
-	// whose default is empty, since kong checks the default like any value.
+	// The conversion adds an empty last option to an optional enum with an
+	// empty default, for kong's sake.
 	// kingpin rejected an empty value it did not list.
 	if n := len(options); n > 0 && options[n-1] == "" && !v.Required && v.Default == "" && v.Target.Kind() != reflect.Slice {
 		options = options[:n-1]
@@ -419,35 +418,27 @@ func (s *checker) finish() error {
 	return nil
 }
 
-// checkDefaults checks the defaults kingpin applied to what was not given,
-// before anything else, unless --help was given.
+// checkDefaults checks the defaults of what was not given, as kingpin did
+// first, unless --help was given.
 func (s *checker) checkDefaults() error {
 	if s.syntaxOnly || s.sawHelp {
 		return nil
 	}
-	for _, v := range s.unset() {
-		if err := checkDefault(v); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-// unset returns the flags and arguments in scope that were neither given
-// nor set from the environment.
-func (s *checker) unset() []*kong.Value {
-	var out []*kong.Value
 	for _, f := range s.flags {
-		if !s.given[f.Value] && !envSet(f.Value) {
-			out = append(out, f.Value)
+		if !s.given[f.Value] {
+			if err := checkDefault(f.Value); err != nil {
+				return err
+			}
 		}
 	}
 	for _, a := range s.args {
-		if !s.given[a] && !envSet(a) {
-			out = append(out, a)
+		if !s.given[a] {
+			if err := checkDefault(a); err != nil {
+				return err
+			}
 		}
 	}
-	return out
+	return nil
 }
 
 func (s *checker) missingRequired() error {
@@ -475,12 +466,19 @@ func (s *checker) missingRequired() error {
 // not empty.
 // kingpin treated an empty variable as unset.
 func envSet(v *kong.Value) bool {
+	_, ok := envValue(v)
+	return ok
+}
+
+// envValue returns the first environment variable of v that is set and not
+// empty.
+func envValue(v *kong.Value) (string, bool) {
 	for _, e := range v.Tag.Envs {
-		if os.Getenv(e) != "" {
-			return true
+		if s := os.Getenv(e); s != "" {
+			return s, true
 		}
 	}
-	return false
+	return "", false
 }
 
 // fullCommand returns the command path of a node, as kingpin's FullCommand

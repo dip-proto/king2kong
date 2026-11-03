@@ -223,6 +223,10 @@ func (c *converter) deletableStmts(p *Package, body *dst.BlockStmt) (map[dst.Stm
 					}
 				} else if pure && s.Tok == token.DEFINE && !hasCallBesides(p, in, s) {
 					ok = usedOnlyByDeletable(s)
+				} else if root := localRoot(p, s.Lhs); pure && root != nil && !hasCallBesides(p, in, s) {
+					// Changing a local only registrations read, as in
+					// spec.Name += "-copy".
+					ok = !slices.ContainsFunc(uses[root], func(u dst.Stmt) bool { return u != s && !d[u] && stillReads(u, root) })
 				}
 			case *dst.DeclStmt:
 				vals := in.stmtVals[s]
@@ -260,6 +264,38 @@ func (c *converter) deletableStmts(p *Package, body *dst.BlockStmt) (map[dst.Stm
 		changed = changed || len(lowered) > before
 	}
 	return d, lowered
+}
+
+// localRoot returns the local variable or parameter that assigning to lhs
+// changes, when nothing outside the function can see the change.
+func localRoot(p *Package, lhs []dst.Expr) *types.Var {
+	var root *types.Var
+	for _, l := range lhs {
+		e := unparen(l)
+		for {
+			sel, ok := e.(*dst.SelectorExpr)
+			if !ok {
+				break
+			}
+			if _, ptr := typeUnder(p.typeOf(sel.X)).(*types.Pointer); ptr {
+				return nil
+			}
+			e = unparen(sel.X)
+		}
+		id, ok := e.(*dst.Ident)
+		if !ok {
+			return nil
+		}
+		v, ok := p.objectOf(id).(*types.Var)
+		if !ok || v.IsField() || v.Pkg() == nil || v.Parent() == v.Pkg().Scope() || root != nil && root != v {
+			return nil
+		}
+		if _, ptr := typeUnder(v.Type()).(*types.Pointer); ptr {
+			return nil
+		}
+		root = v
+	}
+	return root
 }
 
 // linksCommands reports whether an assignment outside a constructor hands a

@@ -36,8 +36,26 @@ func (c *converter) convertRuntime() {
 	c.pointRemovedCalls()
 	c.declareListCLIs()
 	exports := c.compatExports()
-	// Hook values are bound at kingpin.New when they are in scope there,
-	// and otherwise where they were passed to the wiring code.
+	// A hook value is bound where the program passes it, as in
+	// Define(app, cfg).
+	// Otherwise it is bound at kingpin.New, if a variable of its type is
+	// in scope there.
+	var passed []types.Type
+	for _, p := range c.prog.Packages {
+		for _, f := range p.Syntax {
+			dst.Inspect(f, func(n dst.Node) bool {
+				if s, ok := n.(dst.Stmt); ok {
+					if call := stmtCall(s); call != nil {
+						params, _, bound := c.atCall(p, call)
+						for _, i := range bound {
+							passed = append(passed, params.At(i).Type())
+						}
+					}
+				}
+				return true
+			})
+		}
+	}
 	for _, p := range c.prog.Packages {
 		for _, f := range p.Syntax {
 			dst.Inspect(f, func(n dst.Node) bool {
@@ -47,7 +65,7 @@ func (c *converter) convertRuntime() {
 				}
 				if id, ok := call.Fun.(*dst.Ident); ok && id.Name == "New" && c.prog.isKingpinPath(id.Path) {
 					for _, t := range c.injected {
-						if c.variableOfType(p, call, t) != nil {
+						if !containsType(passed, t) && c.variableOfType(p, call, t) != nil {
 							c.boundAtNew = append(c.boundAtNew, t)
 						}
 					}
@@ -98,19 +116,17 @@ func (c *converter) convertRuntime() {
 	}
 }
 
-// runtimeRenames are kingpin's package-level functions whose kongcompat
-// version has another name, the name they have taking other arguments.
+// runtimeRenames maps kingpin functions to their kongcompat versions that
+// have another name, because they take other arguments.
 var runtimeRenames = map[string]string{"MustParse": "Must"}
 
-// notCarried are kingpin's package-level names whose kongcompat namesakes
-// mean something else, so they are reported instead.
+// notCarried are kingpin names whose kongcompat namesakes do something
+// else, so they are reported.
 var notCarried = map[string]bool{"Parse": true, "Usage": true, "HelpCommand": true}
 
-// compatName moves a use of a kingpin package-level name, such as
-// kingpin.MustParse, to its kongcompat equivalent, and tells whether there is
-// one.
-// When there is none, the use is reported, once per name, since the program
-// would still depend on kingpin.
+// compatName points a use of a kingpin name such as kingpin.MustParse at
+// its kongcompat equivalent, and tells whether there is one.
+// If there isn't, the name is reported once.
 func (c *converter) compatName(p *Package, n *dst.Ident, exports map[string]bool) bool {
 	if to, ok := runtimeRenames[n.Name]; ok {
 		n.Name, n.Path = to, c.compatPath
@@ -157,37 +173,21 @@ func (c *converter) applyRuntime(p *Package, pre, stmt func(*dstutil.Cursor) (bo
 	}
 }
 
-// bindAtCall adds app.Bind(cfg) before a call such as Define(app, cfg),
-// when the callee lost its application parameter or keeps a command list.
-// Only the arguments whose types the hooks take are bound.
+// bindAtCall adds app.Bind(cfg) before a call such as Define(app, cfg).
 func (c *converter) bindAtCall(p *Package, cur *dstutil.Cursor, s dst.Stmt) {
 	call := stmtCall(s)
-	if call == nil {
+	if call == nil || cur.Index() < 0 {
 		return
 	}
-	fn := c.g.in.staticCallee(p, call)
-	sig, ok := c.pruned[fn]
-	kept := c.cmdLists[fn] != nil
-	if (!ok || len(sig.params) == 0) && !kept {
-		return
-	}
-	params := fn.Type().(*types.Signature).Params()
-	if len(call.Args) != params.Len() || cur.Index() < 0 {
-		return
-	}
-	app := -1
+	params, app, all := c.atCall(p, call)
 	var bound []int
-	for i := range call.Args {
-		t := params.At(i).Type()
-		switch {
-		case (sig.params[i] || sig.nils[i] || kept) && c.isAppType(t):
-			app = i
-		case !sig.params[i] && c.isInjectedType(t) && !containsType(c.boundAtNew, t):
+	for _, i := range all {
+		if t := params.At(i).Type(); !containsType(c.boundAtNew, t) {
 			bound = append(bound, i)
 			c.boundAtCall = append(c.boundAtCall, t)
 		}
 	}
-	if app < 0 || len(bound) == 0 {
+	if len(bound) == 0 {
 		return
 	}
 	appExpr, binds := c.sharedArgs(p, cur, s, call, app, bound, params)
@@ -195,7 +195,7 @@ func (c *converter) bindAtCall(p *Package, cur *dstutil.Cursor, s dst.Stmt) {
 	for j, i := range bound {
 		t := params.At(i).Type()
 		typs = append(typs, t)
-		// kong keeps the last value bound for a type, for every hook.
+		// kong only keeps the last value bound for a type.
 		key := renderExact(appExpr) + " " + types.TypeString(t, nil)
 		if prev, ok := c.boundValues[key]; ok && prev != renderExact(binds[j]) {
 			c.issue(p.position(call), "%s and %s are both bound for the hooks as %s, but kong keeps only the last one; set the value by hand", prev, renderExact(binds[j]), types.TypeString(t, shortQual))
@@ -207,12 +207,48 @@ func (c *converter) bindAtCall(p *Package, cur *dstutil.Cursor, s dst.Stmt) {
 	}
 }
 
-// ifaceArg returns (*T)(nil) when t is an interface such as io.Writer, or nil.
-// kong binds a value by its dynamic type, so one a hook takes as an
-// interface has to be bound to that interface with BindTo.
-// It reports false for an interface it can't write in from, the package
-// the expression is written in: one unexported or generic, and an unnamed
-// one tied to a package through its method types or unexported methods.
+// atCall tells where a call such as Define(app, cfg) passes the
+// application and the values the hooks need.
+// It returns the callee's parameters, the index of the application and the
+// indexes of those values.
+func (c *converter) atCall(p *Package, call *dst.CallExpr) (*types.Tuple, int, []int) {
+	fn := c.g.in.staticCallee(p, call)
+	if fn == nil {
+		return nil, -1, nil
+	}
+	sig, ok := c.pruned[fn]
+	kept := c.cmdLists[fn] != nil
+	if (!ok || len(sig.params) == 0) && !kept {
+		return nil, -1, nil
+	}
+	params := fn.Type().(*types.Signature).Params()
+	if len(call.Args) != params.Len() {
+		return nil, -1, nil
+	}
+	app := -1
+	var bound []int
+	for i := range call.Args {
+		t := params.At(i).Type()
+		pruned := i < len(sig.params) && sig.params[i]
+		nils := i < len(sig.nils) && sig.nils[i]
+		switch {
+		case (pruned || nils || kept) && c.isAppType(t):
+			app = i
+		case !pruned && c.isInjectedType(t):
+			bound = append(bound, i)
+		}
+	}
+	if app < 0 {
+		return nil, -1, nil
+	}
+	return params, app, bound
+}
+
+// ifaceArg returns (*T)(nil) when t is an interface such as io.Writer, or
+// nil otherwise.
+// kong binds a value by its concrete type, so a value a hook takes as an
+// interface needs BindTo.
+// It returns false when the interface can't be written in package from.
 func ifaceArg(t types.Type, from string) (dst.Expr, bool) {
 	if !types.IsInterface(t) {
 		return nil, true
@@ -229,9 +265,9 @@ func ifaceArg(t types.Type, from string) (dst.Expr, bool) {
 			typ = dst.NewIdent("any")
 			break
 		}
-		// One naming no package, as interface{ Write([]byte) (int, error) },
-		// is the same type wherever it is written.
-		// Unexported methods belong to their package, though.
+		// Something like interface{ Write([]byte) (int, error) } can be
+		// written anywhere, unless it uses another package's types or
+		// unexported methods.
 		local := false
 		text := types.TypeString(t, func(*types.Package) string {
 			local = true
@@ -248,8 +284,7 @@ func ifaceArg(t types.Type, from string) (dst.Expr, bool) {
 	return callOf(&dst.ParenExpr{X: &dst.StarExpr{X: typ}}, dst.NewIdent("nil")), true
 }
 
-// typeAt returns the expression of t as written in package from, if it can
-// be written there.
+// typeAt writes t as package from would, if it can.
 func typeAt(t types.Type, from string) (dst.Expr, bool) {
 	switch t := types.Unalias(t).(type) {
 	case *types.Basic:
@@ -277,11 +312,11 @@ func typeAt(t types.Type, from string) (dst.Expr, bool) {
 	return nil, false
 }
 
-// asParam gives a constant or nil argument the type of the parameter it
-// was passed to, as time.Duration(5) for Define(app, 5).
-// Bound as it is, 5 would be an int and nil would have no type at all.
-// arg is the argument in the call, and bound the copy to bind.
-// It reports false when that type can't be written in p.
+// asParam converts a constant or nil argument to its parameter's type, as
+// in time.Duration(5) for Define(app, 5).
+// Otherwise kong would bind 5 as an int, and nil as nothing at all.
+// arg is the argument in the call and bound is the copy to bind.
+// It returns false when the type can't be written in p.
 func asParam(p *Package, arg, bound dst.Expr, t types.Type) (dst.Expr, bool) {
 	tv, ok := p.tv(arg)
 	if !ok || tv.Value == nil && !tv.IsNil() || types.IsInterface(t) {
@@ -300,8 +335,8 @@ func asParam(p *Package, arg, bound dst.Expr, t types.Type) (dst.Expr, bool) {
 	return callOf(typ, bound), true
 }
 
-// naturalType returns the type a constant has on its own, as int for 5, or
-// nil when it is not a plain literal or named constant.
+// naturalType returns the type a literal or named constant has on its own,
+// like int for 5, or nil.
 func naturalType(p *Package, e dst.Expr) types.Type {
 	switch e := unparen(e).(type) {
 	case *dst.BasicLit:
@@ -317,8 +352,8 @@ func naturalType(p *Package, e dst.Expr) types.Type {
 	return nil
 }
 
-// importable reports whether package from may import path, which is not
-// the case for an internal package outside its parent.
+// importable reports whether package from may import path, given Go's
+// rule for internal packages.
 func importable(path, from string) bool {
 	p := "/" + path + "/"
 	i := strings.LastIndex(p, "/internal/")
@@ -329,10 +364,10 @@ func importable(path, from string) bool {
 	return root == "" || from == root || strings.HasPrefix(from, root+"/")
 }
 
-// bindCalls returns the calls binding values, of types typs, for the hooks:
-// one Bind for most, and a BindTo for each interface.
-// call builds each one from its name, as kong.Bind or app.Bind.
-// pos is where to report what cannot be bound.
+// bindCalls returns the calls that bind values for the hooks: one Bind for
+// most of them, and a BindTo for each interface.
+// typs are the types the hooks take, and call builds kong.Bind or app.Bind.
+// pos is where problems are reported.
 func (c *converter) bindCalls(pos token.Position, values []dst.Expr, typs []types.Type, from string, call func(name string, args ...dst.Expr) dst.Expr) []dst.Expr {
 	var out, plain []dst.Expr
 	for i, v := range values {
@@ -379,11 +414,10 @@ func stmtCall(s dst.Stmt) *dst.CallExpr {
 }
 
 // sharedArgs returns copies of the application argument and of the
-// arguments at indexes, to be used a second time before call.
-// Arguments that are not plain variables, such as &Config{} or getApp(),
-// are first moved into variables named after their parameters, so every
-// argument is still evaluated once and in its original order.
-// Constants and nil get the type of their parameter.
+// arguments at indexes, to use again just before call.
+// An argument like &Config{} or getApp() first goes into a variable, so it
+// is still evaluated once and in order.
+// Constants and nil get their parameter's type.
 func (c *converter) sharedArgs(p *Package, cur *dstutil.Cursor, s dst.Stmt, call *dst.CallExpr, app int, indexes []int, params *types.Tuple) (dst.Expr, []dst.Expr) {
 	last := app
 	for _, i := range indexes {

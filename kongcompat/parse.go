@@ -74,13 +74,15 @@ func Parse(k *kong.Kong, args []string, uc *UsageContext) (string, error) {
 		}
 	}
 
-	// kingpin printed the version as soon as it saw the flag, ignoring the
-	// rest of the command line.
-	// kong's VersionFlag prints it from a hook that runs before any check,
-	// so only parse up to the flag.
+	// kingpin printed the version before checking any value or handling
+	// --help, as long as the command line up to the flag made sense.
+	// kong prints it from a hook that runs before any check, so the flag is
+	// parsed alone.
 	if i := versionFlagIndex(k, flags); i >= 0 {
-		_, err := k.Parse(args[:i+1])
-		return "", err
+		if _, err := scan(k, args[:i+1], true); err == nil {
+			_, err := k.Parse(args[i : i+1])
+			return "", err
+		}
 	}
 
 	// Values must be decoded only once, by kong's Parse, since a value's Set
@@ -88,7 +90,7 @@ func Parse(k *kong.Kong, args []string, uc *UsageContext) (string, error) {
 	// Until then, just follow the command line the way kingpin read it.
 	scanned, err := scan(k, args, true)
 	if err != nil {
-		// A bad default still comes first.
+		// kingpin checked the defaults even before the syntax.
 		if _, ferr := scan(k, args, false); ferr != nil {
 			return "", ferr
 		}
@@ -239,12 +241,11 @@ func hideEnvars(k *kong.Kong, given map[*kong.Value]bool) (restore func()) {
 	}
 }
 
-// takeGiven makes kong decode the values given on the command line as
+// takeGiven makes kong read the values given on the command line the way
 // kingpin did, until restore is called.
-// Their defaults are left alone, so a bad one, such as an empty int, is no
-// error.
-// And they are not split at newlines, which only separate the values of an
-// environment variable or of several defaults.
+// Their defaults are ignored, so a bad one is no error.
+// They are not split at newlines either: only environment variables and
+// default lists are.
 func takeGiven(given map[*kong.Value]bool) (restore func()) {
 	type saved struct {
 		v           *kong.Value
@@ -466,11 +467,28 @@ func isPath(v *kong.Value) bool {
 	return v.Tag.Type == "existingfile" || v.Tag.Type == "existingdir"
 }
 
-// checkDefault checks the default of an existing file or directory value,
-// which kingpin did only when the default was used.
+// checkDefault checks the environment variable or, failing that, the
+// default of a value missing from the command line.
+// An empty default counts.
 func checkDefault(v *kong.Value) error {
-	if !isPath(v) || v.Default == "" || v.Target.Kind() != reflect.String {
+	text, ok := envValue(v)
+	if !ok {
+		text, ok = v.Default, v.HasDefault
+	}
+	if !ok {
 		return nil
 	}
-	return checkPath(v.Default, v.Tag.Type == "existingdir")
+	texts := []string{text}
+	switch {
+	case v.Target.Kind() == reflect.Slice && v.Tag.Sep != -1:
+		texts = kong.SplitEscaped(text, v.Tag.Sep)
+	case v.Target.Kind() == reflect.Map && v.Tag.MapSep != -1:
+		texts = kong.SplitEscaped(text, v.Tag.MapSep)
+	}
+	for _, t := range texts {
+		if err := checkValue(v, t); err != nil {
+			return err
+		}
+	}
+	return nil
 }

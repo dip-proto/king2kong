@@ -81,7 +81,10 @@ func checkValue(v *kong.Value, value string) error {
 //     absolute;
 //   - a noflag value is a boolean flag named no-x, which kingpin v3 set to
 //     false when it was given;
-//   - a boolarg value is a positional boolean, given as true or false.
+//   - a boolarg value is a positional boolean, given as true or false;
+//   - a counter's environment variable or default counts as one, whatever
+//     it says;
+//   - a file is opened by the name given, and "-" is just a file name.
 func Values() kong.Option {
 	return kong.OptionFunc(func(k *kong.Kong) error {
 		for _, opt := range []kong.Option{
@@ -92,6 +95,8 @@ func Values() kong.Option {
 			kong.NamedMapper("existingdir", existingPath(true)),
 			kong.NamedMapper("noflag", noFlag{}),
 			kong.NamedMapper("boolarg", kong.MapperFunc(boolArg)),
+			kong.NamedMapper("counter", kong.MapperFunc(counter)),
+			kong.TypeMapper(reflect.TypeOf((*os.File)(nil)), kong.MapperFunc(openFile)),
 		} {
 			if err := opt.Apply(k); err != nil {
 				return err
@@ -137,6 +142,36 @@ func valueTexts(ctx *kong.DecodeContext, sep rune, many bool) ([]string, error) 
 		return nil, fmt.Errorf("missing value")
 	}
 	return kong.SplitEscaped(fmt.Sprint(t.Value), sep), nil
+}
+
+// counter adds one for every value, as kingpin's counter did.
+func counter(ctx *kong.DecodeContext, target reflect.Value) error {
+	if ctx.Scan.Peek().Type == kong.FlagValueToken {
+		ctx.Scan.Pop()
+	}
+	switch target.Kind() {
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+		target.SetInt(target.Int() + 1)
+	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
+		target.SetUint(target.Uint() + 1)
+	default:
+		return fmt.Errorf("a counter needs an integer, not %s", target.Type())
+	}
+	return nil
+}
+
+// openFile opens a file the way kingpin's File did.
+func openFile(ctx *kong.DecodeContext, target reflect.Value) error {
+	texts, err := valueTexts(ctx, -1, false)
+	if err != nil {
+		return err
+	}
+	f, err := os.Open(texts[0])
+	if err != nil {
+		return err
+	}
+	target.Set(reflect.ValueOf(f))
+	return nil
 }
 
 // boolArg decodes a positional boolean, which takes a value, unlike a
@@ -199,11 +234,9 @@ func existingPath(dir bool) kong.MapperFunc {
 			return err
 		}
 		for _, s := range texts {
-			// kong also decodes the defaults of unselected commands,
-			// which kingpin never checked.
-			// Parse checks a single default that is kept, before the
-			// other errors as kingpin did, and hides the defaults of
-			// values given on the command line.
+			// kong also decodes the defaults of commands that were not
+			// selected, which kingpin never checked.
+			// Parse checks the defaults that are used itself.
 			if ctx.Value.Active && (many || !ctx.Value.HasDefault || s != ctx.Value.Default) {
 				if err := checkPath(s, dir); err != nil {
 					return err

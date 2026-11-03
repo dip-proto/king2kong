@@ -94,11 +94,9 @@ func (c *converter) cleanupWiring() {
 	c.dropEmptiedCalls()
 }
 
-// reportDroppedFields reports the fields that s, a statement going away
-// with the registrations, sets in a command struct literal, as in
-// h := &hello{cfg: cfg} in a function that only registers h's command.
-// Nothing carries those values over, so code reading them would see zero
-// values.
+// reportDroppedFields reports the fields a deleted statement sets in a
+// command struct literal, like cfg in h := &hello{cfg: cfg}.
+// Those values are lost, so code reading them would see zero values.
 func (c *converter) reportDroppedFields(p *Package, fd *dst.FuncDecl, s dst.Stmt) {
 	if c.destFields == nil {
 		c.destFields = map[*types.Var]bool{}
@@ -137,8 +135,7 @@ func (c *converter) reportDroppedFields(p *Package, fd *dst.FuncDecl, s dst.Stmt
 	})
 }
 
-// isZeroValue reports whether e is nil or a constant zero value, which a
-// command struct starts with anyway.
+// isZeroValue reports whether e is nil or a zero constant.
 func isZeroValue(p *Package, e dst.Expr) bool {
 	tv, ok := p.tv(e)
 	if !ok {

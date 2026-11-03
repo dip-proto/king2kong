@@ -51,9 +51,11 @@ type mainProgram struct {
 	// package-level application that became kong options.
 	packageSettings map[*dst.CallExpr]bool
 	// binds go to kong.Bind, for hooks that now do what constructors did.
-	// bound are the variables they name.
-	binds []dst.Expr
-	bound []*types.Var
+	// bound are the variables they name, and boundAs the types the hooks
+	// take them as.
+	binds   []dst.Expr
+	bound   []*types.Var
+	boundAs []types.Type
 	// structSpecs declare the package-level command structs the CLI
 	// replaces, and cliSpec is the one whose place a package-level cli takes
 	// when it starts with their values.
@@ -1660,7 +1662,7 @@ func (c *converter) parserArgs(name, help dst.Expr) []dst.Expr {
 	var binds []dst.Expr
 	var typs []types.Type
 	for i, b := range mp.binds {
-		binds, typs = append(binds, dst.Clone(b).(dst.Expr)), append(typs, mp.bound[i].Type())
+		binds, typs = append(binds, dst.Clone(b).(dst.Expr)), append(typs, mp.boundAs[i])
 	}
 	args = append(args, c.bindCalls(c.tree.Root.cl.pos, binds, typs, c.tree.RootPkg.PkgPath, kongOption)...)
 	if mp.exit != nil {
@@ -1714,13 +1716,13 @@ func onePerLine(elts []dst.Expr) []dst.Expr {
 // needsValues reports whether a flag or argument needs kongcompat.Values
 // because kingpin decoded it differently from kong.
 // That covers ints and []int (kingpin parsed them as floats), []bool,
-// map[string]string, existing files and directories, and kingpin v3 booleans
-// named no-x.
+// map[string]string, counters, files, existing files and directories,
+// positional booleans, and kingpin v3 booleans named no-x.
 func (c *converter) needsValues() bool {
 	for _, b := range c.plan.bindings {
 		if b.tag != nil {
 			switch b.tag.Get("type") {
-			case "existingfile", "existingdir", "noflag", "boolarg":
+			case "existingfile", "existingdir", "noflag", "boolarg", "counter":
 				return true
 			}
 		}
@@ -1735,6 +1737,9 @@ func (c *converter) needsValues() bool {
 		}
 		if t == nil {
 			continue
+		}
+		if types.TypeString(t, nil) == "*os.File" {
+			return true
 		}
 		switch u := t.Underlying().(type) {
 		case *types.Slice:

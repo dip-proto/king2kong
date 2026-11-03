@@ -7,7 +7,6 @@ import (
 	"go/constant"
 	"go/token"
 	"go/types"
-	"maps"
 	"math"
 	"slices"
 	"strconv"
@@ -398,12 +397,26 @@ func (in *interp) block(fr *frame, stmts []dst.Stmt) {
 		}
 		in.stmt(fr, s)
 		// After if cond { return }, the rest only runs when cond is false.
-		if g, ok := s.(*dst.IfStmt); ok && g.Else == nil && len(g.Body.List) > 0 {
-			if _, returns := g.Body.List[len(g.Body.List)-1].(*dst.ReturnStmt); returns && fr.unknownIf == g {
-				fr.conds = append(append([]cond{}, fr.conds...), cond{expr: g.Cond, neg: true, fn: fr.fn, pkg: fr.pkg})
+		// After if cond { ... } else { return }, only when it is true.
+		if g, ok := s.(*dst.IfStmt); ok && fr.unknownIf == g {
+			body := endsInReturn(g.Body)
+			other := false
+			if e, ok := g.Else.(*dst.BlockStmt); ok {
+				other = endsInReturn(e)
+			}
+			if body != other {
+				fr.conds = append(append([]cond{}, fr.conds...), cond{expr: g.Cond, neg: body, fn: fr.fn, pkg: fr.pkg})
 			}
 		}
 	}
+}
+
+func endsInReturn(b *dst.BlockStmt) bool {
+	if len(b.List) == 0 {
+		return false
+	}
+	_, ok := b.List[len(b.List)-1].(*dst.ReturnStmt)
+	return ok
 }
 
 // ran reports whether the interpreter executed a statement at least once.
@@ -568,30 +581,56 @@ func (in *interp) assign(fr *frame, s *dst.AssignStmt) {
 	}
 }
 
-// copyData gives x := y, where y is a struct of plain data such as names and
-// help texts, an object of its own, so changing the copy leaves y alone.
-// Other structs stay shared, which keeps the fields of a command reachable
+// copyData makes x := y copy y when it is a struct of plain data, like
+// names and help texts, so changing x leaves y alone.
+// Other structs stay shared, so a command's fields can still be reached
 // through its copies.
 func (in *interp) copyData(rhs dst.Expr, v value) value {
-	vo, ok := v.(vObj)
-	if !ok {
-		return v
-	}
 	switch unparen(rhs).(type) {
-	case *dst.Ident, *dst.SelectorExpr, *dst.StarExpr:
-	default:
-		return v
+	case *dst.Ident, *dst.SelectorExpr, *dst.StarExpr, *dst.IndexExpr:
+		return in.copyValue(v)
 	}
-	for _, f := range vo.o.fields {
-		switch f.(type) {
-		case vConst, vSlice, vUnknown, vNil:
-		default:
-			return v
+	return v
+}
+
+// copyValue is copyData for a value already read, like a range variable.
+func (in *interp) copyValue(v value) value {
+	if vo, ok := v.(vObj); ok {
+		if o, ok := in.copyStruct(vo.o); ok {
+			return vObj{o}
 		}
 	}
-	o := in.newObject(vo.o.typ, vo.o.known, vo.o.site)
-	maps.Copy(o.fields, vo.o.fields)
-	return vObj{o}
+	return v
+}
+
+// copyStruct copies an object of plain data, nested structs included.
+// It returns false if the object holds anything else.
+func (in *interp) copyStruct(src *object) (*object, bool) {
+	if src.st == nil {
+		return nil, false
+	}
+	o := in.newObject(src.typ, src.known, src.site)
+	for i := range src.st.NumFields() {
+		f := src.st.Field(i)
+		switch v := src.fields[f].(type) {
+		case nil:
+		case vConst, vSlice, vUnknown, vNil:
+			o.fields[f] = v
+		case vObj:
+			if v.o.parent != src {
+				return nil, false
+			}
+			inner, ok := in.copyStruct(v.o)
+			if !ok {
+				return nil, false
+			}
+			inner.parent, inner.pfield = o, f
+			o.fields[f] = vObj{inner}
+		default:
+			return nil, false
+		}
+	}
+	return o, true
 }
 
 func (in *interp) store(fr *frame, lhs dst.Expr, v value) {
@@ -748,15 +787,123 @@ func (in *interp) ifStmt(fr *frame, s *dst.IfStmt) {
 			fr.jump = 0
 		}
 	}
+	written := assigned(s)
+	before := in.readAll(fr, written)
 	fr.conds = append(append([]cond{}, saved...), cond{expr: s.Cond, fn: fr.fn, pkg: fr.pkg})
 	in.block(fr, s.Body.List)
 	settle()
+	afterBody, afterElse := in.readAll(fr, written), before
 	if s.Else != nil {
+		in.writeAll(fr, written, before)
 		fr.conds = append(append([]cond{}, saved...), cond{expr: s.Cond, neg: true, fn: fr.fn, pkg: fr.pkg})
 		in.stmt(fr, s.Else)
 		settle()
+		afterElse = in.readAll(fr, written)
 	}
 	fr.conds = saved
+	// Plain data the branches set differently, like a default, now depends
+	// on the condition, so it is unknown.
+	// Grammar values keep what the last branch left.
+	for i, l := range written {
+		v := afterElse[i]
+		if !sameValue(afterBody[i], afterElse[i]) && isData(afterBody[i]) && isData(afterElse[i]) {
+			v = vUnknown{}
+		} else if s.Else == nil {
+			v = afterBody[i]
+		}
+		in.store(fr, l, v)
+	}
+}
+
+// assigned returns what an if statement assigns with =, ++ or --, like x
+// or cfg.Timeout.
+func assigned(s *dst.IfStmt) []dst.Expr {
+	var out []dst.Expr
+	add := func(e dst.Expr) {
+		if id, ok := e.(*dst.Ident); ok && id.Name == "_" || !plainExpr(e) {
+			return
+		}
+		out = append(out, e)
+	}
+	dst.Inspect(s, func(n dst.Node) bool {
+		switch n := n.(type) {
+		case *dst.FuncLit:
+			return false
+		case *dst.AssignStmt:
+			if n.Tok != token.DEFINE {
+				for _, l := range n.Lhs {
+					add(l)
+				}
+			}
+		case *dst.IncDecStmt:
+			add(n.X)
+		}
+		return true
+	})
+	return out
+}
+
+func (in *interp) readAll(fr *frame, exprs []dst.Expr) []value {
+	out := make([]value, len(exprs))
+	for i, e := range exprs {
+		out[i] = in.eval(fr, e)
+	}
+	return out
+}
+
+func (in *interp) writeAll(fr *frame, exprs []dst.Expr, vals []value) {
+	for i, e := range exprs {
+		in.store(fr, e, vals[i])
+	}
+}
+
+// isData reports whether v is plain data, not grammar.
+func isData(v value) bool {
+	switch v.(type) {
+	case vConst, vNil, vUnknown:
+		return true
+	case vSlice:
+		for _, e := range v.(vSlice).elems {
+			if !isData(e) {
+				return false
+			}
+		}
+		return true
+	}
+	return false
+}
+
+// sameValue reports whether a and b are known to be the same value.
+func sameValue(a, b value) bool {
+	switch a := a.(type) {
+	case vConst:
+		b, ok := b.(vConst)
+		return ok && a.c.Kind() == b.c.Kind() && constant.Compare(a.c, token.EQL, b.c)
+	case vNil:
+		_, ok := b.(vNil)
+		return ok
+	case vSlice:
+		b, ok := b.(vSlice)
+		if !ok || len(a.elems) != len(b.elems) {
+			return false
+		}
+		for i := range a.elems {
+			if !sameValue(a.elems[i], b.elems[i]) {
+				return false
+			}
+		}
+		return true
+	case vObj:
+		b, ok := b.(vObj)
+		return ok && a.o == b.o
+	case vPtr:
+		b, ok := b.(vPtr)
+		return ok && a.o == b.o
+	case vClause:
+		b, ok := b.(vClause)
+		return ok && a.c == b.c
+	}
+	return false
 }
 
 // forgetWrites drops what the interpreter knows of the variables n assigns,
@@ -768,7 +915,7 @@ func (in *interp) forgetWrites(fr *frame, n dst.Node) {
 			return
 		}
 		if v.IsField() {
-			// A field of a struct the code at hand reaches, as cfg.Remote.
+			// A field, as in cfg.Remote = true.
 			if sel, ok := unparen(l).(*dst.SelectorExpr); ok && plainExpr(sel.X) {
 				switch o := in.eval(fr, sel.X).(type) {
 				case vObj:
@@ -796,6 +943,18 @@ func (in *interp) forgetWrites(fr *frame, n dst.Node) {
 			}
 		case *dst.IncDecStmt:
 			forget(n.X)
+		case *dst.CallExpr:
+			// A call may write through a pointer, as json.Unmarshal(raw,
+			// &settings) does.
+			var args []value
+			for _, a := range n.Args {
+				v := value(vUnknown{})
+				if u, ok := unparen(a).(*dst.UnaryExpr); ok && u.Op == token.AND && plainExpr(u.X) {
+					v = in.eval(fr, a)
+				}
+				args = append(args, v)
+			}
+			in.forgetPointed(fr, n, vUnknown{}, args)
 		}
 		return true
 	})
@@ -808,6 +967,14 @@ func (in *interp) forgetWrites(fr *frame, n dst.Node) {
 // rarely replace those and commands need them to stay reachable.
 func (in *interp) forgetPointed(fr *frame, c *dst.CallExpr, recv value, args []value) {
 	forgetObject := func(v value) {
+		if fp, ok := v.(vFieldPtr); ok {
+			// As in readBool(&settings.Remote).
+			switch typeUnder(fp.f.Type()).(type) {
+			case *types.Basic, *types.Slice:
+				fp.o.fields[fp.f] = vUnknown{}
+			}
+			return
+		}
 		p, ok := v.(vPtr)
 		if !ok || p.o.st == nil {
 			return
@@ -874,7 +1041,7 @@ func (in *interp) rangeStmt(fr *frame, s *dst.RangeStmt) {
 		}
 		if v, ok := s.Value.(*dst.Ident); ok && v.Name != "_" {
 			if o := fr.pkg.objectOf(v); o != nil {
-				fr.vars[o] = e
+				fr.vars[o] = in.copyValue(e)
 			}
 		}
 		in.loops++
@@ -1253,7 +1420,14 @@ var compoundOps = map[token.Token]token.Token{
 func numericOp(x value, op token.Token, y value) (v value) {
 	xc, ok1 := x.(vConst)
 	yc, ok2 := y.(vConst)
-	if !ok1 || !ok2 || op == token.ILLEGAL || xc.c == nil || yc.c == nil || !isNumeric(xc.c) || !isNumeric(yc.c) {
+	if !ok1 || !ok2 || op == token.ILLEGAL || xc.c == nil || yc.c == nil {
+		return vUnknown{}
+	}
+	if op == token.ADD && xc.c.Kind() == constant.String && yc.c.Kind() == constant.String {
+		// As in name += "-copy".
+		return vConst{constant.BinaryOp(xc.c, op, yc.c), xc.t}
+	}
+	if !isNumeric(xc.c) || !isNumeric(yc.c) {
 		return vUnknown{}
 	}
 	if op == token.QUO && isInteger(xc.t) {
@@ -1573,7 +1747,7 @@ func (in *interp) inline(fr *frame, c *dst.CallExpr, fd funcDecl, fn *types.Func
 			v = vSlice{rest}
 		case i < len(args):
 			v = args[i]
-			// A struct passed by value is the callee's own copy.
+			// A struct passed by value is a copy.
 			if len(c.Args) == len(args) {
 				v = in.copyData(c.Args[i], v)
 			}

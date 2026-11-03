@@ -88,7 +88,7 @@ func (c *converter) movableTo(from *Package, e dst.Expr, to *types.Package) bool
 // When only the package of a type it embeds can compute the hints, it goes on
 // that type instead, and the command gets it through the embedding.
 func (c *converter) convertHints() {
-	done := map[*types.Named]bool{}
+	done := map[*types.Named]string{}
 	for _, n := range c.tree.nodes {
 		if n.parent == nil || n.typ == nil {
 			continue
@@ -106,10 +106,16 @@ func (c *converter) convertHints() {
 				continue
 			}
 			hosted = true
-			if src == "" || done[host] {
+			if src == "" {
 				break
 			}
-			done[host] = true
+			if prev, ok := done[host]; ok {
+				if prev != src {
+					c.issue(n.cl.pos, "commands share %s but complete their values differently; only the first one's hints are kept", host.Obj().Name())
+				}
+				break
+			}
+			done[host] = src
 			if obj, _, _ := types.LookupFieldOrMethod(types.NewPointer(host), true, host.Obj().Pkg(), "Hints"); obj != nil {
 				c.issue(n.cl.pos, "%s already has a member named Hints; completion hints computed at run time are not kept", host.Obj().Name())
 				break

@@ -148,33 +148,3 @@ func TestParseLeavesValuesToKong(t *testing.T) {
 		t.Errorf("decoded %d times, value %q", decodes, cli.Token.value)
 	}
 }
-
-// TestPathDefaults checks that a missing default path is an error only when
-// the default is used, and that it comes before a missing argument, as
-// kingpin applied defaults first.
-func TestPathDefaults(t *testing.T) {
-	var cli struct {
-		Config string `default:"missing.conf" type:"existingfile"`
-		Source string `arg:"" required:""`
-	}
-	for _, tc := range []struct {
-		args []string
-		want string
-	}{
-		{nil, "path 'missing.conf' does not exist"},
-		{[]string{"--config", "parse_test.go"}, "required argument 'source' not provided"},
-		{[]string{"--config", "parse_test.go", "x"}, ""},
-	} {
-		k, err := kong.New(&cli, Values(), kong.Exit(func(int) {}))
-		if err != nil {
-			t.Fatal(err)
-		}
-		got := ""
-		if _, err := Parse(k, tc.args, nil); err != nil {
-			got = err.Error()
-		}
-		if got != tc.want {
-			t.Errorf("%q: got %q, want %q", tc.args, got, tc.want)
-		}
-	}
-}

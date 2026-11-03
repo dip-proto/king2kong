@@ -241,10 +241,11 @@ func (p *Plan) embeddedTypes() map[*types.Named]bool {
 // renders its tag.
 func (p *Plan) nameFields(t *Tree) {
 	for _, n := range t.nodes {
-		taken := map[string]bool{}
+		// Methods the conversion may add to the struct.
+		taken := map[string]bool{"Hints": true, "Vars": true, "BeforeApply": true, "AfterApply": true}
 		if n.containerOwn && n.typ != nil {
-			// An unexported field may be exported later, as config to
-			// Config for a flag.
+			// An unexported field may get exported later, like config to
+			// Config.
 			for _, name := range memberNames(n.typ) {
 				taken[name] = true
 				taken[p.g.prog.exported(name)] = true

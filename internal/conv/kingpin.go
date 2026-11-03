@@ -5,6 +5,7 @@ import (
 	"go/constant"
 	"go/token"
 	"go/types"
+	"strings"
 
 	"github.com/dave/dst"
 )
@@ -337,9 +338,9 @@ func (in *interp) kingpinMethod(fr *frame, c *dst.CallExpr, cl *clause, name str
 				}
 				for _, e := range elems {
 					s, ok := constString(e)
-					if !ok {
-						// Not a constant: a generated Hints method returns
-						// them at run time.
+					if !ok || strings.Contains(s, ",") {
+						// Not a constant, or one with a comma, which the
+						// hints tag would split: a Hints method returns it.
 						cl.hintExpr, cl.hintPkg = hintOptionsExpr(c), fr.pkg
 						return self
 					}

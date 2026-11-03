@@ -56,7 +56,7 @@ func (c *converter) addSetDecode(t *types.Named, b *binding) {
 		c.issue(b.cl.pos, "%s %q: %s has no Set method", b.cl.kind, b.cl.name, t.Obj().Name())
 		return
 	}
-	recv := c.receiverName(t, strings.ToLower(t.Obj().Name()[:1]))
+	recv := c.methodRecv(t, strings.ToLower(t.Obj().Name()[:1]))
 	name := recvType(t)
 	var body string
 	if c.hasMethod(t, "IsBoolFlag") {

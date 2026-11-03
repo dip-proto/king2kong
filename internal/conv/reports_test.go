@@ -7,9 +7,8 @@ import (
 	"testing"
 )
 
-// TestReports converts programs the tool can't convert on its own, and
-// checks that it says what is left to do instead of silently changing
-// behavior.
+// TestReports checks that programs the tool can't fully convert get a
+// report instead of a silent change.
 func TestReports(t *testing.T) {
 	cmdPkg := `package cmd
 
