@@ -243,8 +243,11 @@ func (p *Plan) nameFields(t *Tree) {
 	for _, n := range t.nodes {
 		taken := map[string]bool{}
 		if n.containerOwn && n.typ != nil {
+			// An unexported field may be exported later, as config to
+			// Config for a flag.
 			for _, name := range memberNames(n.typ) {
 				taken[name] = true
+				taken[p.g.prog.exported(name)] = true
 			}
 		}
 		for _, ch := range n.children {

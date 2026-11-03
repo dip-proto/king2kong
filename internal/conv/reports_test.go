@@ -145,6 +145,16 @@ func main() {
 			want: "constructors newHello and newWave get different *cmd.Config values",
 		},
 		{
+			name: "unexported interface, bound at a call",
+			files: map[string]string{
+				"cmd/cmd.go": strings.ReplaceAll(cmdPkg, "interface{ Write([]byte) (int, error); Stat() (os.FileInfo, error) }", "output") +
+					"\ntype output interface{ Write([]byte) (int, error); Stat() (os.FileInfo, error) }\n",
+				"main.go": runtimeMain(`
+	runners := cmd.Bye(app, os.Stdout)`),
+			},
+			want: "the hooks take os.Stdout as cmd.output",
+		},
+		{
 			name: "interface naming a package, bound at a call",
 			files: map[string]string{"cmd/cmd.go": cmdPkg, "main.go": runtimeMain(`
 	runners := cmd.Bye(app, os.Stdout)`)},

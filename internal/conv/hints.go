@@ -110,8 +110,8 @@ func (c *converter) convertHints() {
 				break
 			}
 			done[host] = true
-			if c.hasMethod(host, "Hints") {
-				c.issue(n.cl.pos, "%s already has a Hints method; completion hints computed at run time are not kept", host.Obj().Name())
+			if obj, _, _ := types.LookupFieldOrMethod(types.NewPointer(host), true, host.Obj().Pkg(), "Hints"); obj != nil {
+				c.issue(n.cl.pos, "%s already has a member named Hints; completion hints computed at run time are not kept", host.Obj().Name())
 				break
 			}
 			decls, err := snippet(loc.pkg.Name, imports, src)

@@ -88,6 +88,10 @@ func Parse(k *kong.Kong, args []string, uc *UsageContext) (string, error) {
 	// Until then, just follow the command line the way kingpin read it.
 	scanned, err := scan(k, args, true)
 	if err != nil {
+		// A bad default still comes first.
+		if _, ferr := scan(k, args, false); ferr != nil {
+			return "", ferr
+		}
 		return "", err
 	}
 	path := scanned.path
@@ -145,7 +149,9 @@ func Parse(k *kong.Kong, args []string, uc *UsageContext) (string, error) {
 	// values, so hideEnvars never looks them up.
 	keep := keepUnselected(k, path)
 	restore := hideEnvars(k, scanned.given)
+	restoreGiven := takeGiven(scanned.given)
 	kctx, err := k.Parse(args)
+	restoreGiven()
 	restore()
 	keep()
 	if err != nil {
@@ -229,6 +235,36 @@ func hideEnvars(k *kong.Kong, given map[*kong.Value]bool) (restore func()) {
 	return func() {
 		for v, envs := range saved {
 			v.Tag.Envs = envs
+		}
+	}
+}
+
+// takeGiven makes kong decode the values given on the command line as
+// kingpin did, until restore is called.
+// Their defaults are left alone, so a bad one, such as an empty int, is no
+// error.
+// And they are not split at newlines, which only separate the values of an
+// environment variable or of several defaults.
+func takeGiven(given map[*kong.Value]bool) (restore func()) {
+	type saved struct {
+		v           *kong.Value
+		hasDefault  bool
+		sep, mapSep rune
+	}
+	var changed []saved
+	for v := range given {
+		changed = append(changed, saved{v, v.HasDefault, v.Tag.Sep, v.Tag.MapSep})
+		v.HasDefault = false
+		if v.Tag.Sep == '\n' {
+			v.Tag.Sep = -1
+		}
+		if v.Tag.MapSep == '\n' {
+			v.Tag.MapSep = -1
+		}
+	}
+	return func() {
+		for _, s := range changed {
+			s.v.HasDefault, s.v.Tag.Sep, s.v.Tag.MapSep = s.hasDefault, s.sep, s.mapSep
 		}
 	}
 }

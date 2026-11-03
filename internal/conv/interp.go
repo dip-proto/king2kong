@@ -398,7 +398,7 @@ func (in *interp) block(fr *frame, stmts []dst.Stmt) {
 		}
 		in.stmt(fr, s)
 		// After if cond { return }, the rest only runs when cond is false.
-		if g, ok := s.(*dst.IfStmt); ok && g.Else == nil && len(g.Body.List) > 0 && !in.mentionsBuilder(fr.pkg, g.Body) {
+		if g, ok := s.(*dst.IfStmt); ok && g.Else == nil && len(g.Body.List) > 0 {
 			if _, returns := g.Body.List[len(g.Body.List)-1].(*dst.ReturnStmt); returns && fr.unknownIf == g {
 				fr.conds = append(append([]cond{}, fr.conds...), cond{expr: g.Cond, neg: true, fn: fr.fn, pkg: fr.pkg})
 			}
@@ -504,7 +504,7 @@ func (in *interp) declStmt(fr *frame, s *dst.DeclStmt) {
 			vals = in.multi(fr, vs.Values[0])
 		} else {
 			for _, e := range vs.Values {
-				vals = append(vals, in.eval(fr, e))
+				vals = append(vals, in.copyData(e, in.eval(fr, e)))
 			}
 		}
 		in.stmtVals[s] = append(in.stmtVals[s], vals...)
@@ -764,7 +764,19 @@ func (in *interp) ifStmt(fr *frame, s *dst.IfStmt) {
 func (in *interp) forgetWrites(fr *frame, n dst.Node) {
 	forget := func(l dst.Expr) {
 		v, ok := fr.pkg.objectOf(unparen(l)).(*types.Var)
-		if !ok || v.IsField() || v.Pkg() == nil {
+		if !ok || v.Pkg() == nil {
+			return
+		}
+		if v.IsField() {
+			// A field of a struct the code at hand reaches, as cfg.Remote.
+			if sel, ok := unparen(l).(*dst.SelectorExpr); ok && plainExpr(sel.X) {
+				switch o := in.eval(fr, sel.X).(type) {
+				case vObj:
+					o.o.fields[v] = vUnknown{}
+				case vPtr:
+					o.o.fields[v] = vUnknown{}
+				}
+			}
 			return
 		}
 		if v.Parent() == v.Pkg().Scope() {
@@ -1533,6 +1545,9 @@ func (in *interp) inline(fr *frame, c *dst.CallExpr, fd funcDecl, fn *types.Func
 	if fd.decl.Recv != nil && len(fd.decl.Recv.List) == 1 && len(fd.decl.Recv.List[0].Names) == 1 {
 		if o := fd.pkg.objectOf(fd.decl.Recv.List[0].Names[0]); o != nil {
 			nf.vars[o] = adaptRecv(recv, o.Type())
+			if sel, ok := c.Fun.(*dst.SelectorExpr); ok {
+				nf.vars[o] = in.copyData(sel.X, nf.vars[o])
+			}
 		}
 	}
 	sig, _ := fn.Type().(*types.Signature)
@@ -1558,6 +1573,10 @@ func (in *interp) inline(fr *frame, c *dst.CallExpr, fd funcDecl, fn *types.Func
 			v = vSlice{rest}
 		case i < len(args):
 			v = args[i]
+			// A struct passed by value is the callee's own copy.
+			if len(c.Args) == len(args) {
+				v = in.copyData(c.Args[i], v)
+			}
 		}
 		if po != nil {
 			nf.vars[po] = v

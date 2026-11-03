@@ -1720,7 +1720,7 @@ func (c *converter) needsValues() bool {
 	for _, b := range c.plan.bindings {
 		if b.tag != nil {
 			switch b.tag.Get("type") {
-			case "existingfile", "existingdir", "noflag":
+			case "existingfile", "existingdir", "noflag", "boolarg":
 				return true
 			}
 		}

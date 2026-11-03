@@ -297,6 +297,18 @@ func Convert(prog *Program, opts Options) (*Result, error) {
 		if n.typ != nil {
 			c.cmdTypes[n.typ] = true
 		}
+		if n.containerOwn && n.typ != nil {
+			for _, ch := range n.children {
+				c.nm.claim(n.typ, ch.field)
+			}
+		}
+		// convertHints may add a Hints method to the command or a type it
+		// embeds.
+		if n.typ != nil && slices.ContainsFunc(n.cl.children, func(ch *clause) bool { return ch.hintExpr != nil }) {
+			for _, t := range append([]*types.Named{n.typ}, embeddedClosure(n.typ)...) {
+				c.nm.claim(t, "Hints")
+			}
+		}
 	}
 
 	fatal := false
@@ -1304,45 +1316,73 @@ func (c *converter) convertConstructors() {
 	for _, f := range slices.SortedFunc(maps.Keys(c.valueEmbeds), byPos) {
 		c.embedByValue(f)
 	}
-	// kong hands every hook the one value bound for a type, so the
-	// constructors must all get the same one.
-	// Main mode checks the arguments themselves, below.
+	// argsOf returns the values the interpreter saw passed to an injected
+	// parameter, with the constructor they were passed to.
 	type given struct {
 		v  value
 		fn *types.Func
 	}
+	argsOf := func(list []inj) []given {
+		var out []given
+		for _, in := range list {
+			idx := in.ci.params[in.param]
+			for _, s := range c.g.in.sites {
+				if s.callee == in.ci.fn && idx < len(s.args) {
+					out = append(out, given{s.args[idx], in.ci.fn})
+				}
+			}
+		}
+		return out
+	}
+	// kong hands every hook the one value bound for a type, so the
+	// constructors must all get the same one.
+	// Main mode checks the arguments themselves, below.
 	firstGiven := map[string]given{}
 	clashes := func(f *types.Var, list []inj) bool {
 		t := list[0].param.Type()
 		key := types.TypeString(t, nil)
-		for _, in := range list {
-			idx := in.ci.params[in.param]
-			for _, s := range c.g.in.sites {
-				if s.callee != in.ci.fn || idx >= len(s.args) {
-					continue
-				}
-				prev, seen := firstGiven[key]
-				if !seen {
-					firstGiven[key] = given{s.args[idx], in.ci.fn}
-					continue
-				}
-				if !differentValues(prev.v, s.args[idx]) {
-					continue
-				}
-				who := "constructors " + prev.fn.Name() + " and " + in.ci.fn.Name() + " get"
-				if prev.fn == in.ci.fn {
-					who = "constructor " + prev.fn.Name() + " gets"
-				}
-				c.issue(in.ci.decl.pkg.position(in.ci.decl.decl), "%s different %s values, but kong hands every hook the one value bound for its type; set %s by hand", who, types.TypeString(t, shortQual), c.finalName(f))
-				return true
+		for _, g := range argsOf(list) {
+			prev, seen := firstGiven[key]
+			if !seen {
+				firstGiven[key] = g
+				continue
 			}
+			if !differentValues(prev.v, g.v) {
+				continue
+			}
+			who := "constructors " + prev.fn.Name() + " and " + g.fn.Name() + " get"
+			if prev.fn == g.fn {
+				who = "constructor " + g.fn.Name() + " gets"
+			}
+			c.issue(list[0].ci.decl.pkg.position(list[0].ci.decl.decl), "%s different %s values, but kong hands every hook the one value bound for its type; set %s by hand", who, types.TypeString(t, shortQual), c.finalName(f))
+			return true
 		}
 		return false
+	}
+	// kong can't hand a nil interface to a hook.
+	// When every caller passes nil, the field is left alone, as it starts
+	// nil anyway.
+	nilInterface := func(f *types.Var, list []inj) bool {
+		t := list[0].param.Type()
+		if !types.IsInterface(t) {
+			return false
+		}
+		args := argsOf(list)
+		nils := 0
+		for _, g := range args {
+			if _, ok := g.v.(vNil); ok {
+				nils++
+			}
+		}
+		if nils > 0 && nils < len(args) {
+			c.issue(list[0].ci.decl.pkg.position(list[0].ci.decl.decl), "constructor %s is sometimes given a nil %s, which kong can't hand to a hook; set %s by hand", list[0].ci.fn.Name(), types.TypeString(t, shortQual), c.finalName(f))
+		}
+		return nils > 0
 	}
 	for _, f := range slices.SortedFunc(maps.Keys(injections), byPos) {
 		list := injections[f]
 		owner := c.nm.declaringType(f)
-		if owner == nil || c.main == nil && clashes(f, list) {
+		if owner == nil || nilInterface(f, list) || c.main == nil && clashes(f, list) {
 			continue
 		}
 		param := list[0].param
@@ -1368,8 +1408,23 @@ func (c *converter) convertConstructors() {
 			}
 			if lit, t, ok := sameConstant(argPkg, args); ok {
 				// A constant of a named type, as time.Second, keeps its type.
+				n := naturalType(argPkg, args[0])
 				if _, basic := t.(*types.Basic); t != nil && !basic {
 					lit = typeExpr(t, pkg, h.imports) + "(" + lit + ")"
+					n = t
+				}
+				// Code moved from the constructor may still read the
+				// parameter, as in prefix: strings.ToUpper(region), so it
+				// becomes a local holding the constant.
+				name, typ := paramName(param.Name()), typeExpr(param.Type(), pkg, h.imports)
+				if h.beforeParams[name] == typ {
+					delete(h.beforeParams, name)
+					decl := fmt.Sprintf("var %s %s = %s", name, typ, lit)
+					if n != nil && types.Identical(n, param.Type()) {
+						decl = fmt.Sprintf("%s := %s", name, lit)
+					}
+					h.before = append([]string{decl}, h.before...)
+					lit = name
 				}
 				h.before = append(h.before, fmt.Sprintf("%s.%s = %s", c.recvPlaceholder, c.finalName(f), lit))
 				continue

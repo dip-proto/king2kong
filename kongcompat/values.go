@@ -80,7 +80,8 @@ func checkValue(v *kong.Value, value string) error {
 //   - an existingfile or existingdir value is kept as given, not made
 //     absolute;
 //   - a noflag value is a boolean flag named no-x, which kingpin v3 set to
-//     false when it was given.
+//     false when it was given;
+//   - a boolarg value is a positional boolean, given as true or false.
 func Values() kong.Option {
 	return kong.OptionFunc(func(k *kong.Kong) error {
 		for _, opt := range []kong.Option{
@@ -90,6 +91,7 @@ func Values() kong.Option {
 			kong.NamedMapper("existingfile", existingPath(false)),
 			kong.NamedMapper("existingdir", existingPath(true)),
 			kong.NamedMapper("noflag", noFlag{}),
+			kong.NamedMapper("boolarg", kong.MapperFunc(boolArg)),
 		} {
 			if err := opt.Apply(k); err != nil {
 				return err
@@ -137,6 +139,21 @@ func valueTexts(ctx *kong.DecodeContext, sep rune, many bool) ([]string, error) 
 	return kong.SplitEscaped(fmt.Sprint(t.Value), sep), nil
 }
 
+// boolArg decodes a positional boolean, which takes a value, unlike a
+// boolean flag.
+func boolArg(ctx *kong.DecodeContext, target reflect.Value) error {
+	texts, err := valueTexts(ctx, -1, false)
+	if err != nil {
+		return err
+	}
+	b, err := strconv.ParseBool(texts[0])
+	if err != nil {
+		return err
+	}
+	target.SetBool(b)
+	return nil
+}
+
 func boolList(ctx *kong.DecodeContext, target reflect.Value) error {
 	texts, err := valueTexts(ctx, ctx.Value.Tag.Sep, true)
 	if err != nil {
@@ -182,10 +199,12 @@ func existingPath(dir bool) kong.MapperFunc {
 			return err
 		}
 		for _, s := range texts {
-			// kong also decodes the defaults of unselected commands, and
-			// of flags given on the command line, which kingpin never
-			// checked; Parse checks a default that is kept.
-			if ctx.Value.Active && (many || s != ctx.Value.Default) {
+			// kong also decodes the defaults of unselected commands,
+			// which kingpin never checked.
+			// Parse checks a single default that is kept, before the
+			// other errors as kingpin did, and hides the defaults of
+			// values given on the command line.
+			if ctx.Value.Active && (many || !ctx.Value.HasDefault || s != ctx.Value.Default) {
 				if err := checkPath(s, dir); err != nil {
 					return err
 				}

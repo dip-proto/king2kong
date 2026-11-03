@@ -604,7 +604,12 @@ func (p *Plan) tagFor(b *binding, fieldName string) *kongtag.Tag {
 	}
 	if len(c.enum) > 0 && !hookEnum {
 		vals := append([]string{}, c.enum...)
-		if !c.required && !c.hasDefault && !isSlice {
+		// kong checks an empty default against the enum like any value, so
+		// an optional enum gets an empty option at the end.
+		// kongcompat drops it again when checking what was given, and
+		// relies on it being there whenever the default may be empty.
+		emptyDefault := !c.hasDefault && c.defaultExpr == nil || c.hasDefault && len(c.defaults) == 1 && c.defaults[0] == ""
+		if !c.required && !isSlice && (emptyDefault || c.defaultExpr != nil && c.enum[len(c.enum)-1] == "") {
 			vals = append(vals, "")
 		}
 		t.Set("enum", kongtag.Interpolated(strings.Join(vals, ",")))
@@ -634,6 +639,8 @@ func (p *Plan) tagFor(b *binding, fieldName string) *kongtag.Tag {
 		t.Flag("negatable")
 	case "Bool":
 		switch {
+		case c.kind == kindArg:
+			t.Set("type", "boolarg")
 		case !p.g.prog.kingpinV3 && c.kind == kindFlag:
 			// kingpin v2 accepts --no-x for every boolean flag.
 			t.Flag("negatable")

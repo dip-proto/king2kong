@@ -210,9 +210,9 @@ func (c *converter) bindAtCall(p *Package, cur *dstutil.Cursor, s dst.Stmt) {
 // ifaceArg returns (*T)(nil) when t is an interface such as io.Writer, or nil.
 // kong binds a value by its dynamic type, so one a hook takes as an
 // interface has to be bound to that interface with BindTo.
-// It reports false for an unnamed interface tied to a package, through its
-// method types or unexported methods, which it does not write out.
-// from is the package the expression is written in.
+// It reports false for an interface it can't write in from, the package
+// the expression is written in: one unexported or generic, and an unnamed
+// one tied to a package through its method types or unexported methods.
 func ifaceArg(t types.Type, from string) (dst.Expr, bool) {
 	if !types.IsInterface(t) {
 		return nil, true
@@ -220,11 +220,10 @@ func ifaceArg(t types.Type, from string) (dst.Expr, bool) {
 	var typ dst.Expr
 	switch t := types.Unalias(t).(type) {
 	case *types.Named:
-		id := dst.NewIdent(t.Obj().Name())
-		if pkg := t.Obj().Pkg(); pkg != nil && pkg.Path() != from {
-			id.Path = pkg.Path()
+		var ok bool
+		if typ, ok = typeAt(t, from); !ok {
+			return nil, false
 		}
-		typ = id
 	case *types.Interface:
 		if t.Empty() {
 			typ = dst.NewIdent("any")
@@ -247,6 +246,87 @@ func ifaceArg(t types.Type, from string) (dst.Expr, bool) {
 		typ = dst.NewIdent(text)
 	}
 	return callOf(&dst.ParenExpr{X: &dst.StarExpr{X: typ}}, dst.NewIdent("nil")), true
+}
+
+// typeAt returns the expression of t as written in package from, if it can
+// be written there.
+func typeAt(t types.Type, from string) (dst.Expr, bool) {
+	switch t := types.Unalias(t).(type) {
+	case *types.Basic:
+		return dst.NewIdent(t.Name()), true
+	case *types.Named:
+		id := dst.NewIdent(t.Obj().Name())
+		if pkg := t.Obj().Pkg(); pkg != nil && pkg.Path() != from {
+			if !t.Obj().Exported() || !importable(pkg.Path(), from) {
+				return nil, false
+			}
+			id.Path = pkg.Path()
+		}
+		return id, t.TypeArgs().Len() == 0
+	case *types.Pointer:
+		elem, ok := typeAt(t.Elem(), from)
+		return &dst.StarExpr{X: elem}, ok
+	case *types.Slice:
+		elem, ok := typeAt(t.Elem(), from)
+		return &dst.ArrayType{Elt: elem}, ok
+	case *types.Map:
+		key, ok1 := typeAt(t.Key(), from)
+		elem, ok2 := typeAt(t.Elem(), from)
+		return &dst.MapType{Key: key, Value: elem}, ok1 && ok2
+	}
+	return nil, false
+}
+
+// asParam gives a constant or nil argument the type of the parameter it
+// was passed to, as time.Duration(5) for Define(app, 5).
+// Bound as it is, 5 would be an int and nil would have no type at all.
+// arg is the argument in the call, and bound the copy to bind.
+// It reports false when that type can't be written in p.
+func asParam(p *Package, arg, bound dst.Expr, t types.Type) (dst.Expr, bool) {
+	tv, ok := p.tv(arg)
+	if !ok || tv.Value == nil && !tv.IsNil() || types.IsInterface(t) {
+		return bound, true
+	}
+	if n := naturalType(p, arg); n != nil && types.Identical(n, t) {
+		return bound, true
+	}
+	typ, ok := typeAt(t, p.PkgPath)
+	if !ok {
+		return bound, false
+	}
+	if _, ptr := typ.(*dst.StarExpr); ptr {
+		typ = &dst.ParenExpr{X: typ}
+	}
+	return callOf(typ, bound), true
+}
+
+// naturalType returns the type a constant has on its own, as int for 5, or
+// nil when it is not a plain literal or named constant.
+func naturalType(p *Package, e dst.Expr) types.Type {
+	switch e := unparen(e).(type) {
+	case *dst.BasicLit:
+		kinds := map[token.Token]types.BasicKind{token.INT: types.Int, token.FLOAT: types.Float64, token.IMAG: types.Complex128, token.CHAR: types.Rune, token.STRING: types.String}
+		if k, ok := kinds[e.Kind]; ok {
+			return types.Typ[k]
+		}
+	case *dst.Ident:
+		if k, ok := p.objectOf(e).(*types.Const); ok {
+			return types.Default(k.Type())
+		}
+	}
+	return nil
+}
+
+// importable reports whether package from may import path, which is not
+// the case for an internal package outside its parent.
+func importable(path, from string) bool {
+	p := "/" + path + "/"
+	i := strings.LastIndex(p, "/internal/")
+	if i < 0 {
+		return true
+	}
+	root := strings.TrimPrefix(p[:i], "/")
+	return root == "" || from == root || strings.HasPrefix(from, root+"/")
 }
 
 // bindCalls returns the calls binding values, of types typs, for the hooks:
@@ -303,6 +383,7 @@ func stmtCall(s dst.Stmt) *dst.CallExpr {
 // Arguments that are not plain variables, such as &Config{} or getApp(),
 // are first moved into variables named after their parameters, so every
 // argument is still evaluated once and in its original order.
+// Constants and nil get the type of their parameter.
 func (c *converter) sharedArgs(p *Package, cur *dstutil.Cursor, s dst.Stmt, call *dst.CallExpr, app int, indexes []int, params *types.Tuple) (dst.Expr, []dst.Expr) {
 	last := app
 	for _, i := range indexes {
@@ -324,7 +405,12 @@ func (c *converter) sharedArgs(p *Package, cur *dstutil.Cursor, s dst.Stmt, call
 	}
 	var out []dst.Expr
 	for _, i := range indexes {
-		out = append(out, dst.Clone(call.Args[i]).(dst.Expr))
+		t := params.At(i).Type()
+		a, ok := asParam(p, call.Args[i], dst.Clone(call.Args[i]).(dst.Expr), t)
+		if !ok {
+			c.issue(p.position(call), "%s is bound for the hooks as %s, a type that can't be written here; bind it by hand", render(a), types.TypeString(t, shortQual))
+		}
+		out = append(out, a)
 	}
 	return dst.Clone(call.Args[app]).(dst.Expr), out
 }

@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"reflect"
 	"strconv"
 	"strings"
 	"unicode/utf8"
@@ -70,6 +71,7 @@ type checker struct {
 	argsOnly    bool
 	syntaxOnly  bool
 	sawHelp     bool
+	valueErr    error
 	// helpArgs are the arguments given to the help command.
 	helpArgs []string
 	// noRequired skips the checks for missing flags and arguments, as
@@ -169,12 +171,27 @@ func (s *checker) next() token {
 	return token{tokArg, arg}
 }
 
+// run reads the command line and checks it the way kingpin's Parse did:
+// the defaults of what was not given first, then the syntax, then the
+// values given, and last what is missing.
 func (s *checker) run() error {
+	if err := s.scan(); err != nil {
+		if derr := s.checkDefaults(); derr != nil {
+			return derr
+		}
+		return err
+	}
+	return s.finish()
+}
+
+// scan reads the command line up to its end or to a syntax error.
+// Errors in the values given wait in valueErr.
+func (s *checker) scan() error {
 	for {
 		t := s.next()
 		switch t.kind {
 		case tokEOL:
-			return s.finish()
+			return nil
 		case tokLong, tokShort:
 			if err := s.flag(t); err != nil {
 				return err
@@ -193,13 +210,9 @@ func (s *checker) run() error {
 					s.nextArg++
 				}
 				if !s.syntaxOnly {
-					if err := checkValue(arg, t.value); err != nil {
-						return err
-					}
+					s.badValue(checkValue(arg, t.value))
 				}
-				if err := s.checkEnum(arg, t.value); err != nil {
-					return err
-				}
+				s.badValue(s.checkEnum(arg, t.value))
 				continue
 			}
 			if cmd := s.command(t.value); cmd != nil {
@@ -258,7 +271,7 @@ func (s *checker) flag(t token) error {
 		}
 	}
 	if !s.syntaxOnly && s.seen[flag] && !cumulative(flag.Value) && !isCompletionFlag(flag.Name) {
-		return fmt.Errorf("flag '%s' cannot be repeated", flag.Name)
+		s.badValue(fmt.Errorf("flag '%s' cannot be repeated", flag.Name))
 	}
 	s.seen[flag] = true
 	s.given[flag.Value] = true
@@ -282,11 +295,18 @@ func (s *checker) flag(t token) error {
 	value := v.value
 	element.Value = &value
 	if !s.syntaxOnly {
-		if err := checkValue(flag.Value, v.value); err != nil {
-			return err
-		}
+		s.badValue(checkValue(flag.Value, v.value))
 	}
-	return s.checkEnum(flag.Value, v.value)
+	s.badValue(s.checkEnum(flag.Value, v.value))
+	return nil
+}
+
+// badValue records the first error in a value given, which kingpin only
+// reported once the whole command line was read.
+func (s *checker) badValue(err error) {
+	if s.valueErr == nil {
+		s.valueErr = err
+	}
 }
 
 // enterDefault moves into the default command and pushes t back to try it
@@ -329,18 +349,18 @@ func (s *checker) checkEnum(v *kong.Value, value string) error {
 		return nil
 	}
 	options := v.EnumSlice()
-	var shown []string
+	// The conversion adds an empty option at the end of an optional enum
+	// whose default is empty, since kong checks the default like any value.
+	// kingpin rejected an empty value it did not list.
+	if n := len(options); n > 0 && options[n-1] == "" && !v.Required && v.Default == "" && v.Target.Kind() != reflect.Slice {
+		options = options[:n-1]
+	}
 	for _, o := range options {
-		// An empty option only lets an optional enum be left out.
-		// kingpin rejected an explicit empty value.
-		if o == value && o != "" {
+		if o == value {
 			return nil
 		}
-		if o != "" {
-			shown = append(shown, o)
-		}
 	}
-	return fmt.Errorf("enum value must be one of %s, got '%s'", strings.Join(shown, ","), value)
+	return fmt.Errorf("enum value must be one of %s, got '%s'", strings.Join(options, ","), value)
 }
 
 func (s *checker) command(name string) *kong.Node {
@@ -370,22 +390,21 @@ func hasCommands(n *kong.Node) bool {
 }
 
 // finish runs the checks kingpin did after reading all arguments, in the
-// same order: missing subcommand, missing required values, missing command.
+// same order: bad defaults, bad values, missing subcommand, missing
+// required values, missing command.
 func (s *checker) finish() error {
 	// After --help, kingpin did not enter default commands.
 	for s.node.DefaultCmd != nil && !s.sawHelp {
 		s.enterCommand(s.node.DefaultCmd)
 	}
-	if s.syntaxOnly || s.noRequired {
+	if s.syntaxOnly {
 		return nil
 	}
-	// kingpin applied the defaults first, unless --help was given.
-	if !s.sawHelp {
-		for _, v := range s.unset() {
-			if err := checkDefault(v); err != nil {
-				return err
-			}
-		}
+	if err := s.checkDefaults(); err != nil {
+		return err
+	}
+	if s.valueErr != nil || s.noRequired {
+		return s.valueErr
 	}
 	commands := hasCommands(s.node)
 	if commands && len(s.path) > 1 {
@@ -396,6 +415,20 @@ func (s *checker) finish() error {
 	}
 	if commands {
 		return ErrCommandNotSpecified
+	}
+	return nil
+}
+
+// checkDefaults checks the defaults kingpin applied to what was not given,
+// before anything else, unless --help was given.
+func (s *checker) checkDefaults() error {
+	if s.syntaxOnly || s.sawHelp {
+		return nil
+	}
+	for _, v := range s.unset() {
+		if err := checkDefault(v); err != nil {
+			return err
+		}
 	}
 	return nil
 }
