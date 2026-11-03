@@ -987,15 +987,15 @@ func (%[1]s *%[2]s) Decode(ctx *kong.DecodeContext) error {
 				imports["strings"] = "strings"
 				given = `!strings.HasPrefix(ctx.Value.Name, "no-")`
 			}
-			doc, valueless := "The flag takes no value, but --flag=false is still understood.", "ctx.Scan.Peek().Type != kong.FlagValueToken"
+			doc := "the flag value lands in %[3]s.\n// The flag takes no value, but --flag=false is still understood."
+			valueless := "ctx.Scan.Peek().Type != kong.FlagValueToken"
 			if c.wrapsArgument(w) {
-				doc = "A flag takes no value, but --flag=false is still understood, and an\n// argument is true or false."
+				doc = "the value lands in %[3]s.\n// A flag takes no value, but --flag=false is still understood, and an\n// argument is true or false."
 				valueless = "ctx.Value.Flag != nil && " + valueless
 			}
-			body = fmt.Sprintf(`// Decode implements kong.MapperValue, so the value lands in %[3]s.
-// %[6]s%[4]s
+			body = fmt.Sprintf(`// Decode implements kong.MapperValue, so `+doc+`%[4]s
 func (%[1]s *%[2]s) Decode(ctx *kong.DecodeContext) error {
-	if %[7]s {
+	if %[6]s {
 		%[1]s.%[3]s = %[5]s
 		return nil
 	}
@@ -1015,7 +1015,7 @@ func (%[1]s *%[2]s) Decode(ctx *kong.DecodeContext) error {
 // IsBool tells kong the flag does not take a value.
 func (%[1]s *%[2]s) IsBool() bool {
 	return true
-}`, recv, t, v, negatedNote(given != "true"), given, doc, valueless)
+}`, recv, t, v, negatedNote(given != "true"), given, valueless)
 		case u.Info()&types.IsNumeric != 0:
 			imports["strconv"] = "strconv"
 			body = numericDecode(recv, t, v, u, typeExpr(w.value.Type(), w.named.Obj().Pkg(), imports))
