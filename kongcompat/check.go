@@ -154,7 +154,7 @@ func (s *checker) next() token {
 		r, size := utf8.DecodeRuneInString(arg[1:])
 		short := string(r)
 		flag, ok := s.short[short]
-		if ok && !flag.IsBool() {
+		if ok && !valueless(flag) {
 			// A short flag with its value attached: -fVALUE.
 			if len(arg) > 1+size {
 				s.pushed = append(s.pushed, token{tokArg, arg[1+size:]})
@@ -268,7 +268,7 @@ func (s *checker) flag(t token) error {
 	fc := &FlagClause{flag}
 	element := &ParseElement{Clause: fc, OneOf: OneOfClause{Flag: fc}}
 	s.elements = append(s.elements, element)
-	if flag.IsBool() {
+	if valueless(flag) {
 		// kingpin recorded the boolean the flag set, false for --no-x and
 		// noflag flags.
 		value := strconv.FormatBool(!negated && flag.Tag.Type != "noflag")
@@ -442,4 +442,10 @@ func FullCommand(ctx *kong.Context) string {
 		return ""
 	}
 	return fullCommand(ctx.Selected())
+}
+
+// valueless reports whether a flag takes no value: a boolean, or a counter,
+// which kingpin read like one.
+func valueless(f *kong.Flag) bool {
+	return f.IsBool() || f.IsCounter()
 }

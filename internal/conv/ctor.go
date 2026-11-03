@@ -34,6 +34,9 @@ type ctorItem struct {
 	kind  ctorKind
 	stmt  dst.Stmt
 	field *types.Var // for initializations
+	// path are the fields from the command variable to field, as Settings
+	// then Retries in d.Settings.Retries.
+	path  []*types.Var
 	param *types.Var // the parameter stored, for injections and cross-refs
 	expr  dst.Expr
 	text  string
@@ -115,12 +118,16 @@ func (p *Plan) classifyStmt(ci *ctorInfo, s dst.Stmt) []ctorItem {
 			}
 		}
 		if s.Tok == token.ASSIGN && len(s.Lhs) == 1 && len(s.Rhs) == 1 {
-			if f := p.instanceField(ci, s.Lhs[0]); f != nil {
+			if f, path := p.instanceField(ci, s.Lhs[0]); f != nil {
 				if touched && p.g.prog.isKingpinType(pkg.typeOf(s.Rhs[0])) {
 					return []ctorItem{{kind: ctorRegistration, stmt: s}}
 				}
 				item := p.classifyInit(ci, f, s.Rhs[0])
-				item.stmt = s
+				item.stmt, item.path = s, path
+				if len(path) > 1 && item.kind != ctorResidue && item.kind != ctorCrossRef {
+					// Only plain values are moved to a nested field.
+					item.kind = ctorResidue
+				}
 				return []ctorItem{item}
 			}
 		}
@@ -154,28 +161,27 @@ func (p *Plan) isInstanceType(o types.Object, inst *types.Named) bool {
 }
 
 // instanceField returns the field e writes when e selects a field, possibly
-// promoted, of the constructor's command variable.
-func (p *Plan) instanceField(ci *ctorInfo, e dst.Expr) *types.Var {
-	sel, ok := e.(*dst.SelectorExpr)
-	if !ok {
-		return nil
-	}
-	root := dst.Expr(sel)
+// promoted, of the constructor's command variable, and the fields leading to
+// it from that variable.
+func (p *Plan) instanceField(ci *ctorInfo, e dst.Expr) (*types.Var, []*types.Var) {
+	var path []*types.Var
+	root := e
 	for {
 		s, ok := root.(*dst.SelectorExpr)
 		if !ok {
 			break
 		}
+		f, _ := ci.decl.pkg.objectOf(s).(*types.Var)
+		if f == nil || !f.IsField() {
+			return nil, nil
+		}
+		path = append([]*types.Var{f}, path...)
 		root = s.X
 	}
-	if ci.local == nil || ci.decl.pkg.objectOf(root) != ci.local {
-		return nil
+	if len(path) == 0 || ci.local == nil || ci.decl.pkg.objectOf(root) != ci.local {
+		return nil, nil
 	}
-	f, _ := ci.decl.pkg.objectOf(sel).(*types.Var)
-	if f == nil || !f.IsField() {
-		return nil
-	}
-	return f
+	return path[len(path)-1], path
 }
 
 // literalInits classifies the fields set by the composite literal that

@@ -2,6 +2,7 @@ package conv
 
 import (
 	"bytes"
+	"cmp"
 	"fmt"
 	"go/ast"
 	"go/constant"
@@ -10,7 +11,9 @@ import (
 	"go/token"
 	"go/types"
 	"io/fs"
+	"maps"
 	"os"
+	pathpkg "path"
 	"path/filepath"
 	"slices"
 	"sort"
@@ -2089,6 +2092,26 @@ func sharedImportNames(p *Package, f *dst.File) map[string]string {
 			name = ""
 		}
 		out[path] = name
+	}
+	// An import the conversion adds, such as kong, must not be hidden by a
+	// local of the same name.
+	added := map[string]bool{}
+	dst.Inspect(f, func(n dst.Node) bool {
+		if id, ok := n.(*dst.Ident); ok && id.Path != "" && id.Path != p.PkgPath && names[id.Path] == nil {
+			added[id.Path] = true
+		}
+		return true
+	})
+	for _, path := range slices.Sorted(maps.Keys(added)) {
+		own := cmp.Or(knownPackageNames[path], p.names[path], pathpkg.Base(path))
+		taken := func(n string) bool {
+			return declared[n] || chosen[n] || slices.ContainsFunc(slices.Collect(maps.Values(names)), func(ns []string) bool { return slices.Contains(ns, n) })
+		}
+		if taken(own) {
+			name := firstFree(taken, own)
+			chosen[name] = true
+			out[path] = name
+		}
 	}
 	return out
 }

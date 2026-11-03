@@ -271,6 +271,12 @@ func HelpShortFlag(short rune) kong.Option {
 // Application.Usage did.
 // It stops the program if kingpin could not have read the command line.
 func PrintUsage(k *kong.Kong, args []string, uc *UsageContext) {
+	if version == 2 {
+		// kingpin v2 read @file arguments here too.
+		expanded, err := ExpandArgs(args)
+		k.FatalIfErrorf(err)
+		args = expanded
+	}
 	s, err := scan(k, args, true)
 	k.FatalIfErrorf(err)
 	k.FatalIfErrorf(usageAt(k.Stdout, k, s.path, uc))

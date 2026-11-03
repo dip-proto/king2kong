@@ -5,6 +5,7 @@ import (
 	"go/scanner"
 	"go/token"
 	"go/types"
+	"maps"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -82,6 +83,26 @@ func (c *converter) convertTree() {
 			names[n] = c.freeName(root, unexported(c.prog.identFromName(strings.ReplaceAll(n.cl.fullName(), " ", "-")))+"Command")
 		}
 	}
+	rootTaken := map[string]bool{"Help": true}
+	for _, ch := range t.Root.children {
+		rootTaken[ch.field] = true
+	}
+	// The struct holding the app's flags is embedded under its type name,
+	// so no flag field may use that name, and no command should.
+	commands := maps.Clone(rootTaken)
+	for _, b := range c.appFlagBindings() {
+		if b.holder == nil {
+			continue
+		}
+		if named, ok := b.holder.typ.(*types.Named); ok {
+			name := named.Obj().Name()
+			if commands[name] {
+				c.issue(b.cl.pos, "the CLI embeds %s, which holds the application's flags, and a command uses the same field name; rename one of them by hand", name)
+				break
+			}
+			rootTaken[name] = true
+		}
+	}
 	var pkgFlagLines []string
 	if c.main != nil {
 		groups := c.collectPkgFlags()
@@ -91,20 +112,7 @@ func (c *converter) convertTree() {
 				c.pkgFlagsOf[pf.b.cl] = true
 			}
 		}
-		pkgFlagLines = c.convertPkgFlags(groups, imports)
-	}
-	rootTaken := map[string]bool{"Help": true}
-	for _, ch := range t.Root.children {
-		rootTaken[ch.field] = true
-	}
-	// The struct holding the app's flags is embedded under its type name,
-	// so no flag field may use that name.
-	for _, b := range c.appFlagBindings() {
-		if b.holder != nil {
-			if named, ok := b.holder.typ.(*types.Named); ok {
-				rootTaken[named.Obj().Name()] = true
-			}
-		}
+		pkgFlagLines = c.convertPkgFlags(groups, imports, rootTaken)
 	}
 	rootStorage := c.storageFields(t.Root, root.Types, imports, c.cliVar, rootTaken)
 	if c.main != nil {
@@ -560,6 +568,11 @@ func (c *converter) conditionalOptions(root *Package, cliName string, imports ma
 	for _, n := range c.tree.nodes {
 		if n.parent != nil && n.parent.parent != nil && len(n.cl.conds) > len(n.parent.cl.conds) {
 			c.issue(n.cl.pos, "command %q is registered under a condition, which is only supported for top-level commands", n.cl.fullName())
+		}
+	}
+	for _, b := range c.plan.bindings {
+		if b.cmd.kind == kindCommand && len(b.cl.conds) > len(b.cmd.conds) {
+			c.issue(b.cl.pos, "%s %q of command %q is registered under a condition, which is only supported for the application's own flags and top-level commands; kong always accepts it", b.cl.kind, b.cl.name, b.cmd.fullName())
 		}
 	}
 	if len(order) == 0 {

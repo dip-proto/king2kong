@@ -135,7 +135,9 @@ func (c *converter) pointIntoFlags(p *Package, pf pkgFlag, field dst.Expr) {
 
 // convertPkgFlags writes each package's flags struct, points its variables
 // into it, and returns the CLI lines embedding the structs.
-func (c *converter) convertPkgFlags(groups map[*Package]*pkgFlags, imports map[string]string) []string {
+// rootTaken are the names of the CLI's fields, which the embedded structs
+// must not use.
+func (c *converter) convertPkgFlags(groups map[*Package]*pkgFlags, imports map[string]string, rootTaken map[string]bool) []string {
 	var list []*pkgFlags
 	for _, g := range groups {
 		list = append(list, g)
@@ -150,6 +152,10 @@ func (c *converter) convertPkgFlags(groups map[*Package]*pkgFlags, imports map[s
 			base = c.prog.exported(g.pkg.Name) + "Flags"
 		}
 		g.typeName = c.freeName(g.pkg, base)
+		for rootTaken[g.typeName] {
+			g.typeName = c.freeName(g.pkg, g.typeName+"Values")
+		}
+		rootTaken[g.typeName] = true
 		g.varName = c.freeName(g.pkg, "Flag", "FlagValues")
 		pkgImports := map[string]string{}
 		var fields []string

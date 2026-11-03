@@ -77,6 +77,8 @@ type interp struct {
 	// inInit is true during that setup.
 	initCalled map[*types.Func]bool
 	inInit     bool
+	// loops counts the loops being unrolled.
+	loops int
 	// globalWrites is the last value stored in each package-level variable.
 	// Unlike globals, it keeps any kind of value, such as what a flag's
 	// variable starts with.
@@ -108,6 +110,8 @@ type frame struct {
 	conds []cond
 	ret   []value
 	done  bool
+	// jump is the break or continue leaving the current loop iteration.
+	jump token.Token
 }
 
 func newInterp(prog *Program) *interp {
@@ -384,7 +388,7 @@ func (in *interp) opaque(t types.Type, site string) value {
 
 func (in *interp) block(fr *frame, stmts []dst.Stmt) {
 	for _, s := range stmts {
-		if fr.done {
+		if fr.done || fr.jump != 0 {
 			return
 		}
 		in.stmt(fr, s)
@@ -404,6 +408,13 @@ func (in *interp) stmt(fr *frame, s dst.Stmt) {
 		in.stmtVals[s] = in.multi(fr, s.X)
 	case *dst.AssignStmt:
 		in.assign(fr, s)
+	case *dst.IncDecStmt:
+		op := token.ADD
+		if s.Tok == token.DEC {
+			op = token.SUB
+		}
+		one := vConst{constant.MakeInt64(1), types.Typ[types.UntypedInt]}
+		in.store(fr, s.X, numericOp(in.eval(fr, s.X), op, one))
 	case *dst.DeclStmt:
 		in.declStmt(fr, s)
 	case *dst.IfStmt:
@@ -424,6 +435,11 @@ func (in *interp) stmt(fr *frame, s dst.Stmt) {
 		fr.done = true
 	case *dst.RangeStmt:
 		in.rangeStmt(fr, s)
+	case *dst.BranchStmt:
+		// break and continue of a loop the interpreter unrolls.
+		if s.Label == nil && in.loops > 0 && (s.Tok == token.BREAK || s.Tok == token.CONTINUE) {
+			fr.jump = s.Tok
+		}
 	case *dst.ForStmt, *dst.SwitchStmt, *dst.TypeSwitchStmt, *dst.SelectStmt, *dst.GoStmt, *dst.DeferStmt:
 		if in.mentionsBuilder(fr.pkg, s) {
 			in.escapes = append(in.escapes, escape{pos: fr.pkg.position(s), what: "kingpin registration inside a loop, switch, defer or goroutine, which the tool does not follow", report: true})
@@ -518,9 +534,13 @@ func (in *interp) assign(fr *frame, s *dst.AssignStmt) {
 	}
 	in.stmtVals[s] = vals
 	if s.Tok != token.ASSIGN && s.Tok != token.DEFINE {
-		// Compound assignment: the result is not tracked.
+		// x += y and the like: only a single numeric constant is followed.
+		v := value(vUnknown{})
+		if len(s.Lhs) == 1 && len(vals) == 1 {
+			v = numericOp(in.eval(fr, s.Lhs[0]), compoundOps[s.Tok], vals[0])
+		}
 		for _, l := range s.Lhs {
-			in.store(fr, l, vUnknown{})
+			in.store(fr, l, v)
 		}
 		return
 	}
@@ -663,6 +683,14 @@ func (in *interp) ifStmt(fr *frame, s *dst.IfStmt) {
 		return
 	}
 	if !in.mentionsBuilder(fr.pkg, s.Body) && (s.Else == nil || !in.mentionsBuilder(fr.pkg, s.Else)) {
+		// Whichever branch runs, what it writes is no longer known.
+		in.forgetWrites(fr, s.Body)
+		if s.Else != nil {
+			in.forgetWrites(fr, s.Else)
+		}
+		if in.loops > 0 && leavesLoop(s) {
+			in.escapes = append(in.escapes, escape{pos: fr.pkg.position(s), what: "kingpin registration in a loop that skips some values under a condition the tool cannot resolve", report: true})
+		}
 		return
 	}
 	saved := fr.conds
@@ -675,6 +703,51 @@ func (in *interp) ifStmt(fr *frame, s *dst.IfStmt) {
 		fr.done = false
 	}
 	fr.conds = saved
+}
+
+// forgetWrites drops what the interpreter knows of the variables n assigns,
+// for code it does not follow.
+func (in *interp) forgetWrites(fr *frame, n dst.Node) {
+	forget := func(l dst.Expr) {
+		v, ok := fr.pkg.objectOf(unparen(l)).(*types.Var)
+		if !ok || v.IsField() || v.Pkg() == nil {
+			return
+		}
+		if v.Parent() == v.Pkg().Scope() {
+			in.globalWrites[v] = vUnknown{}
+			return
+		}
+		fr.vars[v] = vUnknown{}
+		in.varVals[v] = vUnknown{}
+	}
+	dst.Inspect(n, func(n dst.Node) bool {
+		switch n := n.(type) {
+		case *dst.FuncLit:
+			return false
+		case *dst.AssignStmt:
+			for _, l := range n.Lhs {
+				forget(l)
+			}
+		case *dst.IncDecStmt:
+			forget(n.X)
+		}
+		return true
+	})
+}
+
+// leavesLoop reports whether s has a break or continue of the loop around it.
+func leavesLoop(s dst.Stmt) bool {
+	found := false
+	dst.Inspect(s, func(n dst.Node) bool {
+		switch n := n.(type) {
+		case *dst.FuncLit, *dst.ForStmt, *dst.RangeStmt, *dst.SwitchStmt, *dst.TypeSwitchStmt, *dst.SelectStmt:
+			return false
+		case *dst.BranchStmt:
+			found = found || n.Label == nil && (n.Tok == token.BREAK || n.Tok == token.CONTINUE)
+		}
+		return !found
+	})
+	return found
 }
 
 func (in *interp) rangeStmt(fr *frame, s *dst.RangeStmt) {
@@ -697,8 +770,12 @@ func (in *interp) rangeStmt(fr *frame, s *dst.RangeStmt) {
 				fr.vars[o] = e
 			}
 		}
+		in.loops++
 		in.block(fr, s.Body.List)
-		if fr.done {
+		in.loops--
+		jump := fr.jump
+		fr.jump = 0
+		if fr.done || jump == token.BREAK {
 			return
 		}
 	}
@@ -1056,6 +1133,32 @@ func convertConst(v value, t types.Type) value {
 		return vConst{c.c, t}
 	}
 	return vUnknown{}
+}
+
+// compoundOps maps x op= y to its operator.
+var compoundOps = map[token.Token]token.Token{
+	token.ADD_ASSIGN: token.ADD, token.SUB_ASSIGN: token.SUB, token.MUL_ASSIGN: token.MUL,
+	token.QUO_ASSIGN: token.QUO, token.REM_ASSIGN: token.REM,
+}
+
+// numericOp applies op to two numeric constants as Go would for x's type, or
+// returns unknown.
+func numericOp(x value, op token.Token, y value) (v value) {
+	xc, ok1 := x.(vConst)
+	yc, ok2 := y.(vConst)
+	if !ok1 || !ok2 || op == token.ILLEGAL || xc.c == nil || yc.c == nil || !isNumeric(xc.c) || !isNumeric(yc.c) {
+		return vUnknown{}
+	}
+	if op == token.QUO && isInteger(xc.t) {
+		op = token.QUO_ASSIGN
+	}
+	// Division by zero panics in go/constant.
+	defer func() {
+		if recover() != nil {
+			v = vUnknown{}
+		}
+	}()
+	return fitType(constant.BinaryOp(xc.c, op, yc.c), xc.t)
 }
 
 // fitType returns v the way a variable of type t would hold it.
@@ -1491,12 +1594,19 @@ func foldCall(fn *types.Func, args []value, packed bool) (value, bool) {
 			}
 			format, rest = f, args[1:]
 		}
-		if len(rest) == 1 {
+		// args... spreads a slice; a plain slice is a single value.
+		if len(rest) == 1 && packed {
 			if s, ok := rest[0].(vSlice); ok {
 				rest = s.elems
 			}
 		}
 		for _, a := range rest {
+			// A named type such as time.Duration prints its own way.
+			if c, ok := a.(vConst); ok {
+				if _, basic := c.t.(*types.Basic); !basic && c.t != nil {
+					return nil, false
+				}
+			}
 			g, ok := goValue(a)
 			if !ok {
 				return nil, false

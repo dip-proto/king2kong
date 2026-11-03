@@ -2,6 +2,7 @@ package conv
 
 import (
 	"fmt"
+	"go/constant"
 	"go/token"
 	"go/types"
 	"io/fs"
@@ -708,7 +709,11 @@ func (c *converter) convertEnumChecks() {
 	}
 	done := map[checkKey]bool{}
 	for _, b := range c.plan.bindings {
-		if !b.enumInHook() || b.inst == nil {
+		if !b.enumInHook() {
+			continue
+		}
+		if b.inst == nil {
+			c.issue(b.cl.pos, "flag %q: its enum values are only known at run time, which the tool checks in a command's hook, and it has none; check the value by hand", b.cl.name)
 			continue
 		}
 		host, rest := c.host(b)
@@ -1204,6 +1209,19 @@ func (c *converter) convertConstructors() {
 		ci := c.ctors[fn]
 		ok := true
 		deletable, _ := c.deletableStmts(ci.decl.pkg, ci.decl.decl.Body)
+		// The hook sets injected fields after the other ones, so a field
+		// set both ways would end with the wrong value.
+		set := map[*types.Var]ctorKind{}
+		for _, it := range ci.items {
+			if it.field == nil || it.kind != ctorInjection && it.kind != ctorResidue {
+				continue
+			}
+			if k, seen := set[it.field]; seen && k != it.kind {
+				c.issue(ci.decl.pkg.position(ci.decl.decl), "constructor %s sets %s both from a parameter and otherwise, which the hook cannot keep in order", fn.Name(), it.field.Name())
+				ok = false
+			}
+			set[it.field] = it.kind
+		}
 		for i, it := range ci.items {
 			if it.kind == ctorResidue && it.stmt != nil && it.field == nil && deletable[it.stmt] {
 				// Registration through a local clause, such as
@@ -1280,9 +1298,19 @@ func (c *converter) convertConstructors() {
 				h.before = append(h.before, fmt.Sprintf("%s.%s = %s", c.recvPlaceholder, c.finalName(f), lit))
 				continue
 			}
-			if v, ok := sameVariable(argPkg, args); ok && c.visibleAtParser(v) {
-				c.main.binds = append(c.main.binds, dst.NewIdent(v.Name()))
-			} else {
+			v, ok := sameVariable(argPkg, args)
+			// kong hands a hook the one value bound for its type.
+			i := slices.IndexFunc(c.main.bound, func(b *types.Var) bool { return ok && b != v && types.Identical(b.Type(), v.Type()) })
+			switch {
+			case ok && i >= 0:
+				c.issue(list[0].ci.decl.pkg.position(list[0].ci.decl.decl), "constructor %s stores %s, while another one stores %s of the same type, which kong cannot tell apart; set %s by hand", list[0].ci.fn.Name(), v.Name(), c.main.bound[i].Name(), c.finalName(f))
+				continue
+			case ok && c.visibleAtParser(v):
+				if !slices.Contains(c.main.bound, v) {
+					c.main.binds = append(c.main.binds, dst.NewIdent(v.Name()))
+					c.main.bound = append(c.main.bound, v)
+				}
+			default:
 				c.issue(list[0].ci.decl.pkg.position(list[0].ci.decl.decl), "constructor %s stores its %s parameter, which no single constant or variable visible where the parser is built provides; set %s by hand", list[0].ci.fn.Name(), param.Name(), c.finalName(f))
 				continue
 			}
@@ -1324,7 +1352,12 @@ func sameConstant(p *Package, args []dst.Expr) (string, bool) {
 		if !ok || tv.Value == nil {
 			return "", false
 		}
+		// The hook may live in another package, which can't see a named
+		// constant of the caller, so only literals are copied as written.
 		s := renderExact(a)
+		if _, lit := unparen(a).(*dst.BasicLit); !lit {
+			s = constLiteral(tv.Value)
+		}
 		if i == 0 {
 			first = s
 		} else if s != first {
@@ -1332,6 +1365,21 @@ func sameConstant(p *Package, args []dst.Expr) (string, bool) {
 		}
 	}
 	return first, true
+}
+
+// constLiteral writes a constant value as Go source.
+func constLiteral(v constant.Value) string {
+	switch v.Kind() {
+	case constant.String:
+		return strconv.Quote(constant.StringVal(v))
+	case constant.Float:
+		if n := constant.ToInt(v); n.Kind() == constant.Int {
+			return n.ExactString()
+		}
+		f, _ := constant.Float64Val(v)
+		return strconv.FormatFloat(f, 'g', -1, 64)
+	}
+	return v.ExactString()
 }
 
 // sameVariable returns the variable all args name, if they name one.
@@ -1414,7 +1462,7 @@ func (c *converter) residueHook(ci *ctorInfo, it ctorItem) bool {
 			return false
 		}
 		tname := typeExpr(target, pkg, h.imports)
-		field := c.recvPlaceholder + "." + c.finalName(it.field)
+		field := c.recvPlaceholder + "." + c.itemPath(it)
 		h.before = append(h.before, fmt.Sprintf("%s = &%s{}", field, tname))
 		for _, ti := range tctor.items {
 			switch ti.kind {
@@ -1516,8 +1564,22 @@ func (c *converter) residueHook(ci *ctorInfo, it ctorItem) bool {
 	for _, id := range renamed {
 		id.Name = name
 	}
-	h.before = append(h.before, fmt.Sprintf("%s.%s = %s", c.recvPlaceholder, c.finalName(it.field), expr))
+	h.before = append(h.before, fmt.Sprintf("%s.%s = %s", c.recvPlaceholder, c.itemPath(it), expr))
 	return true
+}
+
+// itemPath is the field a constructor item sets, from the command, as the
+// conversion names it: Settings.Retries for d.Settings.Retries.
+func (c *converter) itemPath(it ctorItem) string {
+	path := it.path
+	if len(path) == 0 {
+		path = []*types.Var{it.field}
+	}
+	var names []string
+	for _, f := range path {
+		names = append(names, c.finalName(f))
+	}
+	return strings.Join(names, ".")
 }
 
 // redocKeptCtor rewrites the doc comment of a constructor kept for tests

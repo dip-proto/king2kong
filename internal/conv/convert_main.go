@@ -51,7 +51,9 @@ type mainProgram struct {
 	// package-level application that became kong options.
 	packageSettings map[*dst.CallExpr]bool
 	// binds go to kong.Bind, for hooks that now do what constructors did.
+	// bound are the variables they name.
 	binds []dst.Expr
+	bound []*types.Var
 	// structSpecs declare the package-level command structs the CLI
 	// replaces, and cliSpec is the one whose place a package-level cli takes
 	// when it starts with their values.
