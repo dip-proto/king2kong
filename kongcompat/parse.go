@@ -123,6 +123,8 @@ func Parse(k *kong.Kong, args []string, uc *UsageContext) (string, error) {
 		// kingpin's help command ignored default commands.
 		// With no command named, it showed the application's usage, and it
 		// failed on an unknown command.
+		// When the program turned exiting off, as the Fastly CLI does,
+		// kingpin went on to show the usage of what it recognized.
 		var targetPath []*kong.Node
 		if len(target) > 0 {
 			s := newChecker(target, true)
@@ -131,7 +133,6 @@ func Parse(k *kong.Kong, args []string, uc *UsageContext) (string, error) {
 			if err := s.run(); err != nil {
 				fmt.Fprintf(k.Stderr, "%s: error: %s\n", k.Model.Name, err)
 				k.Exit(1)
-				return "", err
 			}
 			targetPath = s.path
 		}

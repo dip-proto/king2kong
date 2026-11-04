@@ -20,6 +20,10 @@ import (
 type interp struct {
 	prog *Program
 
+	// globalRefs caches the package-level variables a function, and those
+	// it calls, refer to.
+	globalRefs map[*types.Func][]*types.Var
+
 	clauses []*clause
 	objects []*object
 	sites   []*callSite
@@ -487,6 +491,92 @@ func decidingExpr(s dst.Stmt) dst.Expr {
 	return dst.NewIdent("a return in the statement before")
 }
 
+// forgetReachable forgets the package-level state code the interpreter
+// does not follow may change: what it names, and what the functions of the
+// program it calls or hands over name.
+// Structs built in place keep their identity, so flags can still write to
+// them, and initializers that may register flags are not run again.
+func (in *interp) forgetReachable(p *Package, n dst.Node) {
+	forget := func(v *types.Var) {
+		if init, ok := in.prog.varInit[v]; in.structVars[v] || ok && builtInPlace(init.pkg, init.expr) {
+			switch val := in.packageVar(v).(type) {
+			case vPtr:
+				if val.o.st != nil {
+					in.forgetFields(val.o, false, map[*object]bool{})
+				}
+			case vObj:
+				if val.o.st != nil {
+					in.forgetFields(val.o, false, map[*object]bool{})
+				}
+			}
+			return
+		}
+		switch typeUnder(v.Type()).(type) {
+		case *types.Basic, *types.Slice, *types.Map, *types.Array:
+			in.globalWrites[v] = vUnknown{}
+		}
+	}
+	dst.Inspect(n, func(n dst.Node) bool {
+		id, ok := n.(*dst.Ident)
+		if !ok {
+			return true
+		}
+		switch o := p.objectOf(id).(type) {
+		case *types.Var:
+			if o.Pkg() != nil && o.Parent() == o.Pkg().Scope() {
+				forget(o)
+			}
+		case *types.Func:
+			for _, v := range in.globalsUsed(o) {
+				forget(v)
+			}
+		}
+		return true
+	})
+}
+
+// globalsUsed returns the package-level variables fn and the functions of
+// the program it calls or refers to name.
+func (in *interp) globalsUsed(fn *types.Func) []*types.Var {
+	if out, ok := in.globalRefs[fn]; ok {
+		return out
+	}
+	if in.globalRefs == nil {
+		in.globalRefs = map[*types.Func][]*types.Var{}
+	}
+	var out []*types.Var
+	seenVar := map[*types.Var]bool{}
+	seen := map[*types.Func]bool{}
+	var visit func(f *types.Func)
+	visit = func(f *types.Func) {
+		fd, ok := in.prog.funcs[f]
+		if seen[f] || !ok || fd.decl.Body == nil {
+			return
+		}
+		seen[f] = true
+		dst.Inspect(fd.decl.Body, func(n dst.Node) bool {
+			id, ok := n.(*dst.Ident)
+			if !ok {
+				return true
+			}
+			switch o := fd.pkg.objectOf(id).(type) {
+			case *types.Var:
+				if o.Pkg() != nil && o.Parent() == o.Pkg().Scope() && !seenVar[o] {
+					seenVar[o] = true
+					out = append(out, o)
+				}
+			case *types.Func:
+				// Called, or handed over, as in once.Do(loadConfig).
+				visit(o)
+			}
+			return true
+		})
+	}
+	visit(fn)
+	in.globalRefs[fn] = out
+	return out
+}
+
 // countReturns counts the return statements of n, outside the function
 // literals it declares.
 func countReturns(n dst.Node) int {
@@ -560,9 +650,9 @@ func (in *interp) stmt(fr *frame, s dst.Stmt) {
 		if in.mentionsBuilder(fr.pkg, s) {
 			in.escapes = append(in.escapes, escape{pos: fr.pkg.position(s), what: "kingpin registration inside a loop, switch, defer or goroutine, which the tool does not follow", report: true})
 		}
-		in.forgetWrites(fr, s)
 		// We don't step into it, but if it parses, the values flag
-		// variables start with are the ones they hold now.
+		// variables start with are the ones they hold now, before what
+		// it may change is forgotten.
 		parses := false
 		dst.Inspect(s, func(n dst.Node) bool {
 			if c, ok := n.(*dst.CallExpr); ok && calleeName(c) == "Parse" && in.isKingpinCall(fr.pkg, c) {
@@ -573,6 +663,7 @@ func (in *interp) stmt(fr *frame, s dst.Stmt) {
 		if parses {
 			in.takePriors()
 		}
+		in.forgetWrites(fr, s)
 	case *dst.LabeledStmt:
 		in.stmt(fr, s.Stmt)
 	}
@@ -1199,6 +1290,7 @@ func equalValues(a, b value) (equal, known bool) {
 // forgetWrites drops what the interpreter knows of the variables n assigns,
 // for code it does not follow.
 func (in *interp) forgetWrites(fr *frame, n dst.Node) {
+	in.forgetReachable(fr.pkg, n)
 	forget := func(l dst.Expr) {
 		in.markChanged(fr, l)
 		// *cfg = Config{...}: every field of what cfg points to.
@@ -1268,6 +1360,48 @@ func (in *interp) forgetWrites(fr *frame, n dst.Node) {
 	})
 }
 
+// forgetFields forgets what the fields of o, and of the structs it holds,
+// were set to, keeping the structs themselves.
+// A foreign function may also replace the pointers it reaches.
+func (in *interp) forgetFields(o *object, foreign bool, seen map[*object]bool) {
+	if seen[o] {
+		return
+	}
+	seen[o] = true
+	// A missing field reads as its zero value, so it is marked unknown.
+	for i := range o.st.NumFields() {
+		f := o.st.Field(i)
+		switch v := o.fields[f].(type) {
+		case nil, vConst, vSlice, vNil:
+			switch typeUnder(f.Type()).(type) {
+			case *types.Basic, *types.Slice:
+				o.fields[f] = vUnknown{}
+			case *types.Pointer, *types.Map, *types.Interface:
+				// A loader may fill an optional section, as
+				// json.Unmarshal does for TLS *TLSConfig.
+				o.fields[f] = vUnknown{}
+			case *types.Struct:
+				if v == nil {
+					sub := in.newObject(f.Type(), false, o.site+"."+f.Name())
+					sub.parent, sub.pfield = o, f
+					o.fields[f] = vObj{sub}
+				}
+			}
+		case vObj:
+			if v.o.st != nil {
+				in.forgetFields(v.o, foreign, seen)
+			}
+		case vPtr:
+			if v.o.st != nil {
+				in.forgetFields(v.o, foreign, seen)
+			}
+			if foreign {
+				o.fields[f] = vUnknown{}
+			}
+		}
+	}
+}
+
 // forgetPointed drops what the interpreter knows of the plain values a call
 // it does not follow could change: variables passed by address, as in
 // withPrefix(&spec), and the data fields of structs passed by pointer.
@@ -1281,45 +1415,7 @@ func (in *interp) forgetPointed(fr *frame, c *dst.CallExpr, recv value, args []v
 	callee := in.staticCallee(fr.pkg, c)
 	foreign := callee == nil || !in.prog.owns(callee.Pkg())
 	seen := map[*object]bool{}
-	var forgetFields func(o *object)
-	forgetFields = func(o *object) {
-		if seen[o] {
-			return
-		}
-		seen[o] = true
-		// A missing field reads as its zero value, so it is marked unknown.
-		for i := range o.st.NumFields() {
-			f := o.st.Field(i)
-			switch v := o.fields[f].(type) {
-			case nil, vConst, vSlice, vNil:
-				switch typeUnder(f.Type()).(type) {
-				case *types.Basic, *types.Slice:
-					o.fields[f] = vUnknown{}
-				case *types.Pointer, *types.Map, *types.Interface:
-					// A loader may fill an optional section, as
-					// json.Unmarshal does for TLS *TLSConfig.
-					o.fields[f] = vUnknown{}
-				case *types.Struct:
-					if v == nil {
-						sub := in.newObject(f.Type(), false, o.site+"."+f.Name())
-						sub.parent, sub.pfield = o, f
-						o.fields[f] = vObj{sub}
-					}
-				}
-			case vObj:
-				if v.o.st != nil {
-					forgetFields(v.o)
-				}
-			case vPtr:
-				if v.o.st != nil {
-					forgetFields(v.o)
-				}
-				if foreign {
-					o.fields[f] = vUnknown{}
-				}
-			}
-		}
-	}
+	forgetFields := func(o *object) { in.forgetFields(o, foreign, seen) }
 	forgetObject := func(v value) {
 		if vp, ok := v.(vVarPtr); ok {
 			// A pointer saved in a variable, as in
@@ -1456,8 +1552,13 @@ func leavesLoop(s dst.Stmt) bool {
 
 func (in *interp) rangeStmt(fr *frame, s *dst.RangeStmt) {
 	if !in.mentionsBuilder(fr.pkg, s.Body) {
-		// Not followed, so what it writes is no longer known.
+		// Not followed, so what it writes is no longer known, and what
+		// follows a return in it depends on something the tool doesn't
+		// follow either.
 		in.forgetWrites(fr, s.Body)
+		if countReturns(s.Body) > 0 {
+			fr.conds = append(append([]cond{}, fr.conds...), cond{expr: s.X, fn: fr.fn, pkg: fr.pkg, opaque: true})
+		}
 		return
 	}
 	sl, ok := in.eval(fr, s.X).(vSlice)
@@ -2097,6 +2198,10 @@ func (in *interp) call(fr *frame, c *dst.CallExpr) []value {
 	}
 	in.noteEscape(fr, c, args)
 	in.forgetPointed(fr, c, recv, args)
+	// A helper not followed may still change the package-level state it
+	// reaches, as loadConfig setting config.ReadOnly, directly, through
+	// an alias, through json.Unmarshal or as a callback.
+	in.forgetReachable(fr.pkg, c)
 	n := 1
 	if sig, ok := fn.Type().(*types.Signature); ok && sig.Results().Len() > 1 {
 		n = sig.Results().Len()
