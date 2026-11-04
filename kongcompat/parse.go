@@ -235,6 +235,17 @@ func dashAsEmpty(args []string) []string {
 	return out
 }
 
+// Given reports whether the flag named name was given on the command line,
+// rather than taking its default or an environment variable.
+func Given(ctx *kong.Context, name string) bool {
+	for _, p := range ctx.Path {
+		if p.Flag != nil && p.Flag.Name == name && !p.Resolved {
+			return true
+		}
+	}
+	return false
+}
+
 // fillMaps gives each map[string]string flag left nil an empty map, as
 // kingpin's StringMap allocated one even when the flag was absent.
 // Custom map values stay nil, as kingpin left them.

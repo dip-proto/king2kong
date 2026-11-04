@@ -9,6 +9,7 @@ import (
 	"io/fs"
 	"maps"
 	"path/filepath"
+	"regexp"
 	"slices"
 	"sort"
 	"strconv"
@@ -217,6 +218,9 @@ type hookSet struct {
 	beforeParams map[string]string // parameter name -> type source
 	after        []string
 	checks       []string
+	// checksGiven is set when a check asks kong's context whether a flag
+	// was given.
+	checksGiven bool
 	// actions are calls of former kingpin Actions, run last in AfterApply.
 	actions []string
 	imports map[string]string
@@ -915,6 +919,14 @@ func (c *converter) convertEnumChecks() {
 		guard := ""
 		if !b.cl.required {
 			guard = val + ` != "" && `
+			// kingpin checked an empty value too when it was given, as in
+			// --role=.
+			if b.cl.kind == kindFlag && c.compatPath != "" {
+				h.checksGiven = true
+				h.imports["github.com/alecthomas/kong"] = "kong"
+				name := importName(h.imports, c.compatPath, "kongcompat")
+				guard = "(" + val + ` != "" || ` + name + ".Given(ctx, " + strconv.Quote(b.cl.name) + ")) && "
+			}
 		}
 		h.checks = append(h.checks, "if "+guard+"!slices.Contains("+list+", "+val+") {\nreturn "+errorf(val)+"\n}")
 	}
@@ -973,7 +985,34 @@ func (c *converter) rename(f *types.Var, name string) {
 	c.ed.renameField(f, name)
 	c.renames[f] = name
 	c.res.Stats.Renamed++
+	if !f.Exported() {
+		c.unprivateHeading(f)
+	}
 }
+
+// unprivateHeading drops "private" from a heading such as
+// "// Serve private fields" over a group whose field is now exported.
+func (c *converter) unprivateHeading(f *types.Var) {
+	loc, ok := c.ed.fields[f]
+	if !ok {
+		return
+	}
+	list := loc.st.Fields.List
+	for j := slices.Index(list, loc.field); j >= 0; j-- {
+		if j == 0 || list[j].Decs.Before == dst.EmptyLine {
+			start := list[j].Decs.Start
+			for i, l := range start {
+				if r := privateFields.ReplaceAllString(l, "$2"); r != l {
+					start[i] = r
+					c.ed.touch(loc.pkg, loc.file)
+				}
+			}
+			return
+		}
+	}
+}
+
+var privateFields = regexp.MustCompile(`(?i)\b(private|unexported) (fields?)\b`)
 
 // addShadow adds a tagged field to host and the statement copying it to the
 // real destination.

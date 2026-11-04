@@ -730,7 +730,10 @@ func (c *converter) localInit(cd cond, v *types.Var) dst.Expr {
 	if !ok || len(call.Args) != 0 {
 		return nil
 	}
-	if id, ok := call.Fun.(*dst.Ident); !ok || id.Path == "" {
+	// A function of the program too, as check in
+	// if err := check(); err != nil { return err }, which renderCond only
+	// keeps when the option's package can call it.
+	if _, ok := call.Fun.(*dst.Ident); !ok {
 		return nil
 	}
 	return init
@@ -873,7 +876,11 @@ func (c *converter) writeHooks() {
 		}
 		if len(h.after) > 0 || len(h.checks) > 0 || len(h.actions) > 0 {
 			src.WriteString(afterDoc(len(h.checks) > 0, len(h.after) > 0, len(h.actions) > 0))
-			fmt.Fprintf(&src, "func (%s *%s) AfterApply() error {\n", recv, recvType(t))
+			param := ""
+			if h.checksGiven {
+				param = "ctx *kong.Context"
+			}
+			fmt.Fprintf(&src, "func (%s *%s) AfterApply(%s) error {\n", recv, recvType(t), param)
 			for _, s := range h.checks {
 				src.WriteString(withReceiver(s, recv) + "\n")
 			}
