@@ -4,12 +4,10 @@ import (
 	"bytes"
 	"fmt"
 	"go/ast"
-	"go/constant"
 	"go/token"
 	"go/types"
 	"os"
 	"path/filepath"
-	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -153,9 +151,6 @@ func (c *converter) convertTests(renames map[*types.Var]string) error {
 type testConversion struct {
 	c *converter
 	p *Package
-	// drop holds the test's registrations of grammar the converted program
-	// already declares.
-	drop map[dst.Stmt]bool
 	// clauseFields are the fields that held kingpin clauses, pureCtors the
 	// kept constructors that only build their command, and used the
 	// variables the conversion made the test use.
@@ -173,7 +168,6 @@ type testConversion struct {
 func (t *testConversion) convert(f *dst.File, name string) (string, error) {
 	c, p := t.c, t.p
 	exports := c.compatExports()
-	t.drop = map[dst.Stmt]bool{}
 	t.used = map[types.Object]bool{}
 	dstutil.Apply(f, func(cur *dstutil.Cursor) bool {
 		switch n := cur.Node().(type) {
@@ -228,13 +222,6 @@ func (t *testConversion) convert(f *dst.File, name string) (string, error) {
 					}
 				}
 			}
-		}
-		return true
-	}, nil)
-	dstutil.Apply(f, func(cur *dstutil.Cursor) bool {
-		if s, ok := cur.Node().(dst.Stmt); ok && t.drop[s] {
-			cur.Delete()
-			return false
 		}
 		return true
 	}, nil)
@@ -309,12 +296,10 @@ func (t *testConversion) followPrunedAssign(cur *dstutil.Cursor, as *dst.AssignS
 func (t *testConversion) newApplication(f *dst.File, call *dst.CallExpr) dst.Expr {
 	c := t.c
 	cli := &dst.CompositeLit{Type: &dst.Ident{Name: c.cliName, Path: c.tree.RootPkg.PkgPath}}
+	t.reportOwnFlags(f, call)
 	if c.rootFlags != nil {
 		obj := c.rootFlags.Obj()
-		holder := t.ownRootFlags(f, call)
-		if holder == nil {
-			holder = callOf(dst.NewIdent("new"), &dst.Ident{Name: obj.Name(), Path: obj.Pkg().Path()})
-		}
+		holder := callOf(dst.NewIdent("new"), &dst.Ident{Name: obj.Name(), Path: obj.Pkg().Path()})
 		cli.Elts = append(cli.Elts, &dst.KeyValueExpr{Key: dst.NewIdent(obj.Name()), Value: holder})
 	}
 	args := append([]dst.Expr{&dst.UnaryExpr{Op: token.AND, X: cli}}, call.Args...)
@@ -381,12 +366,11 @@ func (p *Package) astIdent(id *dst.Ident) *ast.Ident {
 	return a
 }
 
-// ownRootFlags finds the application flags a test registers itself on the
-// application call builds, such as
-// app.Flag("debug", "Debug").BoolVar(&flags.Debug).
-// Those registrations are dropped, and a pointer to the struct holding the
-// flags is returned for the CLI to use.
-func (t *testConversion) ownRootFlags(f *dst.File, call *dst.CallExpr) dst.Expr {
+// reportOwnFlags reports a test registering flags on the application call
+// builds, such as app.Flag("debug", "Debug").BoolVar(&flags.Debug).
+// The converted grammar declares the program's flags already, and a test
+// setting up its own is rare enough to be ported by hand.
+func (t *testConversion) reportOwnFlags(f *dst.File, call *dst.CallExpr) {
 	p := t.p
 	var app types.Object
 	dst.Inspect(f, func(n dst.Node) bool {
@@ -396,125 +380,21 @@ func (t *testConversion) ownRootFlags(f *dst.File, call *dst.CallExpr) dst.Expr 
 		return app == nil
 	})
 	if app == nil {
-		return nil
+		return
 	}
-	flags := map[string]*clause{}
-	for _, fl := range t.c.tree.Root.cl.flags() {
-		flags[fl.name] = fl
-	}
-	want := types.TypeString(t.c.rootFlags, nil)
-	var holder dst.Expr
-	var stmts []dst.Stmt
-	ok := true
 	dst.Inspect(f, func(n dst.Node) bool {
-		s, isExpr := n.(*dst.ExprStmt)
-		if !isExpr || !ok {
-			return ok
-		}
-		outer, isCall := s.X.(*dst.CallExpr)
-		if !isCall {
+		s, ok := n.(*dst.ExprStmt)
+		if !ok {
 			return true
 		}
-		base, flagName := chainBase(outer)
-		if base == nil || p.objectOf(base) != app || flagName == "" {
-			return true
+		if outer, ok := s.X.(*dst.CallExpr); ok {
+			if base, name := chainBase(outer); base != nil && p.objectOf(base) == app && name != "" {
+				t.c.issue(p.position(s), "the test registers flag %q on its own application, which the converted grammar declares already; port this test by hand", name)
+				app = nil
+			}
 		}
-		if flags[flagName] == nil || len(outer.Args) != 1 {
-			ok = false
-			return false
-		}
-		if !sameSettings(p, outer, flags[flagName]) {
-			t.c.issue(p.position(s), "the test registers flag %q with other settings than the program, which the converted grammar has; port this test by hand", flagName)
-			ok = false
-			return false
-		}
-		u, isAddr := outer.Args[0].(*dst.UnaryExpr)
-		if !isAddr {
-			ok = false
-			return false
-		}
-		sel, isSel := u.X.(*dst.SelectorExpr)
-		if !isSel || types.TypeString(deref(p.typeOf(sel.X)), nil) != want {
-			ok = false
-			return false
-		}
-		if holder != nil && renderExact(holder) != renderExact(sel.X) {
-			ok = false
-			return false
-		}
-		holder = sel.X
-		stmts = append(stmts, s)
-		return true
+		return app != nil
 	})
-	if !ok || holder == nil {
-		return nil
-	}
-	root := holder
-	for {
-		if sel, isSel := root.(*dst.SelectorExpr); isSel {
-			root = sel.X
-			continue
-		}
-		break
-	}
-	if id, isIdent := root.(*dst.Ident); isIdent {
-		if v := p.objectOf(id); v != nil && p.astOf(call) != nil && v.Pos() > p.astOf(call).Pos() {
-			t.c.issue(p.position(call), "the test declares %s after creating the application, where the converted grammar needs it; declare it first", id.Name)
-			return nil
-		}
-	}
-	for _, s := range stmts {
-		t.drop[s] = true
-	}
-	if _, ptr := p.typeOf(holder).Underlying().(*types.Pointer); ptr {
-		return dst.Clone(holder).(dst.Expr)
-	}
-	return &dst.UnaryExpr{Op: token.AND, X: dst.Clone(holder).(dst.Expr)}
-}
-
-// sameSettings reports whether a test's registration chain, such as
-// app.Flag("debug", "...").Short('d').BoolVar(&x), gives the flag the
-// default, environment variable, short form and requirement the program
-// gave cl.
-func sameSettings(p *Package, call *dst.CallExpr, cl *clause) bool {
-	var defaults []string
-	var envar string
-	var short rune
-	required := false
-	for e := dst.Expr(call); ; {
-		x, isCall := e.(*dst.CallExpr)
-		if !isCall {
-			break
-		}
-		sel, isSel := x.Fun.(*dst.SelectorExpr)
-		if !isSel {
-			break
-		}
-		var args []string
-		for _, a := range x.Args {
-			if tv, ok := p.tv(a); ok && tv.Value != nil && tv.Value.Kind() == constant.String {
-				args = append(args, constant.StringVal(tv.Value))
-			}
-		}
-		switch sel.Sel.Name {
-		case "Default":
-			defaults = append(args, defaults...)
-		case "Envar":
-			if len(args) == 1 {
-				envar = args[0]
-			}
-		case "Short":
-			if tv, ok := p.tv(x.Args[0]); ok && tv.Value != nil {
-				if r, exact := constant.Int64Val(tv.Value); exact {
-					short = rune(r)
-				}
-			}
-		case "Required":
-			required = true
-		}
-		e = sel.X
-	}
-	return slices.Equal(defaults, cl.defaults) && envar == cl.envar && short == cl.short && required == cl.required
 }
 
 // chainBase returns the variable a builder chain such as

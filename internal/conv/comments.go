@@ -341,12 +341,26 @@ func addNote(loc fieldLoc, comments []string) {
 func addHeading(loc fieldLoc, comments []string, members, added map[*dst.Field]bool, original []string) {
 	// A heading left after the last field, with no field under it, is
 	// the one moving here.
+	f := loc.field
+	has := func(lines []string) bool {
+		return !slices.ContainsFunc(comments, func(l string) bool {
+			return !slices.ContainsFunc(lines, func(m string) bool { return sameComment(l, m) })
+		})
+	}
 	if last, i := trailing(loc.st); i >= 0 && slices.Equal(trimNewlines(last.Decs.End[i:]), comments) {
 		last.Decs.End = last.Decs.End[:i]
-	} else if !slices.ContainsFunc(comments, func(l string) bool { return !slices.Contains(original, l) }) {
-		return
+	} else if has(original) {
+		// The struct's own fields are under that heading already.
+		// A field added for the same flags joins the group right before it
+		// when that group has the heading, and repeats it elsewhere.
+		if !added[f] {
+			return
+		}
+		if has(headingBefore(loc.st, f)) {
+			f.Decs.Before = dst.NewLine
+			return
+		}
 	}
-	f := loc.field
 	if len(f.Decs.Start) > 0 {
 		comments = append(slices.Clone(comments), "\n")
 	}
@@ -357,6 +371,12 @@ func addHeading(loc fieldLoc, comments []string, members, added map[*dst.Field]b
 		f.Decs.Before = dst.EmptyLine
 	}
 	for _, g := range list[i+1:] {
+		if start := g.Decs.Start; members[g] && g.Decs.Before == dst.EmptyLine && startsWith(start, comments) {
+			// The same heading further down, over more of these flags,
+			// merges with this one.
+			g.Decs.Start, g.Decs.Before = trimNewlines(start[len(comments):]), dst.NewLine
+			continue
+		}
 		if !members[g] {
 			// The struct's own layout stays, but a field added
 			// for another flag is set apart.
@@ -372,6 +392,40 @@ func addHeading(loc fieldLoc, comments []string, members, added map[*dst.Field]b
 		}
 	}
 	onOwnLine(f)
+}
+
+// sameComment reports whether two comment lines say the same, as
+// "// Optional." and "// Optional".
+func sameComment(a, b string) bool {
+	norm := func(s string) string {
+		return strings.ToLower(strings.TrimRight(strings.TrimSpace(strings.TrimPrefix(s, "//")), ".:"))
+	}
+	return norm(a) == norm(b)
+}
+
+// startsWith reports whether comments start with the lines of heading.
+func startsWith(comments, heading []string) bool {
+	if len(comments) < len(heading) {
+		return false
+	}
+	for i, l := range heading {
+		if !sameComment(comments[i], l) {
+			return false
+		}
+	}
+	return true
+}
+
+// headingBefore returns the comments above the group of fields that ends
+// right before f, or holds it.
+func headingBefore(st *dst.StructType, f *dst.Field) []string {
+	list := st.Fields.List
+	for j := slices.Index(list, f) - 1; j >= 0; j-- {
+		if j == 0 || list[j].Decs.Before == dst.EmptyLine {
+			return list[j].Decs.Start
+		}
+	}
+	return nil
 }
 
 // onOwnLine makes sure a field with comments is not on the line of the

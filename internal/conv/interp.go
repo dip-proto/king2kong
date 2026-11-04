@@ -434,11 +434,32 @@ func (in *interp) block(fr *frame, stmts []dst.Stmt) {
 			if e, ok := g.Else.(*dst.BlockStmt); ok {
 				other = endsInReturn(e)
 			}
-			if body != other {
+			switch {
+			case body != other:
 				fr.conds = append(append([]cond{}, fr.conds...), cond{expr: g.Cond, neg: body, fn: fr.fn, pkg: fr.pkg})
+			case !body && (returnsInside(g.Body) || g.Else != nil && returnsInside(g.Else)):
+				// A return deeper inside, as in if a { if b { return } },
+				// leaves a condition the tool doesn't follow.
+				fr.conds = append(append([]cond{}, fr.conds...), cond{expr: g.Cond, fn: fr.fn, pkg: fr.pkg, opaque: true})
 			}
 		}
 	}
+}
+
+// returnsInside reports whether n holds a return statement, outside the
+// function literals it declares.
+func returnsInside(n dst.Node) bool {
+	found := false
+	dst.Inspect(n, func(n dst.Node) bool {
+		switch n.(type) {
+		case *dst.FuncLit:
+			return false
+		case *dst.ReturnStmt:
+			found = true
+		}
+		return !found
+	})
+	return found
 }
 
 func endsInReturn(b *dst.BlockStmt) bool {

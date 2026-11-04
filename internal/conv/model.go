@@ -199,6 +199,9 @@ type cond struct {
 	neg  bool
 	fn   *types.Func
 	pkg  *Package
+	// opaque is set when the registration only depends on expr in a way
+	// the tool doesn't follow, as after a return nested in its branches.
+	opaque bool
 }
 
 // callSite is a call that created kingpin clauses and returned a struct

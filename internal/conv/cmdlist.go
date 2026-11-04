@@ -122,6 +122,28 @@ func (c *converter) findCommandList(p *Package, f *dst.File, fd *dst.FuncDecl) {
 		return
 	}
 	local := c.freeLocalIn(fd, "cli", "kongCLI")
+	// A comment heading the statements that built some of the commands,
+	// as "// Aliases for deprecated commands", goes to the first of them in
+	// the list.
+	heads := map[dst.Stmt]dst.Stmt{}
+	for head, group := range c.groups {
+		for _, s := range group {
+			heads[s] = head
+		}
+	}
+	defs := map[types.Object]dst.Stmt{}
+	dst.Inspect(fd.Body, func(n dst.Node) bool {
+		if as, ok := n.(*dst.AssignStmt); ok && as.Tok == token.DEFINE {
+			for _, l := range as.Lhs {
+				if o := p.objectOf(l); o != nil {
+					defs[o] = as
+				}
+			}
+		}
+		return true
+	})
+	headed := map[*dst.UnaryExpr]dst.Stmt{}
+	used := map[dst.Stmt]bool{}
 	rewritten := map[*dst.CompositeLit][]dst.Expr{}
 	for _, lit := range lits {
 		var elts []dst.Expr
@@ -136,6 +158,9 @@ func (c *converter) findCommandList(p *Package, f *dst.File, fd *dst.FuncDecl) {
 			}
 			elt := &dst.UnaryExpr{Op: token.AND, X: pathExpr(local + path)}
 			elt.Decs.NodeDecs = *e.Decorations()
+			if h := heads[defs[p.objectOf(e)]]; h != nil && !used[h] {
+				headed[elt], used[h] = h, true
+			}
 			elts = append(elts, elt)
 		}
 		rewritten[lit] = elts
@@ -143,6 +168,18 @@ func (c *converter) findCommandList(p *Package, f *dst.File, fd *dst.FuncDecl) {
 	locals := c.usedCommandLocals(p, fd, lits)
 	for lit, elts := range rewritten {
 		lit.Elts = elts
+		for i, e := range elts {
+			h, ok := headed[e.(*dst.UnaryExpr)]
+			if !ok || len(trimNewlines(h.Decorations().Start)) == 0 {
+				continue
+			}
+			comments := trimNewlines(h.Decorations().Start)
+			e.Decorations().Start = append(slices.Clone(comments), e.Decorations().Start...)
+			if i > 0 {
+				e.Decorations().Before = dst.EmptyLine
+			}
+			h.Decorations().Start = nil
+		}
 	}
 	stmts = append(stmts, pointLocals(locals, local)...)
 	for _, s := range stmts {

@@ -622,6 +622,9 @@ func quoteAll(s []string) []string {
 // The generated option cannot see locals, so a local set from a side-effect
 // free call is replaced by the call.
 func (c *converter) renderCond(cd cond, imports map[string]string) (string, bool) {
+	if cd.opaque {
+		return "", false
+	}
 	e := dst.Clone(cd.expr).(dst.Expr)
 	ok := true
 	e = dstutil.Apply(e, func(cur *dstutil.Cursor) bool {
