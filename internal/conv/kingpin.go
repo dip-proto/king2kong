@@ -379,7 +379,10 @@ func (in *interp) kingpinMethod(fr *frame, c *dst.CallExpr, cl *clause, name str
 					if !ok || strings.Contains(s, ",") {
 						// Not a constant, or one with a comma, which the
 						// hints tag would split: a Hints method returns it.
-						cl.hintExpr, cl.hintPkg, cl.hintAction = hintOptionsExpr(c), fr.pkg, false
+						cl.hintSources = append(cl.hintSources, hintSource{hintOptionsExpr(c), fr.pkg, false})
+						for _, a := range c.Args {
+							in.moved[a] = true
+						}
 						return self
 					}
 					hints = append(hints, s)
@@ -389,7 +392,8 @@ func (in *interp) kingpinMethod(fr *frame, c *dst.CallExpr, cl *clause, name str
 			return self
 		case "HintAction":
 			if len(c.Args) == 1 {
-				cl.hintExpr, cl.hintPkg, cl.hintAction = c.Args[0], fr.pkg, true
+				cl.hintSources = append(cl.hintSources, hintSource{c.Args[0], fr.pkg, true})
+				in.moved[c.Args[0]] = true
 			}
 			return self
 		case "Action", "PreAction":

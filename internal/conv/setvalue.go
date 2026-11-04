@@ -44,6 +44,10 @@ func (c *converter) convertCustomValues() {
 }
 
 func (c *converter) addSetDecode(t *types.Named, b *binding) {
+	if c.foreignDecode(t) {
+		c.issue(b.cl.pos, "%s %q: %s has a Decode method kong does not know, so kong cannot decode it; rename that method", b.cl.kind, b.cl.name, t.Obj().Name())
+		return
+	}
 	if c.hasMethod(t, "Decode") {
 		return
 	}
@@ -59,7 +63,11 @@ func (c *converter) addSetDecode(t *types.Named, b *binding) {
 	recv := c.methodRecv(t, strings.ToLower(t.Obj().Name()[:1]))
 	name := recvType(t)
 	var body string
-	if c.hasMethod(t, "IsBoolFlag") {
+	isBool, known := c.prog.boolFlag(t)
+	if !known {
+		c.issue(b.cl.pos, "%s %q: %s decides in IsBoolFlag whether it takes a value, which kong decides once for the type; check the flag by hand", b.cl.kind, b.cl.name, t.Obj().Name())
+	}
+	if isBool {
 		body = fmt.Sprintf(`// Decode implements kong.MapperValue with Set, which kingpin called with
 // "true" when the flag was given without a value.
 func (%[1]s *%[2]s) Decode(ctx *kong.DecodeContext) error {

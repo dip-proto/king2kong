@@ -14,8 +14,10 @@ package conv
 import (
 	"fmt"
 	"go/ast"
+	"go/parser"
 	"go/token"
 	"go/types"
+	"path/filepath"
 	"strconv"
 	"strings"
 
@@ -109,6 +111,9 @@ type Program struct {
 	byPath   map[string]*Package
 	funcs    map[*types.Func]funcDecl
 	unkeyed  map[*types.Named]bool
+	// testUnkeyed are the type names test files list fields of by
+	// position, by directory.
+	testUnkeyed map[string]map[string]bool
 	// written holds package-level variables that are assigned or have their
 	// address taken somewhere, so the rest can be treated as constants.
 	written map[*types.Var]bool
@@ -363,7 +368,91 @@ func (prog *Program) unkeyedLiterals(t *types.Named) bool {
 			}
 		}
 	}
-	return prog.unkeyed[t.Origin()]
+	return prog.unkeyed[t.Origin()] || prog.unkeyedInTests(t.Origin())
+}
+
+// unkeyedInTests reports whether the tests next to t's package build a t
+// listing its fields by position, as configCommand{"us-east-1"} does.
+// Tests are not loaded, so this only looks at the syntax, by type name.
+func (prog *Program) unkeyedInTests(t *types.Named) bool {
+	var p *Package
+	for _, q := range prog.Packages {
+		if q.Types == t.Obj().Pkg() {
+			p = q
+		}
+	}
+	if p == nil || len(p.Syntax) == 0 {
+		return false
+	}
+	dir := filepath.Dir(p.filename(p.Syntax[0]))
+	if prog.testUnkeyed == nil {
+		prog.testUnkeyed = map[string]map[string]bool{}
+	}
+	names, ok := prog.testUnkeyed[dir]
+	if !ok {
+		names = map[string]bool{}
+		prog.testUnkeyed[dir] = names
+		tests, _ := filepath.Glob(filepath.Join(dir, "*_test.go"))
+		for _, path := range tests {
+			f, err := parser.ParseFile(token.NewFileSet(), path, nil, 0)
+			if err != nil {
+				continue
+			}
+			// The literals in a table such as []T{{"a"}, {"b"}} leave
+			// their type out.
+			elided := map[*ast.CompositeLit]string{}
+			ast.Inspect(f, func(n ast.Node) bool {
+				cl, ok := n.(*ast.CompositeLit)
+				if !ok {
+					return true
+				}
+				var elem ast.Expr
+				switch typ := cl.Type.(type) {
+				case *ast.ArrayType:
+					elem = typ.Elt
+				case *ast.MapType:
+					elem = typ.Value
+				}
+				for _, e := range cl.Elts {
+					if kv, ok := e.(*ast.KeyValueExpr); ok {
+						e = kv.Value
+					}
+					if u, ok := e.(*ast.UnaryExpr); ok && u.Op == token.AND {
+						e = u.X
+					}
+					if inner, ok := e.(*ast.CompositeLit); ok && inner.Type == nil && elem != nil {
+						elided[inner] = typeName(elem)
+					}
+				}
+				if len(cl.Elts) == 0 {
+					return true
+				}
+				if _, keyed := cl.Elts[0].(*ast.KeyValueExpr); keyed {
+					return true
+				}
+				if name := typeName(cl.Type); name != "" {
+					names[name] = true
+				} else if name := elided[cl]; name != "" {
+					names[name] = true
+				}
+				return true
+			})
+		}
+	}
+	return names[t.Obj().Name()]
+}
+
+// typeName is the name of a type written as T, pkg.T or *T, or "".
+func typeName(e ast.Expr) string {
+	switch t := e.(type) {
+	case *ast.Ident:
+		return t.Name
+	case *ast.SelectorExpr:
+		return t.Sel.Name
+	case *ast.StarExpr:
+		return typeName(t.X)
+	}
+	return ""
 }
 
 // namedType returns the generic or plain named type behind aliases and

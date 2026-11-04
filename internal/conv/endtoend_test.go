@@ -313,6 +313,8 @@ func TestEndToEnd(t *testing.T) {
 			{"serve", "--max", "-1"},
 			{"serve", "--workers", "x"},
 			{"serve", "--ratio", "1e40"},
+			{"serve", "--limit", "1MB"},
+			{"serve", "--limit", "1kB"},
 			{"--help"},
 			{"help", "db"},
 		},

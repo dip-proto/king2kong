@@ -5,6 +5,7 @@ import (
 	"os"
 
 	"github.com/alecthomas/kong"
+	"github.com/alecthomas/units"
 	"github.com/fastly/kingpin"
 )
 
@@ -59,6 +60,11 @@ type optFloat32 struct {
 	Value float32
 }
 
+type optBytes struct {
+	marker
+	Value units.Base2Bytes
+}
+
 type serveCmd struct {
 	Port    int
 	Host    string
@@ -67,6 +73,7 @@ type serveCmd struct {
 	Retries optInt8
 	Max     optUint64
 	Ratio   optFloat32
+	Limit   optBytes
 }
 
 func (c *serveCmd) Run() error {
@@ -75,7 +82,7 @@ func (c *serveCmd) Run() error {
 		label = c.Label.Value
 	}
 	fmt.Printf("serve host=%s port=%d label=%s\n", c.Host, c.Port, label)
-	fmt.Println(c.Workers, c.Retries, c.Max, c.Ratio)
+	fmt.Println(c.Workers, c.Retries, c.Max, c.Ratio, c.Limit)
 	return nil
 }
 
@@ -109,6 +116,7 @@ func main() {
 	serveClause.Flag("retries", "Retries").Action(serve.Retries.Set).Int8Var(&serve.Retries.Value)
 	serveClause.Flag("max", "Maximum").Action(serve.Max.Set).Uint64Var(&serve.Max.Value)
 	serveClause.Flag("ratio", "Ratio").Action(serve.Ratio.Set).Float32Var(&serve.Ratio.Value)
+	serveClause.Flag("limit", "Size limit").Action(serve.Limit.Set).BytesVar(&serve.Limit.Value)
 
 	db := app.Command("db", "Database commands")
 	var dbMigrate dbMigrateCmd

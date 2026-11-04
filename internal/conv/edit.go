@@ -264,6 +264,9 @@ func tagPairs(tag string) [][2]string {
 }
 
 func tagLiteral(tag string) string {
+	if tag == "" {
+		return ""
+	}
 	if strings.ContainsRune(tag, '`') {
 		return strconv.Quote(tag)
 	}

@@ -116,6 +116,13 @@ func (c *converter) convertAction(n *node, fn vFunc, elsewhere bool) string {
 	fd.decl.Type.Params.List = nil
 	c.ed.touch(fd.pkg, fd.file)
 	c.keep[fn.fn] = true
+	// Other calls, as a test's c.run(nil), lose their argument too.
+	pruned := c.pruned[fn.fn]
+	if pruned.params == nil {
+		pruned.params = map[int]bool{}
+	}
+	pruned.params[0] = true
+	c.pruned[fn.fn] = pruned
 	return call
 }
 

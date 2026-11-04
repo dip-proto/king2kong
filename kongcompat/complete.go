@@ -40,6 +40,7 @@ func Complete(k *kong.Kong, args []string) []string {
 		_ = ctx.Reset()
 		_, _ = ctx.Apply()
 		restore()
+		fillMaps(k)
 		node = ctx.Selected()
 		if node == nil {
 			node = k.Model.Node
@@ -197,8 +198,8 @@ func enumOptions(v *kong.Value) []string {
 
 func cmdCompletion(n *kong.Node, ctx *kong.Context, args []string, elements ParseElements) []string {
 	var options []string
-	// The arguments given count, unless empty, as the word being
-	// completed is, or the last one, which takes more values.
+	// Count the arguments given, except the empty word being completed
+	// and an argument that takes more values.
 	satisfied := 0
 	for _, el := range elements {
 		ac, ok := el.Clause.(*ArgClause)

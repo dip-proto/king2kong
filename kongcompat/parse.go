@@ -50,7 +50,11 @@ func Parse(k *kong.Kong, args []string, uc *UsageContext) (string, error) {
 			if a == "--help-man" {
 				tmpl = pick(v2LegacyManPageTemplate, v2ManPageTemplate, v2ManPageTemplate)
 			}
-			s, _ := scan(k, without(args, a), true)
+			// A syntax error still comes first, values are not checked.
+			s, err := scan(k, without(args, a), true)
+			if err != nil {
+				return "", err
+			}
 			if err := usageAt(alwaysStdout(k), k, s.path, &UsageContext{Template: tmpl}); err != nil {
 				return "", err
 			}
@@ -151,7 +155,7 @@ func Parse(k *kong.Kong, args []string, uc *UsageContext) (string, error) {
 	// values, so readLikeKingpin never looks them up.
 	keep := keepUnselected(k, path)
 	restore := readLikeKingpin(k, scanned.given)
-	kctx, err := k.Parse(args)
+	kctx, err := k.Parse(dashAsEmpty(args))
 	restore()
 	keep()
 	if err != nil {
@@ -212,12 +216,31 @@ func keepUnselected(k *kong.Kong, path []*kong.Node) (restore func()) {
 	}
 }
 
-// fillMaps gives each map flag left nil an empty map, as kingpin's
-// StringMap allocated one even when the flag was absent.
+// dashAsEmpty replaces each lone "-" before "--" with an empty value, as
+// kingpin read it.
+func dashAsEmpty(args []string) []string {
+	out := args
+	for i, a := range args {
+		if a == "--" {
+			break
+		}
+		if a == "-" {
+			if &out[0] == &args[0] {
+				out = append([]string(nil), args...)
+			}
+			out[i] = ""
+		}
+	}
+	return out
+}
+
+// fillMaps gives each map[string]string flag left nil an empty map, as
+// kingpin's StringMap allocated one even when the flag was absent.
+// Custom map values stay nil, as kingpin left them.
 // Values runs it after kong resets the values and before the actions.
 func fillMaps(k *kong.Kong) {
 	values(k.Model.Node, func(v *kong.Value) {
-		if t := v.Target; t.IsValid() && t.Kind() == reflect.Map && t.IsNil() && t.CanSet() {
+		if t := v.Target; t.IsValid() && t.Type() == reflect.TypeOf(map[string]string{}) && t.IsNil() && t.CanSet() {
 			t.Set(reflect.MakeMap(t.Type()))
 		}
 	})

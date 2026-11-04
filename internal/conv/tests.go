@@ -29,12 +29,20 @@ import (
 // Tests are not part of the loaded program, so their packages are loaded
 // again with tests.
 func (c *converter) convertTests(renames map[*types.Var]string) error {
-	if len(c.kingpinTests) == 0 || c.compatPath == "" {
+	if c.compatPath == "" {
 		return nil
 	}
 	dirs := map[string]bool{}
 	for path := range c.kingpinTests {
 		dirs[filepath.Dir(path)] = true
+	}
+	// Tests calling a function that lost parameters, as c.run(nil) for a
+	// former Action, need converting too, though they don't use kingpin.
+	for dir := range c.prunedCallers() {
+		dirs[dir] = true
+	}
+	if len(dirs) == 0 {
+		return nil
 	}
 	var patterns []string
 	matched := map[string]bool{}
@@ -251,17 +259,9 @@ func (t *testConversion) callee(call *dst.CallExpr) (*types.Func, prunedSig, boo
 }
 
 func (t *testConversion) followPrunedCall(call *dst.CallExpr) {
-	fn, sig, ok := t.callee(call)
-	if !ok || len(sig.params) == 0 || len(call.Args) != fn.Type().(*types.Signature).Params().Len() {
-		return
+	if fn, sig, ok := t.callee(call); ok {
+		pruneArgs(t.p, call, fn, sig)
 	}
-	var args []dst.Expr
-	for i, a := range call.Args {
-		if !sig.params[i] {
-			args = append(args, a)
-		}
-	}
-	call.Args = args
 }
 
 // followPrunedAssign is converter.followPrunedAssign for tests.
@@ -630,6 +630,36 @@ func (t *testConversion) bindAtCall(cur *dstutil.Cursor, s dst.Stmt) {
 	for _, b := range t.c.bindCalls(t.p.position(call), binds, typs, t.p.PkgPath, methodOn(appExpr)) {
 		cur.InsertBefore(&dst.ExprStmt{X: b})
 	}
+}
+
+// prunedCallers returns the directories of the program whose tests call a
+// function by the name of one that lost parameters.
+func (c *converter) prunedCallers() map[string]bool {
+	out := map[string]bool{}
+	if len(c.pruned) == 0 {
+		return out
+	}
+	for _, p := range c.prog.Packages {
+		for _, f := range p.Syntax {
+			dir := filepath.Dir(p.filename(f))
+			if out[dir] {
+				continue
+			}
+			tests, _ := filepath.Glob(filepath.Join(dir, "*_test.go"))
+			for _, t := range tests {
+				src, err := os.ReadFile(t)
+				if err != nil {
+					continue
+				}
+				for fn := range c.pruned {
+					if bytes.Contains(src, []byte(fn.Name()+"(")) {
+						out[dir] = true
+					}
+				}
+			}
+		}
+	}
+	return out
 }
 
 // onlyTests reports whether the Go files of dir are all tests.

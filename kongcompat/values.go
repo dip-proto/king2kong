@@ -47,7 +47,7 @@ func checkValue(v *kong.Value, value string) error {
 	case t == reflect.TypeOf(time.Duration(0)) && !v2From23():
 		_, err := time.ParseDuration(value)
 		return err
-	case t.Kind() == reflect.Map && t.Key().Kind() == reflect.String:
+	case t == reflect.TypeOf(map[string]string{}):
 		if !strings.ContainsAny(value, ":=") {
 			return fmt.Errorf("expected KEY=VALUE got '%s'", value)
 		}
@@ -86,7 +86,9 @@ func checkValue(v *kong.Value, value string) error {
 //     it says;
 //   - a file is opened by the name given, and "-" is just a file name;
 //   - a regular expression is compiled, in lists too;
-//   - a map flag left out holds an empty map, not nil.
+//   - a map[string]string flag left out holds an empty map, not nil;
+//   - a list argument's default or environment variable holds several
+//     values, split at the separator, as for a flag.
 func Values() kong.Option {
 	return kong.OptionFunc(func(k *kong.Kong) error {
 		for _, opt := range []kong.Option{
@@ -104,6 +106,14 @@ func Values() kong.Option {
 				fillMaps(ctx.Kong)
 				return nil
 			}),
+			kong.PostBuild(func(k *kong.Kong) error {
+				values(k.Model.Node, func(v *kong.Value) {
+					if v.Flag == nil && v.Target.Kind() == reflect.Slice && !reflect.PointerTo(v.Target.Type()).Implements(mapperValue) {
+						v.Mapper = argList{v.Mapper}
+					}
+				})
+				return nil
+			}),
 		} {
 			if err := opt.Apply(k); err != nil {
 				return err
@@ -111,6 +121,27 @@ func Values() kong.Option {
 		}
 		return nil
 	})
+}
+
+var mapperValue = reflect.TypeOf((*kong.MapperValue)(nil)).Elem()
+
+// argList splits the default or environment variable of a list argument,
+// which kong only splits for flags.
+// Values from the command line come as tokens of their own.
+type argList struct{ kong.Mapper }
+
+func (m argList) Decode(ctx *kong.DecodeContext, target reflect.Value) error {
+	t := ctx.Scan.Peek()
+	s, ok := t.Value.(string)
+	if t.Type != kong.FlagValueToken || !ok || ctx.Value.Tag.Sep == -1 {
+		return m.Mapper.Decode(ctx, target)
+	}
+	ctx.Scan.Pop()
+	var tokens []kong.Token
+	for _, part := range kong.SplitEscaped(s, ctx.Value.Tag.Sep) {
+		tokens = append(tokens, kong.Token{Type: kong.FlagValueToken, Value: part})
+	}
+	return m.Mapper.Decode(ctx.WithScanner(kong.ScanFromTokens(tokens...)), target)
 }
 
 func floatInt(ctx *kong.DecodeContext, target reflect.Value) error {

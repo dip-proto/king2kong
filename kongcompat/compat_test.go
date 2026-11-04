@@ -188,6 +188,54 @@ func TestUsageMatchesKingpin(t *testing.T) {
 	}
 }
 
+// wasSet is the "was it given" flag idiom, which the tool converts to a
+// struct kong decodes, with a placeholder showing the default as kingpin did.
+type wasSet struct {
+	Given bool
+	Value string
+}
+
+func (w *wasSet) Set(*kingpin.ParseElement, *kingpin.ParseContext) error {
+	w.Given = true
+	return nil
+}
+
+func (w *wasSet) Decode(ctx *kong.DecodeContext) error {
+	return ctx.Scan.PopValueInto("value", &w.Value)
+}
+
+// Programs such as the Fastly CLI turn the model into documentation before
+// parsing.
+func TestModelBeforeParseMatchesKingpin(t *testing.T) {
+	var st kpState
+	var sort wasSet
+	app := kingpinApp(&st)
+	app.Flag("sort", "Sort field").Default("name").Action(sort.Set).StringVar(&sort.Value)
+	want := app.Model()
+
+	var cli struct {
+		kongCLI
+		Sort wasSet `default:"name" placeholder:"\"name\"" help:"Sort field"`
+	}
+	got := New(&cli, "tool", "A tool to manage stores", kong.Vars{"version": "1.0"}).Model()
+
+	var wantCmds, gotCmds []string
+	for _, c := range want.Commands {
+		wantCmds = append(wantCmds, c.Name)
+	}
+	for _, c := range got.Commands {
+		gotCmds = append(gotCmds, c.Name)
+	}
+	if !slices.Equal(gotCmds, wantCmds) {
+		t.Errorf("commands = %v, kingpin had %v", gotCmds, wantCmds)
+	}
+	wantSort, gotSort := want.Flags[len(want.Flags)-1], got.Flags[len(got.Flags)-1]
+	if gotSort.PlaceHolder != wantSort.PlaceHolder || gotSort.FormatPlaceHolder() != wantSort.FormatPlaceHolder() {
+		t.Errorf("sort placeholder = %q shown as %s, kingpin had %q shown as %s",
+			gotSort.PlaceHolder, gotSort.FormatPlaceHolder(), wantSort.PlaceHolder, wantSort.FormatPlaceHolder())
+	}
+}
+
 // normalize drops the flags kingpin always registers for its own shell
 // completion, which kong does not have.
 func normalize(s string) string {

@@ -637,7 +637,11 @@ func (p *Plan) tagFor(b *binding, fieldName string) *kongtag.Tag {
 	if c.hasFormat {
 		t.Set("format", c.format)
 	}
-	switch strings.TrimSuffix(c.bind, "Var") {
+	kind := strings.TrimSuffix(c.bind, "Var")
+	if b.wrapper != nil && slices.Contains([]string{"Counter", "ExistingFile", "ExistingFiles", "ExistingDir", "ExistingDirs"}, kind) {
+		p.issue(c.pos, "%s %q: a was-set wrapper around a %s value is not supported; record whether it was given by hand", c.kind, c.name, kind)
+	}
+	switch kind {
 	case "NegatableBool":
 		t.Flag("negatable")
 	case "Bool":
@@ -657,9 +661,14 @@ func (p *Plan) tagFor(b *binding, fieldName string) *kongtag.Tag {
 		if c.seeded {
 			p.issue(c.pos, "%s %q: its custom value starts with fields set, which kong resets before calling Set; set them in a hook by hand", c.kind, c.name)
 		}
-		if !p.g.prog.kingpinV3 && c.kind == kindFlag && boolLike(b) {
+		if !p.g.prog.kingpinV3 && c.kind == kindFlag && p.boolLike(b) {
 			// kingpin v2 accepts --no-x for custom booleans too.
 			t.Flag("negatable")
+		}
+		if dt := bindingType(b); c.kind == kindArg && dt != nil && listKind(dt) && !hasIsCumulative(dt) && c.parent != nil {
+			if i := slices.Index(c.parent.children, c); slices.ContainsFunc(c.parent.children[i+1:], func(o *clause) bool { return o.kind == kindArg }) {
+				p.issue(c.pos, "%s %q: kong takes a custom map or list argument as the rest of the command line and refuses the arguments after it; make it the last argument by hand", c.kind, c.name)
+			}
 		}
 	case "Counter":
 		t.Set("type", "counter")
@@ -678,20 +687,37 @@ func (p *Plan) tagFor(b *binding, fieldName string) *kongtag.Tag {
 	return t
 }
 
-// boolLike reports whether b's custom value has an IsBoolFlag method.
-func boolLike(b *binding) bool {
-	var t types.Type
-	switch {
-	case b.field != nil:
-		t = b.field.Type()
-	case b.dstVar != nil:
-		t = b.dstVar.Type()
-	default:
+// boolLike reports whether b's custom value told kingpin it takes no value.
+func (p *Plan) boolLike(b *binding) bool {
+	t := bindingType(b)
+	if t == nil {
 		return false
 	}
-	obj, _, _ := types.LookupFieldOrMethod(types.NewPointer(deref(t)), true, nil, "IsBoolFlag")
-	_, ok := obj.(*types.Func)
-	return ok
+	isBool, _ := p.g.prog.boolFlag(t)
+	return isBool
+}
+
+// boolFlag reports whether a custom value of type t told kingpin it takes no
+// value, through an IsBoolFlag method that doesn't just return false.
+// known is false when that method decides at run time.
+func (prog *Program) boolFlag(t types.Type) (isBool, known bool) {
+	obj, _, _ := types.LookupFieldOrMethod(types.NewPointer(t), true, nil, "IsBoolFlag")
+	fn, ok := obj.(*types.Func)
+	if !ok {
+		return false, true
+	}
+	fd, ok := prog.funcs[fn]
+	if !ok || fd.decl.Body == nil || len(fd.decl.Body.List) != 1 {
+		return true, false
+	}
+	ret, ok := fd.decl.Body.List[0].(*dst.ReturnStmt)
+	if !ok || len(ret.Results) != 1 {
+		return true, false
+	}
+	if id, ok := ret.Results[0].(*dst.Ident); ok && (id.Name == "true" || id.Name == "false") {
+		return id.Name == "true", true
+	}
+	return true, false
 }
 
 // runtimeVar returns the name of the kong variable holding a run-time value
@@ -802,6 +828,33 @@ func (p *Plan) tagFieldName(b *binding) string {
 		return p.g.prog.identFromName(b.cl.name)
 	}
 	return p.g.prog.exported(b.field.Name())
+}
+
+// bindingType is the type of the value a flag writes, or nil.
+func bindingType(b *binding) types.Type {
+	switch {
+	case b.field != nil:
+		return deref(b.field.Type())
+	case b.dstVar != nil:
+		return deref(b.dstVar.Type())
+	}
+	return nil
+}
+
+// listKind reports whether kong takes a value of type t as several values.
+func listKind(t types.Type) bool {
+	switch t.Underlying().(type) {
+	case *types.Slice, *types.Map:
+		return true
+	}
+	return false
+}
+
+// hasIsCumulative reports whether a custom value told kingpin it takes
+// several values.
+func hasIsCumulative(t types.Type) bool {
+	named, ok := t.(*types.Named)
+	return ok && lookupMethod(named, "IsCumulative") != nil
 }
 
 func (p *Plan) isSliceDest(b *binding) bool {

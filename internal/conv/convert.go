@@ -61,7 +61,15 @@ type converter struct {
 	// holding the grammar, so the whole program is converted.
 	main         *mainProgram
 	storagePaths map[*clause]string
-	rootImports  map[string]string
+	// shadowFields are the fields added for shadow bindings.
+	shadowFields map[*binding]fieldLoc
+	// registered caches registeredBy.
+	registered map[dst.Stmt][]*clause
+	// groups are the sections of statements headed by a comment.
+	groups map[dst.Stmt][]dst.Stmt
+	// stmtDirs are the directories of the statements.
+	stmtDirs    map[dst.Stmt]string
+	rootImports map[string]string
 	// cliName and cliVar name the generated root struct and the variable
 	// holding the parsed command line.
 	cliName string
@@ -307,6 +315,7 @@ func Convert(prog *Program, opts Options) (*Result, error) {
 		renames:         map[*types.Var]string{},
 		opts:            opts,
 		storagePaths:    map[*clause]string{},
+		shadowFields:    map[*binding]fieldLoc{},
 		genActions:      map[*node]*genActions{},
 		fieldOrder:      map[string]int{},
 		rootFieldNames:  map[*clause]string{},
@@ -355,7 +364,7 @@ func Convert(prog *Program, opts Options) (*Result, error) {
 		}
 		// convertHints may add Hints and HintActions methods here or on an
 		// embedded type.
-		if slices.ContainsFunc(n.cl.children, func(ch *clause) bool { return ch.hintExpr != nil }) {
+		if slices.ContainsFunc(n.cl.children, func(ch *clause) bool { return len(ch.hintSources) > 0 }) {
 			for _, t := range append([]*types.Named{n.typ}, embeddedClosure(n.typ)...) {
 				c.nm.claim(t, "Hints")
 				c.nm.claim(t, "HintActions")
@@ -384,6 +393,7 @@ func Convert(prog *Program, opts Options) (*Result, error) {
 		}
 	}
 	c.computeRegOnly()
+	c.groups = c.sections()
 	c.writeCompat()
 	c.testRefs = c.scanUnloaded(prog.Dir)
 	c.convertFlags()
@@ -414,6 +424,7 @@ func Convert(prog *Program, opts Options) (*Result, error) {
 	c.convertCommandNames()
 	c.addCommandNamesOption()
 	c.writeHooks()
+	c.keepRegistrationComments()
 
 	c.res.Issues = append(c.res.Issues, c.plan.Issues...)
 	if c.genErr != nil {
@@ -601,6 +612,9 @@ func (c *converter) convertFlags() {
 					c.issue(b.cl.pos, "flag %q is registered differently by commands sharing %s", b.cl.name, host.Obj().Name())
 				}
 				b.shadowField = shadowName[key]
+				if loc, ok := c.shadowFields[prev]; ok {
+					c.shadowFields[b] = loc
+				}
 				continue
 			}
 			shadows[key] = b
@@ -779,9 +793,13 @@ func (c *converter) markFailures() {
 		if !ok {
 			continue
 		}
-		quoted := "(unknown)"
+		quoted := []string{"(unknown)"}
 		if f.cl.stmt != nil {
-			quoted = render(f.cl.stmt)
+			// The statement's own comments are quoted on lines of their own.
+			s := dst.Clone(f.cl.stmt).(dst.Stmt)
+			comments := slices.Clone(trimNewlines(s.Decorations().Start))
+			*s.Decorations() = dst.NodeDecs{}
+			quoted = append(comments, render(s))
 		}
 		reason := f.reason
 		if i := strings.Index(reason, ": "); i >= 0 {
@@ -789,7 +807,9 @@ func (c *converter) markFailures() {
 		}
 		loc.field.Decs.Start.Append("// TODO: king2kong could not convert this flag (" + reason + ").")
 		loc.field.Decs.Start.Append("// The kingpin registration was:")
-		loc.field.Decs.Start.Append("// " + quoted)
+		for _, l := range quoted {
+			loc.field.Decs.Start.Append("// " + l)
+		}
 		loc.field.Decs.Before = dst.NewLine
 		c.ed.touch(loc.pkg, loc.file)
 	}
@@ -999,6 +1019,8 @@ func (c *converter) addShadow(host *types.Named, name, dstExpr string, b *bindin
 		c.issue(b.cl.pos, "cannot find the declaration of %s", host.Obj().Name())
 		return
 	}
+	loc, st, _ := c.ed.structType(host)
+	c.shadowFields[b] = fieldLoc{pkg: loc.pkg, file: loc.file, st: st, field: field}
 	c.res.Stats.Shadows++
 }
 
@@ -1036,6 +1058,10 @@ func (c *converter) addDecode(w *wrapperType) {
 		c.issue(token.Position{}, "cannot find the declaration of %s", w.named.Obj().Name())
 		return
 	}
+	if c.foreignDecode(w.named) {
+		c.issue(token.Position{}, "%s has a Decode method kong does not know, so kong cannot decode it; rename that method", w.named.Obj().Name())
+		return
+	}
 	if c.hasMethod(w.named, "Decode") {
 		return
 	}
@@ -1044,9 +1070,20 @@ func (c *converter) addDecode(w *wrapperType) {
 	v := w.value.Name()
 	imports := map[string]string{"github.com/alecthomas/kong": "kong"}
 	var body string
+	named, _ := w.value.Type().(*types.Named)
 	switch u := w.value.Type().Underlying().(type) {
 	case *types.Basic:
 		switch {
+		case named != nil && lookupMethod(named, "UnmarshalText") != nil:
+			// Such as units.Base2Bytes, which BytesVar parsed the same way.
+			body = fmt.Sprintf(`// Decode implements kong.MapperValue, so the flag value lands in %[3]s.
+func (%[1]s *%[2]s) Decode(ctx *kong.DecodeContext) error {
+	var s string
+	if err := ctx.Scan.PopValueInto("value", &s); err != nil {
+		return err
+	}
+	return %[1]s.%[3]s.UnmarshalText([]byte(s))
+}`, recv, t, v)
 		case u.Kind() == types.String:
 			body = fmt.Sprintf(`// Decode implements kong.MapperValue, so the flag value lands in %[3]s.
 func (%[1]s *%[2]s) Decode(ctx *kong.DecodeContext) error {
@@ -1109,7 +1146,33 @@ func (%[1]s *%[2]s) Decode(ctx *kong.DecodeContext) error {
 			body = numericDecode(recv, t, v, u, typeExpr(w.value.Type(), w.named.Obj().Pkg(), imports))
 		}
 	case *types.Slice:
-		if b, ok := u.Elem().Underlying().(*types.Basic); ok && b.Kind() == types.String {
+		if b, ok := u.Elem().Underlying().(*types.Basic); ok && b.Kind() == types.String && c.wrapsArgument(w) {
+			imports["strings"] = "strings"
+			body = fmt.Sprintf(`// Decode implements kong.MapperValue, so the values accumulate in %[3]s.
+// An argument takes the rest of the command line.
+// A value is split on the separator given by the field's sep tag.
+func (%[1]s *%[2]s) Decode(ctx *kong.DecodeContext) error {
+	for {
+		var s string
+		if err := ctx.Scan.PopValueInto("value", &s); err != nil {
+			return err
+		}
+		if sep := ctx.Value.Tag.Sep; sep != -1 {
+			%[1]s.%[3]s = append(%[1]s.%[3]s, strings.Split(s, string(sep))...)
+		} else {
+			%[1]s.%[3]s = append(%[1]s.%[3]s, s)
+		}
+		if ctx.Value.Flag != nil || !ctx.Scan.Peek().IsValue() {
+			return nil
+		}
+	}
+}
+
+// IsCumulative tells kongcompat the value may be repeated, as kingpin allowed.
+func (%[1]s *%[2]s) IsCumulative() bool {
+	return true
+}`, recv, t, v)
+		} else if b, ok := u.Elem().Underlying().(*types.Basic); ok && b.Kind() == types.String {
 			imports["strings"] = "strings"
 			body = fmt.Sprintf(`// Decode implements kong.MapperValue, so the flag values accumulate in
 // %[3]s.
@@ -1252,6 +1315,20 @@ func (c *converter) hasMethod(t *types.Named, name string) bool {
 	return isFunc
 }
 
+// foreignDecode reports whether t has a Decode method kong would not call, as
+// for envconfig's Decode(string) error, which leaves no name for kong's.
+func (c *converter) foreignDecode(t *types.Named) bool {
+	obj, _, _ := types.LookupFieldOrMethod(types.NewPointer(t), true, t.Obj().Pkg(), "Decode")
+	fn, ok := obj.(*types.Func)
+	if !ok {
+		return false
+	}
+	sig := fn.Type().(*types.Signature)
+	return sig.Params().Len() != 1 || sig.Results().Len() != 1 ||
+		types.TypeString(sig.Params().At(0).Type(), nil) != "*github.com/alecthomas/kong.DecodeContext" ||
+		types.TypeString(sig.Results().At(0).Type(), nil) != "error"
+}
+
 // recvType is t's name as a method receiver type, with its type parameters.
 func recvType(t *types.Named) string {
 	params := t.Origin().TypeParams()
@@ -1347,9 +1424,10 @@ func (c *converter) convertConstructors() {
 	// Values every command receives, such as shared configuration, are injected
 	// once through a hook on the type declaring the field.
 	type inj struct {
-		field *types.Var
-		param *types.Var
-		ci    *ctorInfo
+		field    *types.Var
+		param    *types.Var
+		ci       *ctorInfo
+		comments []string
 	}
 	injections := map[*types.Var][]inj{}
 	var fns []*types.Func
@@ -1409,7 +1487,7 @@ func (c *converter) convertConstructors() {
 			}
 			switch it.kind {
 			case ctorInjection:
-				injections[it.field] = append(injections[it.field], inj{it.field, it.param, ci})
+				injections[it.field] = append(injections[it.field], inj{it.field, it.param, ci, it.comments})
 			case ctorEmbed:
 				c.valueEmbeds[it.field] = true
 			case ctorResidue, ctorCrossRef:
@@ -1540,6 +1618,11 @@ func (c *converter) convertConstructors() {
 			continue
 		}
 		param := list[0].param
+		// The comments of the assignment go with it.
+		var doc string
+		if len(list[0].comments) > 0 {
+			doc = strings.Join(list[0].comments, "\n") + "\n"
+		}
 		if c.main != nil {
 			// When main parses the command line, the hook uses the constant
 			// the constructor was called with, or binds the variable it came
@@ -1567,7 +1650,7 @@ func (c *converter) convertConstructors() {
 				if h.paramToLocal(name, typ, decl) {
 					lit = name
 				}
-				h.before = append(h.before, fmt.Sprintf("%s.%s = %s", c.recvPlaceholder, c.finalName(f), lit))
+				h.before = append(h.before, fmt.Sprintf("%s%s.%s = %s", doc, c.recvPlaceholder, c.finalName(f), lit))
 				continue
 			}
 			v, ok := sameVariable(argPkg, args)
@@ -1605,7 +1688,7 @@ func (c *converter) convertConstructors() {
 			continue
 		}
 		pname := h.param(paramName(param.Name()), typ)
-		h.before = append(h.before, fmt.Sprintf("%s.%s = %s", c.recvPlaceholder, c.finalName(f), pname))
+		h.before = append(h.before, fmt.Sprintf("%s%s.%s = %s", doc, c.recvPlaceholder, c.finalName(f), pname))
 		if c.main == nil {
 			c.addInjected(param.Type())
 		}
@@ -1847,7 +1930,7 @@ func (c *converter) residueHook(ci *ctorInfo, it ctorItem) bool {
 	for _, id := range renamed {
 		id.Name = name
 	}
-	h.before = append(h.before, fmt.Sprintf("%s.%s = %s", c.recvPlaceholder, c.itemPath(it), expr))
+	h.before = append(h.before, strings.Join(append(slices.Clone(it.comments), fmt.Sprintf("%s.%s = %s", c.recvPlaceholder, c.itemPath(it), expr)), "\n"))
 	return true
 }
 
@@ -1877,8 +1960,28 @@ func (c *converter) redocKeptCtor(ci *ctorInfo) {
 	if ci.inst != nil {
 		what = ci.inst.Obj().Name()
 	}
-	fd.Decs.Start = dst.Decorations{fmt.Sprintf("// %s returns a %s set up as it was before parsing.", fd.Name.Name, what), "// Its flags now come from the struct's tags."}
+	// Only the first sentence, about registering, is out of date.
+	redoc := dst.Decorations{fmt.Sprintf("// %s returns a %s set up as it was before parsing.", fd.Name.Name, what), "// Its flags now come from the struct's tags."}
+	fd.Decs.Start = append(redoc, afterFirstSentence(fd.Decs.Start)...)
 	c.ed.touch(ci.decl.pkg, ci.decl.file)
+}
+
+// afterFirstSentence returns the // comment lines that follow the first
+// sentence of a doc comment.
+func afterFirstSentence(lines []string) []string {
+	for i, l := range lines {
+		if !strings.HasPrefix(l, "//") {
+			return nil
+		}
+		text := strings.TrimSpace(strings.TrimPrefix(l, "//"))
+		if strings.HasSuffix(text, ".") {
+			return lines[i+1:]
+		}
+		if j := strings.Index(text, ". "); j >= 0 {
+			return append([]string{"// " + text[j+2:]}, lines[i+1:]...)
+		}
+	}
+	return nil
 }
 
 func (c *converter) isInjected(ci *ctorInfo, v *types.Var) bool {

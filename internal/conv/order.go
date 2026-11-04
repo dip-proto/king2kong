@@ -415,6 +415,12 @@ func documents(f *dst.Field) bool {
 // such a group stays out of it.
 func (l fieldLayout) apply(st *dst.StructType) {
 	old := st.Fields.List
+	// A comment after the last field, such as a heading nothing is under
+	// yet, stays at the end.
+	var tail dst.Decorations
+	if last, i := trailing(st); i >= 0 {
+		tail, last.Decs.End = last.Decs.End[i:], last.Decs.End[:i]
+	}
 	for i, f := range old {
 		if f.Decs.After == dst.EmptyLine && i+1 < len(old) {
 			f.Decs.After, old[i+1].Decs.Before = dst.NewLine, dst.EmptyLine
@@ -481,7 +487,21 @@ func (l fieldLayout) apply(st *dst.StructType) {
 	if len(l.list) > 0 && l.list[0].Decs.Before == dst.EmptyLine {
 		l.list[0].Decs.Before = dst.NewLine
 	}
+	if len(tail) > 0 {
+		last := l.list[len(l.list)-1]
+		last.Decs.End = append(last.Decs.End, tail...)
+	}
 	st.Fields.List = l.list
+}
+
+// trailing returns the last field of a struct and where the comments on
+// lines of their own after it start in its end decorations, or -1.
+func trailing(st *dst.StructType) (*dst.Field, int) {
+	if len(st.Fields.List) == 0 {
+		return nil, -1
+	}
+	last := st.Fields.List[len(st.Fields.List)-1]
+	return last, slices.Index(last.Decs.End, "\n")
 }
 
 // interleaved reports whether the flags of a field embedding several of

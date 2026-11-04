@@ -90,11 +90,9 @@ type clause struct {
 	// localHelp is set when the help text is computed from local values, so
 	// it cannot move to where the parser is built.
 	localHelp bool
-	// hintExpr, in hintPkg, computes the hints given to HintOptions at run
-	// time, or is the function given to HintAction, when hintAction is set.
-	hintExpr   dst.Expr
-	hintAction bool
-	hintPkg    *Package
+	// hintSources are the hints computed at run time, in the order kingpin
+	// asked them.
+	hintSources []hintSource
 	// notes are reported but, unlike issues, don't block the conversion.
 	notes   []string
 	noEnvar bool
@@ -126,7 +124,10 @@ type clause struct {
 	// stmt is the statement that registered the clause, quoted when the
 	// conversion cannot handle it.
 	stmt dst.Stmt
-	pkg  *Package
+	// stack holds the statements being run when the clause was registered,
+	// outermost first: the calls leading to stmt, then stmt.
+	stack []dst.Stmt
+	pkg   *Package
 }
 
 func (c *clause) issue(msg string) {
@@ -229,4 +230,13 @@ type actionLit struct {
 	pkg *Package
 	// before counts the named actions registered before it.
 	before int
+}
+
+// hintSource is an expression, in pkg, computing the hints given to
+// HintOptions at run time, or the function given to HintAction when action
+// is set.
+type hintSource struct {
+	expr   dst.Expr
+	pkg    *Package
+	action bool
 }

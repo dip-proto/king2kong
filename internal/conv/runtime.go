@@ -252,8 +252,7 @@ func (c *converter) atCall(p *Package, call *dst.CallExpr) (*types.Tuple, int, [
 	var bound []int
 	for i := range call.Args {
 		t := params.At(i).Type()
-		pruned := i < len(sig.params) && sig.params[i]
-		nils := i < len(sig.nils) && sig.nils[i]
+		pruned, nils := sig.params[i], sig.nils[i]
 		switch {
 		case (pruned || nils || kept) && c.isAppType(t):
 			app = i
@@ -775,7 +774,13 @@ func onlyVarAt(p *Package, n dst.Node, match func(*types.Var) bool) *types.Var {
 func (c *converter) followPrunedCall(p *Package, call *dst.CallExpr) bool {
 	fn := c.g.in.staticCallee(p, call)
 	sig, ok := c.pruned[fn]
-	if !ok || len(sig.params) == 0 && len(sig.nils) == 0 {
+	return ok && pruneArgs(p, call, fn, sig)
+}
+
+// pruneArgs drops the arguments of the parameters fn lost, or passes nil
+// for them, and reports whether it changed the call.
+func pruneArgs(p *Package, call *dst.CallExpr, fn *types.Func, sig prunedSig) bool {
+	if len(sig.params) == 0 && len(sig.nils) == 0 {
 		return false
 	}
 	// A method expression, as in Builder.Setup(b, app), takes the receiver

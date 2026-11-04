@@ -148,3 +148,38 @@ func TestParseLeavesValuesToKong(t *testing.T) {
 		t.Errorf("decoded %d times, value %q", decodes, cli.Token.value)
 	}
 }
+
+type hostSet map[string]bool
+
+func (h *hostSet) Decode(ctx *kong.DecodeContext) error {
+	var s string
+	if err := ctx.Scan.PopValueInto("host", &s); err != nil {
+		return err
+	}
+	if *h == nil {
+		*h = hostSet{}
+	}
+	(*h)[s] = true
+	return nil
+}
+
+// TestCustomMapValue checks that only StringMap values get kingpin's
+// KEY=VALUE syntax and an empty map when left out: a custom map value is
+// decoded by its own code, and left nil.
+func TestCustomMapValue(t *testing.T) {
+	for _, args := range [][]string{nil, {"--host", "example.com"}} {
+		var cli struct {
+			Host hostSet `help:"Allowed host."`
+		}
+		k, err := kong.New(&cli, kong.Exit(func(int) {}), Values())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := Parse(k, args, nil); err != nil {
+			t.Fatalf("%q: %v", args, err)
+		}
+		if (cli.Host == nil) != (args == nil) || args != nil && !cli.Host["example.com"] {
+			t.Errorf("%q: hosts = %#v", args, cli.Host)
+		}
+	}
+}

@@ -28,6 +28,7 @@ func Analyze(prog *Program) *Grammar {
 	in := newInterp(prog)
 	in.runPackageVars()
 	roots := in.findRoots()
+	in.runDataInits(roots)
 	for _, r := range roots {
 		in.run(r)
 	}
@@ -35,6 +36,25 @@ func Analyze(prog *Program) *Grammar {
 	g := &Grammar{prog: prog, in: in, Apps: in.apps, roots: roots, touched: in.touched}
 	in.resolveInstances()
 	return g
+}
+
+// runDataInits runs the init functions that register nothing, as Go runs
+// them before main, for the values they set, as in
+// func init() { defaults.Region = "eu-west-1" }.
+// The ones that register are among the roots.
+func (in *interp) runDataInits(roots []*types.Func) {
+	var inits []*types.Func
+	for fn := range in.prog.funcs {
+		if fn.Name() == "init" && fn.Type().(*types.Signature).Recv() == nil && !slices.Contains(roots, fn) {
+			inits = append(inits, fn)
+		}
+	}
+	slices.SortFunc(inits, in.initOrder())
+	for _, fn := range inits {
+		in.inInit = true
+		in.run(fn)
+		in.inInit = false
+	}
 }
 
 // appMakers are the kingpin package-level names that create an application,

@@ -203,7 +203,7 @@ func (s *checker) scan() error {
 				if isHelpCommand(s.node) {
 					s.helpArgs = append(s.helpArgs, value)
 				}
-				ac := &ArgClause{arg}
+				ac := newArgClause(arg)
 				s.elements = append(s.elements, &ParseElement{Clause: ac, OneOf: OneOfClause{Arg: ac}, Value: &value})
 				if !cumulative(arg) {
 					s.nextArg++
@@ -277,7 +277,7 @@ func (s *checker) flag(t token) error {
 	if flag.Name == "help" {
 		s.sawHelp = true
 	}
-	fc := &FlagClause{flag}
+	fc := newFlagClause(flag)
 	element := &ParseElement{Clause: fc, OneOf: OneOfClause{Flag: fc}}
 	s.elements = append(s.elements, element)
 	if valueless(flag) {

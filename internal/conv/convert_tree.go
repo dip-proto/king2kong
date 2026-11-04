@@ -159,7 +159,7 @@ func (c *converter) convertTree() {
 				if n.typ != nil {
 					fmt.Fprintf(&b, "%s\n\n", typeExpr(n.typ, root.Types, imports))
 				}
-				b.WriteString(strings.Join(all, "\n"))
+				b.WriteString(strings.TrimLeft(strings.Join(all, "\n"), "\n"))
 				b.WriteString("\n}\n")
 			}
 			if g := c.genActions[n]; g != nil {
@@ -215,7 +215,7 @@ func (c *converter) convertTree() {
 		desc = fmt.Sprintf("the %s command line", app.name)
 	}
 	fmt.Fprintf(&src, "// %s is %s, declared as a kong grammar.\n", cliName, desc)
-	fmt.Fprintf(&src, "type %s struct {\n%s\n}\n", cliName, strings.TrimRight(strings.Join(rootLines, "\n"), "\n"))
+	fmt.Fprintf(&src, "type %s struct {\n%s\n}\n", cliName, strings.Trim(strings.Join(rootLines, "\n"), "\n"))
 	if c.main != nil && c.main.local == nil {
 		if w := c.main.flags; w != nil && w.v.Parent() == w.v.Pkg().Scope() {
 			c.cliInits = append(c.cliInits, cliInit{field: w.field, varName: w.v.Name(), pointer: w.ptr})
@@ -702,7 +702,9 @@ func (c *converter) localInit(cd cond, v *types.Var) dst.Expr {
 		for i, l := range as.Lhs {
 			if fd.pkg.objectOf(l) == v {
 				count++
-				if i < len(as.Rhs) {
+				// One of several results, as in home, _ := os.UserHomeDir(),
+				// can't be written as the call.
+				if len(as.Lhs) == len(as.Rhs) {
 					init = as.Rhs[i]
 				}
 			}

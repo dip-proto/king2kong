@@ -162,28 +162,7 @@ func main() {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			dir := t.TempDir()
-			mod, err := os.ReadFile(filepath.Join("testdata", "classic", "go.mod"))
-			if err != nil {
-				t.Fatal(err)
-			}
-			writeFile(t, filepath.Join(dir, "go.mod"), strings.Replace(string(mod), "module classic", "module probe", 1))
-			sum, err := os.ReadFile(filepath.Join("testdata", "classic", "go.sum"))
-			if err != nil {
-				t.Fatal(err)
-			}
-			writeFile(t, filepath.Join(dir, "go.sum"), string(sum))
-			for name, src := range tc.files {
-				writeFile(t, filepath.Join(dir, name), src)
-			}
-			prog, err := Load(dir, "./...")
-			if err != nil {
-				t.Fatal(err)
-			}
-			res, err := Convert(prog, Options{Compat: compatFS(t)})
-			if err != nil {
-				t.Fatal(err)
-			}
+			res := convertProbe(t, tc.files)
 			var got []string
 			for _, is := range res.Issues {
 				if strings.Contains(is.Reason, tc.want) {
@@ -194,4 +173,32 @@ func main() {
 			t.Errorf("no issue says %q; got %q", tc.want, got)
 		})
 	}
+}
+
+// convertProbe converts a module named probe made of files, using kingpin v2.
+func convertProbe(t *testing.T, files map[string]string) *Result {
+	t.Helper()
+	dir := t.TempDir()
+	mod, err := os.ReadFile(filepath.Join("testdata", "classic", "go.mod"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeFile(t, filepath.Join(dir, "go.mod"), strings.Replace(string(mod), "module classic", "module probe", 1))
+	sum, err := os.ReadFile(filepath.Join("testdata", "classic", "go.sum"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeFile(t, filepath.Join(dir, "go.sum"), string(sum))
+	for name, src := range files {
+		writeFile(t, filepath.Join(dir, name), src)
+	}
+	prog, err := Load(dir, "./...")
+	if err != nil {
+		t.Fatal(err)
+	}
+	res, err := Convert(prog, Options{Compat: compatFS(t)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return res
 }

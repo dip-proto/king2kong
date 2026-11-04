@@ -148,7 +148,7 @@ func (c *converter) storageFields(n *node, pkg *types.Package, imports map[strin
 			continue
 		}
 		tag := c.plan.tagFor(b, name)
-		line := fmt.Sprintf("%s %s %s", name, typeExpr(t, pkg, imports), tagLiteral(tag.String()))
+		line := c.ownComments(b) + fmt.Sprintf("%s %s %s", name, typeExpr(t, pkg, imports), tagLiteral(tag.String()))
 		lines = append(lines, line)
 		c.fieldOrder[line] = 2 * b.cl.id
 		if n.cl.kind == kindApp {
@@ -227,7 +227,7 @@ func (c *converter) prepareMain(taken map[string]bool) {
 		}
 		taken[name] = true
 		tag := c.plan.tagFor(b, name)
-		line := fmt.Sprintf("%s %s %s", name, typeExpr(b.dstVar.Type(), c.tree.RootPkg.Types, c.rootImports), tagLiteral(tag.String()))
+		line := c.ownComments(b) + fmt.Sprintf("%s %s %s", name, typeExpr(b.dstVar.Type(), c.tree.RootPkg.Types, c.rootImports), tagLiteral(tag.String()))
 		mp.extraFields = append(mp.extraFields, line)
 		c.fieldOrder[line] = 2 * b.cl.id
 		c.rootFieldNames[b.cl] = name
@@ -1750,6 +1750,10 @@ func (c *converter) needsValues() bool {
 			case "existingfile", "existingdir", "noflag", "boolarg", "counter":
 				return true
 			}
+			// kongcompat splits the default of a list argument.
+			if sep := b.tag.Get("sep"); b.cl.kind == kindArg && sep != "" && sep != "none" {
+				return true
+			}
 		}
 		var t types.Type
 		switch {
@@ -1973,11 +1977,34 @@ func (c *converter) pointList(p *Package, s dst.Stmt, body *dst.BlockStmt) bool 
 	if !ok {
 		return false
 	}
+	// The function goes, so the list must not depend on conditions, nor
+	// the function do anything else.
+	fn := c.g.in.staticCallee(p, call)
+	if fn == nil {
+		return false
+	}
+	fd, ok := c.prog.funcs[fn]
+	if !ok || fd.decl.Body == nil {
+		return false
+	}
+	del, _ := c.deletableStmts(fd.pkg, fd.decl.Body)
+	for _, st := range fd.decl.Body.List {
+		if _, ret := st.(*dst.ReturnStmt); !ret && !del[st] {
+			c.issue(p.position(call), "%s builds its list of commands with more than registrations, which the tool cannot rebuild from the CLI; build the list by hand", fn.Name())
+			return false
+		}
+	}
 	var elts []dst.Expr
 	for _, e := range vals[0].(vSlice).elems {
 		ptr, isPtr := e.(vPtr)
 		if !isPtr {
 			return false
+		}
+		for _, cl := range c.g.in.clauses {
+			if cl.instance == ptr.o && cl.registeredUnderCondition() {
+				c.issue(p.position(call), "the list of commands %s returns depends on conditions, which the tool cannot rebuild from the CLI; build the list by hand", render(call.Fun))
+				return false
+			}
 		}
 		path, found := c.instancePath(ptr.o)
 		if !found {

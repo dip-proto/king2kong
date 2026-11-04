@@ -179,6 +179,7 @@ func (in *interp) newClause(kind clauseKind, parent *clause, pos token.Position,
 	}
 	if n := len(in.stmtStack); n > 0 {
 		c.stmt = in.stmtStack[n-1]
+		c.stack = slices.Clone(in.stmtStack)
 	}
 	if parent != nil {
 		parent.children = append(parent.children, c)
@@ -1212,6 +1213,10 @@ func (in *interp) forgetWrites(fr *frame, n dst.Node) {
 // The structs they reach are gone through as well, as a configuration
 // loader like json.Unmarshal(data, &cfg) fills them all.
 func (in *interp) forgetPointed(fr *frame, c *dst.CallExpr, recv value, args []value) {
+	// Code from other packages, like a JSON decoder, may also set the
+	// pointers it reaches, to nil or to new structs.
+	callee := in.staticCallee(fr.pkg, c)
+	foreign := callee == nil || !in.prog.owns(callee.Pkg())
 	seen := map[*object]bool{}
 	var forgetFields func(o *object)
 	forgetFields = func(o *object) {
@@ -1246,6 +1251,9 @@ func (in *interp) forgetPointed(fr *frame, c *dst.CallExpr, recv value, args []v
 				if v.o.st != nil {
 					forgetFields(v.o)
 				}
+				if foreign {
+					o.fields[f] = vUnknown{}
+				}
 			}
 		}
 	}
@@ -1257,9 +1265,14 @@ func (in *interp) forgetPointed(fr *frame, c *dst.CallExpr, recv value, args []v
 			return
 		}
 		if fp, ok := v.(vFieldPtr); ok {
-			// As in readBool(&settings.Remote).
+			// As in readBool(&settings.Remote), or
+			// json.Unmarshal(raw, &cfg.Experimental) for a pointer field.
 			switch typeUnder(fp.f.Type()).(type) {
-			case *types.Basic, *types.Slice:
+			case *types.Struct:
+				if sub, ok := fp.o.fields[fp.f].(vObj); ok && sub.o.st != nil {
+					forgetFields(sub.o)
+				}
+			default:
 				fp.o.fields[fp.f] = vUnknown{}
 			}
 			return
@@ -1325,10 +1338,27 @@ func (in *interp) forgetAliases(fr *frame, sl vSlice) {
 	if len(sl.elems) == 0 {
 		return
 	}
+	shares := func(v value) bool {
+		other, ok := v.(vSlice)
+		return ok && len(other.elems) > 0 && &other.elems[0] == &sl.elems[0]
+	}
 	for o, v := range fr.vars {
-		if other, ok := v.(vSlice); ok && len(other.elems) > 0 && &other.elems[0] == &sl.elems[0] {
+		if shares(v) {
 			fr.vars[o] = vUnknown{}
 			in.varVals[o] = vUnknown{}
+		}
+	}
+	// Or a field, as in defaults := cfg sharing cfg.Endpoints.
+	for _, o := range in.objects {
+		for f, v := range o.fields {
+			if shares(v) {
+				o.fields[f] = vUnknown{}
+			}
+		}
+	}
+	for v, val := range in.globals {
+		if shares(val) {
+			in.globals[v] = vUnknown{}
 		}
 	}
 }
@@ -1498,6 +1528,11 @@ func (in *interp) ident(fr *frame, id *dst.Ident) value {
 // never written to, when it is a constant or a slice.
 func (in *interp) packageVar(v *types.Var) value {
 	if v.Pkg() == nil || v.Parent() != v.Pkg().Scope() || in.prog.written[v] {
+		return vUnknown{}
+	}
+	// A call it doesn't follow may have changed it, as
+	// sort.Strings(endpoints) does.
+	if _, changed := in.globalWrites[v].(vUnknown); changed {
 		return vUnknown{}
 	}
 	if in.structVars[v] {
@@ -2170,6 +2205,9 @@ func (in *interp) builtin(fr *frame, name string, c *dst.CallExpr) value {
 	switch name {
 	case "copy":
 		if len(c.Args) == 2 && plainExpr(c.Args[0]) {
+			if sl, ok := in.eval(fr, c.Args[0]).(vSlice); ok {
+				in.forgetAliases(fr, sl)
+			}
 			in.store(fr, c.Args[0], vUnknown{})
 		}
 		return vUnknown{}
@@ -2201,10 +2239,13 @@ func (in *interp) builtin(fr *frame, name string, c *dst.CallExpr) value {
 				if !ok {
 					return vUnknown{}
 				}
-				elems = append(elems, s.elems...)
+				for _, e := range s.elems {
+					elems = append(elems, in.copyValue(e))
+				}
 				continue
 			}
-			elems = append(elems, v)
+			// A struct appended by value is a copy.
+			elems = append(elems, in.copyData(a, v))
 		}
 		return vSlice{elems}
 	}

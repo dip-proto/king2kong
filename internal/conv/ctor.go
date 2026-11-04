@@ -40,6 +40,9 @@ type ctorItem struct {
 	param *types.Var // the parameter stored, for injections and cross-refs
 	expr  dst.Expr
 	text  string
+	// comments are the ones written above an initialization, which go
+	// with it into a hook.
+	comments []string
 }
 
 // ctorInfo is the analysis of one command constructor.
@@ -119,11 +122,14 @@ func (p *Plan) classifyStmt(ci *ctorInfo, s dst.Stmt) []ctorItem {
 		}
 		if s.Tok == token.ASSIGN && len(s.Lhs) == 1 && len(s.Rhs) == 1 {
 			if f, path := p.instanceField(ci, s.Lhs[0]); f != nil {
-				if touched && p.g.prog.isKingpinType(pkg.typeOf(s.Rhs[0])) {
+				// Storing the command's clause, as in c.cmd = cmd, goes
+				// with the registrations.
+				if p.g.prog.isKingpinType(pkg.typeOf(s.Rhs[0])) {
 					return []ctorItem{{kind: ctorRegistration, stmt: s}}
 				}
 				item := p.classifyInit(ci, f, s.Rhs[0])
 				item.stmt, item.path = s, path
+				item.comments = trimNewlines(s.Decs.Start)
 				if len(path) > 1 && item.kind != ctorResidue && item.kind != ctorCrossRef {
 					// Only plain values are moved to a nested field.
 					item.kind = ctorResidue
@@ -227,7 +233,9 @@ func (p *Plan) compositeInits(ci *ctorInfo, cl *dst.CompositeLit, t types.Type) 
 			items = append(items, p.compositeInits(ci, inner, f.Type())...)
 			continue
 		}
-		items = append(items, p.classifyInit(ci, f, val))
+		item := p.classifyInit(ci, f, val)
+		item.comments = trimNewlines(el.Decorations().Start)
+		items = append(items, item)
 	}
 	return items
 }

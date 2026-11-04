@@ -21,17 +21,38 @@ import (
 func (c *converter) hintsMethod(n *node, pkg *types.Package, typeName, recv string, imports map[string]string) (string, bool) {
 	var options, actions []string
 	for _, ch := range n.cl.children {
-		if ch.hintExpr == nil {
-			continue
+		var values, funcs []string
+		for _, h := range ch.hintSources {
+			if !c.movableTo(h.pkg, h.expr, pkg) {
+				return "", false
+			}
+			if h.action {
+				funcs = append(funcs, renderIn(h.expr, imports))
+			} else {
+				values = append(values, renderIn(h.expr, imports))
+			}
 		}
-		if !c.movableTo(ch.hintPkg, ch.hintExpr, pkg) {
-			return "", false
+		// kingpin offered the hints of every call, one after the other.
+		if len(values) > 0 {
+			entry := values[0]
+			if len(values) > 1 {
+				entry = "append([]string{}, " + values[0] + "...)"
+				for _, v := range values[1:] {
+					entry = "append(" + entry + ", " + v + "...)"
+				}
+			}
+			options = append(options, fmt.Sprintf("%s: %s,", strconv.Quote(ch.name), entry))
 		}
-		entry := fmt.Sprintf("%s: %s,", strconv.Quote(ch.name), renderIn(ch.hintExpr, imports))
-		if ch.hintAction {
-			actions = append(actions, entry)
-		} else {
-			options = append(options, entry)
+		if len(funcs) > 0 {
+			entry := funcs[0]
+			if len(funcs) > 1 {
+				calls := "append([]string{}, " + funcs[0] + "()...)"
+				for _, f := range funcs[1:] {
+					calls = "append(" + calls + ", " + f + "()...)"
+				}
+				entry = "func() []string {\nreturn " + calls + "\n}"
+			}
+			actions = append(actions, fmt.Sprintf("%s: %s,", strconv.Quote(ch.name), entry))
 		}
 	}
 	var src []string
@@ -63,7 +84,7 @@ func (%s *%s) HintActions() map[string]func() []string {
 // reportHints reports the hints of n that could not be kept.
 func (c *converter) reportHints(n *node) {
 	for _, ch := range n.cl.children {
-		if ch.hintExpr != nil {
+		if len(ch.hintSources) > 0 {
 			c.issue(ch.pos, "%s %q: its completion hints are computed from values the command's package cannot see; shell completion no longer offers them", ch.kind, ch.name)
 		}
 	}

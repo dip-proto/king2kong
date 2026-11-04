@@ -76,6 +76,9 @@ type ClauseModel struct {
 	Envar      string
 
 	boolFlag bool
+	// quoted is set for a value kingpin knew was a string but kong does
+	// not, such as a was-set wrapper.
+	quoted bool
 }
 
 // String returns the current value.
@@ -115,15 +118,13 @@ func (c *ClauseModel) FormatPlaceHolder() string {
 	if c.PlaceHolder != "" {
 		return c.PlaceHolder
 	}
-	if len(c.Default) > 0 {
-		ellipsis := ""
-		if len(c.Default) > 1 {
-			ellipsis = "..."
-		}
-		if c.isString() {
-			return strconv.Quote(c.Default[0]) + ellipsis
-		}
-		return c.Default[0] + ellipsis
+	switch {
+	case len(c.Default) > 0 && c.isString():
+		return quote(c.Default)
+	case len(c.Default) > 1:
+		return c.Default[0] + "..."
+	case len(c.Default) > 0:
+		return c.Default[0]
 	}
 	return strings.ToUpper(c.Name)
 }
@@ -132,10 +133,22 @@ func (c *ClauseModel) FormatPlaceHolder() string {
 // in placeholders.
 // Enums, paths and custom types were not.
 func (c *ClauseModel) isString() bool {
+	if c.quoted {
+		return true
+	}
 	if c.Value == nil || c.Value.Enum != "" || isPath(c.Value) || !c.Value.Target.IsValid() {
 		return false
 	}
 	return c.Value.Target.Type() == reflect.TypeOf("")
+}
+
+// quote shows a string default as kingpin did.
+func quote(defaults []string) string {
+	s := strconv.Quote(defaults[0])
+	if len(defaults) > 1 {
+		s += "..."
+	}
+	return s
 }
 
 // ArgGroupModel lists positional arguments.
@@ -344,9 +357,13 @@ func flagGroupModel(flags []*kong.Flag) *FlagGroupModel {
 func argGroup(args []*kong.Positional) *ArgGroupModel {
 	m := &ArgGroupModel{}
 	for _, a := range args {
-		m.Args = append(m.Args, clause(a, 0, "", false))
+		m.Args = append(m.Args, argClause(a))
 	}
 	return m
+}
+
+func argClause(a *kong.Positional) *ClauseModel {
+	return clause(a, 0, a.Tag.PlaceHolder, a.Tag.Hidden)
 }
 
 func clause(v *kong.Value, short rune, placeholder string, hidden bool) *ClauseModel {
@@ -365,6 +382,12 @@ func clause(v *kong.Value, short rune, placeholder string, hidden bool) *ClauseM
 	}
 	if len(v.Tag.Envs) > 0 {
 		c.Envar = v.Tag.Envs[0]
+	}
+	// The tool writes kingpin's quoted default as the placeholder of such
+	// a string value, to show it as kingpin did.
+	// The program did not set that placeholder.
+	if len(c.Default) > 0 && placeholder == quote(c.Default) {
+		c.PlaceHolder, c.quoted = "", true
 	}
 	return c
 }
@@ -461,15 +484,20 @@ func commandPath(ctx *kong.Context) []*kong.Node {
 // cumulative reports whether a value can be given several times: a slice, a
 // map, a counter, or a type whose IsCumulative method says so.
 func cumulative(v *kong.Value) bool {
-	if v.IsCumulative() || v.IsCounter() {
+	if v.IsCounter() {
 		return true
 	}
 	if v.Target.IsValid() && v.Target.CanAddr() {
-		if c, ok := v.Target.Addr().Interface().(interface{ IsCumulative() bool }); ok {
+		switch c := v.Target.Addr().Interface().(type) {
+		case interface{ IsCumulative() bool }:
 			return c.IsCumulative()
+		case kong.MapperValue:
+			// A custom value took one value in kingpin, unless it said
+			// otherwise, even when kong sees a map or a slice.
+			return false
 		}
 	}
-	return false
+	return v.IsCumulative()
 }
 
 // commandFlags are the flags of a command, in the order its FlagOrder

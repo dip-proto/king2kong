@@ -4,6 +4,7 @@ import (
 	"io"
 	"reflect"
 	"strings"
+	"sync"
 
 	"github.com/alecthomas/kong"
 )
@@ -25,6 +26,9 @@ type Application struct {
 	Grammar any
 
 	usage *UsageContext
+	// parsed is set once the command line was looked at, which is when
+	// kingpin added its help command.
+	parsed bool
 }
 
 // New builds a kong parser for cli, the struct that replaced the program's
@@ -134,7 +138,7 @@ func (a *Application) sync() {
 func (a *Application) GetFlag(name string) *FlagClause {
 	for _, f := range a.Kong.Model.Flags {
 		if f.Name == name {
-			return &FlagClause{f}
+			return newFlagClause(f)
 		}
 	}
 	return nil
@@ -145,6 +149,7 @@ func (a *Application) GetFlag(name string) *FlagClause {
 // See the Parse function for details.
 func (a *Application) Parse(args []string) (string, error) {
 	a.sync()
+	a.parsed = true
 	return Parse(a.Kong, args, a.usage)
 }
 
@@ -152,6 +157,7 @@ func (a *Application) Parse(args []string) (string, error) {
 // kingpin's ParseContext did.
 // It returns what it found and the error kingpin would have returned.
 func (a *Application) ParseContext(args []string) (*ParseContext, error) {
+	a.parsed = true
 	if version == 2 {
 		expanded, err := ExpandArgs(args)
 		if err != nil {
@@ -168,9 +174,20 @@ func (a *Application) ParseContext(args []string) (*ParseContext, error) {
 }
 
 // Model returns the data model usage templates see.
+// As with kingpin, the help command only shows once the command line was
+// parsed.
 func (a *Application) Model() *ApplicationModel {
 	a.sync()
 	m := Model(a.Kong.Model)
+	if !a.parsed {
+		var cmds []*CmdModel
+		for _, c := range m.Commands {
+			if !isHelpCommand(c.Node) {
+				cmds = append(cmds, c)
+			}
+		}
+		m.Commands = cmds
+	}
 	m.Version, m.Author = kongVar(a.Kong, "version"), kongVar(a.Kong, "author")
 	return m
 }
@@ -178,6 +195,7 @@ func (a *Application) Model() *ApplicationModel {
 // Usage prints the usage of the command args select.
 func (a *Application) Usage(args []string) {
 	a.sync()
+	a.parsed = true
 	PrintUsage(a.Kong, args, a.usage)
 }
 
@@ -302,12 +320,30 @@ type cmdMixin struct{ *flagGroup }
 
 type flagGroup struct{ long map[string]*FlagClause }
 
+// Each kong flag, argument and command keeps one clause, as in kingpin, so
+// code comparing them, as in element.Clause == app.HelpFlag, still works.
+var flagClauses, argClauses, cmdClauses sync.Map
+
+func newFlagClause(f *kong.Flag) *FlagClause {
+	c, _ := flagClauses.LoadOrStore(f, &FlagClause{f})
+	return c.(*FlagClause)
+}
+
+func newArgClause(a *kong.Positional) *ArgClause {
+	c, _ := argClauses.LoadOrStore(a, &ArgClause{a})
+	return c.(*ArgClause)
+}
+
 func newCmdClause(n *kong.Node) *CmdClause {
+	if c, ok := cmdClauses.Load(n); ok {
+		return c.(*CmdClause)
+	}
 	long := map[string]*FlagClause{}
 	for _, f := range n.Flags {
-		long[f.Name] = &FlagClause{f}
+		long[f.Name] = newFlagClause(f)
 	}
-	return &CmdClause{node: n, cmdMixin: cmdMixin{&flagGroup{long}}}
+	c, _ := cmdClauses.LoadOrStore(n, &CmdClause{node: n, cmdMixin: cmdMixin{&flagGroup{long}}})
+	return c.(*CmdClause)
 }
 
 // CommandOf returns the command whose struct is cmd, or nil.
@@ -378,7 +414,7 @@ type ArgClause struct{ arg *kong.Positional }
 
 // Model returns the argument's data model.
 func (a *ArgClause) Model() *ClauseModel {
-	return clause(a.arg, 0, "", false)
+	return argClause(a.arg)
 }
 
 func depth(n *kong.Node) int {
