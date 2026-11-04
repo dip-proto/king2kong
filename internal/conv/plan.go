@@ -561,7 +561,7 @@ func (p *Plan) tagFor(b *binding, fieldName string) *kongtag.Tag {
 	if isSlice && p.g.prog.kingpinV3 && (c.hasEnvar || defaultEnvar(c) != "") && !c.hasSep {
 		p.issue(c.pos, "%s %q: kingpin split its environment variable on %q, kong takes it whole", c.kind, c.name, string(os.PathListSeparator))
 	}
-	if (isSlice || isMap) && c.seeded {
+	if (isSlice || isMap) && (c.seeded || c.priorUnknown) {
 		p.issue(c.pos, "%s %q: its destination already holds values, which kingpin kept and added to, but kong replaces; set them by hand", c.kind, c.name)
 	}
 	if !c.hasDefault && !c.required && !isSlice {
@@ -574,7 +574,7 @@ func (p *Plan) tagFor(b *binding, fieldName string) *kongtag.Tag {
 		// what it left alone.
 		checked := len(c.enum) > 0 && !slices.Contains(c.enum, prior) || strings.HasPrefix(c.bind, "Existing")
 		switch {
-		case c.priorUnknown:
+		case c.priorUnknown && !isMap:
 			p.issue(c.pos, "%s %q: its destination holds a value computed before parsing, which kingpin kept when the flag was absent but kong resets; give it as the flag's default by hand", c.kind, c.name)
 		case ok && checked:
 			p.issue(c.pos, "%s %q: kingpin kept %q when it was absent, which kong would check as a default and reject; set it after parsing by hand", c.kind, c.name, prior)

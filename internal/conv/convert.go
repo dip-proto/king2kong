@@ -387,9 +387,17 @@ func Convert(prog *Program, opts Options) (*Result, error) {
 	}
 	// Flags report their own issues when they are bound; commands and the
 	// application are reported here.
+	holders := map[*object]*clause{}
 	for _, n := range c.tree.nodes {
 		for _, is := range append(n.cl.issues, n.cl.notes...) {
 			c.issue(n.cl.pos, "%s: %s", describeClause(n.cl), is)
+		}
+		// kong gives each command a struct of its own.
+		if o := n.cl.instance; o != nil {
+			if other := holders[o]; other != nil {
+				c.issue(n.cl.pos, "%s and %s keep their flags in the same struct, which kong would split in two; give each command a struct of its own by hand", describeClause(other), describeClause(n.cl))
+			}
+			holders[o] = n.cl
 		}
 	}
 	c.computeRegOnly()

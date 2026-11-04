@@ -611,9 +611,9 @@ func (in *interp) forgetReachable(fr *frame, n dst.Node, fns ...*types.Func) {
 					// A closure kept in a local, as load := func() {...}.
 					if !seen[o] {
 						seen[o] = true
-						for _, lit := range in.closuresOf(fr, o) {
-							markAll(lit.Body)
-							walk(lit)
+						for _, f := range in.closuresOf(fr, o) {
+							markAll(f)
+							walk(f)
 						}
 					}
 				}
@@ -635,19 +635,35 @@ func (in *interp) forgetReachable(fr *frame, n dst.Node, fns ...*types.Func) {
 	}
 }
 
-// closuresOf returns the function literals assigned to local v in the
-// function fr runs.
-func (in *interp) closuresOf(fr *frame, v *types.Var) []*dst.FuncLit {
+// closuresOf returns what is assigned to local v in the function fr runs
+// when it holds a function: a function literal, or a method value such as
+// cfg.load, whose receiver comes with it.
+func (in *interp) closuresOf(fr *frame, v *types.Var) []dst.Expr {
+	if _, isFunc := v.Type().Underlying().(*types.Signature); !isFunc {
+		return nil
+	}
 	fd, ok := in.prog.funcs[fr.fn]
 	if !ok || fd.decl.Body == nil {
 		return nil
 	}
-	var out []*dst.FuncLit
+	var out []dst.Expr
 	dst.Inspect(fd.decl.Body, func(n dst.Node) bool {
 		if as, ok := n.(*dst.AssignStmt); ok && len(as.Lhs) == len(as.Rhs) {
 			for i, l := range as.Lhs {
-				if lit, isLit := as.Rhs[i].(*dst.FuncLit); isLit && fr.pkg.objectOf(l) == v {
-					out = append(out, lit)
+				if fr.pkg.objectOf(l) != v {
+					continue
+				}
+				switch r := unparen(as.Rhs[i]).(type) {
+				case *dst.FuncLit:
+					out = append(out, r)
+				case *dst.SelectorExpr:
+					if _, isFunc := fr.pkg.objectOf(r.Sel).(*types.Func); isFunc {
+						out = append(out, r)
+					}
+				case *dst.Ident:
+					if _, isFunc := fr.pkg.objectOf(r).(*types.Func); isFunc {
+						out = append(out, r)
+					}
 				}
 			}
 		}
@@ -2351,11 +2367,20 @@ func (in *interp) call(fr *frame, c *dst.CallExpr) []value {
 		return in.inline(fr, c, fd, fn, recv, args, c.Ellipsis)
 	}
 	in.noteEscape(fr, c, args)
+	if readsOnly(fn) {
+		return in.opaqueResults(fn)
+	}
 	in.forgetPointed(fr, c, recv, args)
 	// A helper not followed may still change the package-level state it
 	// reaches, as loadConfig setting config.ReadOnly, directly, through
 	// an alias, through json.Unmarshal or as a callback.
 	in.forgetReachable(fr, c, fn)
+	return in.opaqueResults(fn)
+}
+
+// opaqueResults are the results of a call to fn the interpreter doesn't
+// follow.
+func (in *interp) opaqueResults(fn *types.Func) []value {
 	n := 1
 	if sig, ok := fn.Type().(*types.Signature); ok && sig.Results().Len() > 1 {
 		n = sig.Results().Len()
@@ -2365,6 +2390,22 @@ func (in *interp) call(fr *frame, c *dst.CallExpr) []value {
 		out[i] = in.opaque(resultType(fn, i), "result of "+fn.Name())
 	}
 	return out
+}
+
+// readsOnly reports whether fn only reads what it is given, as fmt.Printf
+// does, so nothing it reaches needs forgetting.
+func readsOnly(fn *types.Func) bool {
+	if fn == nil || fn.Pkg() == nil {
+		return false
+	}
+	switch fn.Pkg().Path() {
+	case "fmt":
+		// Print, Sprintf, Fprintln and the like, not the scanning functions.
+		return strings.Contains(fn.Name(), "rint") || fn.Name() == "Errorf"
+	case "log":
+		return strings.HasPrefix(fn.Name(), "Print") || strings.HasPrefix(fn.Name(), "Fatal") || strings.HasPrefix(fn.Name(), "Panic")
+	}
+	return false
 }
 
 func resultType(fn *types.Func, i int) types.Type {
@@ -2831,9 +2872,16 @@ func (in *interp) priorUnknown(dst value) bool {
 		_, ok := v.(vUnknown)
 		return ok
 	}
+	plain := func(t types.Type) bool {
+		switch t.Underlying().(type) {
+		case *types.Basic, *types.Slice, *types.Map:
+			return true
+		}
+		return false
+	}
 	switch d := dst.(type) {
 	case vVarPtr:
-		if _, basic := d.v.Type().Underlying().(*types.Basic); !basic {
+		if !plain(d.v.Type()) {
 			return false
 		}
 		if val, ok := in.varVals[d.v]; ok {
@@ -2845,7 +2893,7 @@ func (in *interp) priorUnknown(dst value) bool {
 		init, ok := in.prog.varInit[d.v]
 		return ok && callsAnything(init.pkg, init.expr)
 	case vFieldPtr:
-		if _, basic := d.f.Type().Underlying().(*types.Basic); !basic {
+		if !plain(d.f.Type()) {
 			return false
 		}
 		return unknown(d.o.fields[d.f])
