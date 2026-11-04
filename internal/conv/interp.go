@@ -128,8 +128,9 @@ type frame struct {
 	done  bool
 	// jump is the break or continue leaving the current loop iteration.
 	jump token.Token
-	// unknownIf is the last if statement whose condition was not known.
-	unknownIf *dst.IfStmt
+	// unknownIfs are the if statements whose condition was not known
+	// the last time they ran.
+	unknownIfs map[*dst.IfStmt]bool
 }
 
 func newInterp(prog *Program) *interp {
@@ -419,47 +420,87 @@ func (in *interp) opaque(t types.Type, site string) value {
 }
 
 func (in *interp) block(fr *frame, stmts []dst.Stmt) {
+	// A return ends the function, not the block: what it leaves to run
+	// keeps its condition after the block, as after
+	// if cfg != nil { if cfg.ReadOnly { return } }.
 	saved := fr.conds
-	defer func() { fr.conds = saved }()
+	var guards []cond
+	defer func() { fr.conds = append(append([]cond{}, saved...), guards...) }()
+	guard := func(c cond) {
+		c.fn, c.pkg = fr.fn, fr.pkg
+		guards = append(guards, c)
+		fr.conds = append(append([]cond{}, fr.conds...), c)
+	}
 	for _, s := range stmts {
 		if fr.done || fr.jump != 0 {
 			return
 		}
+		before := len(fr.conds)
 		in.stmt(fr, s)
+		// Guards a nested block left behind belong to this one too.
+		if len(fr.conds) > before {
+			guards = append(guards, fr.conds[before:]...)
+		}
 		// After if cond { return }, the rest only runs when cond is false.
 		// After if cond { ... } else { return }, only when it is true.
-		if g, ok := s.(*dst.IfStmt); ok && fr.unknownIf == g {
-			body := endsInReturn(g.Body)
-			other := false
-			if e, ok := g.Else.(*dst.BlockStmt); ok {
-				other = endsInReturn(e)
+		// The tool doesn't step into these, so what follows a return in
+		// them depends on something it doesn't follow.
+		switch t := s.(type) {
+		case *dst.SwitchStmt, *dst.TypeSwitchStmt, *dst.SelectStmt, *dst.ForStmt:
+			if countReturns(t) > 0 {
+				guard(cond{expr: decidingExpr(t), opaque: true})
 			}
+		}
+		if g, ok := s.(*dst.IfStmt); ok && fr.unknownIfs[g] {
+			bodyReturns, elseReturns := countReturns(g.Body), 0
+			if g.Else != nil {
+				elseReturns = countReturns(g.Else)
+			}
+			e, plainElse := g.Else.(*dst.BlockStmt)
 			switch {
-			case body != other:
-				fr.conds = append(append([]cond{}, fr.conds...), cond{expr: g.Cond, neg: body, fn: fr.fn, pkg: fr.pkg})
-			case !body && (returnsInside(g.Body) || g.Else != nil && returnsInside(g.Else)):
-				// A return deeper inside, as in if a { if b { return } },
-				// leaves a condition the tool doesn't follow.
-				fr.conds = append(append([]cond{}, fr.conds...), cond{expr: g.Cond, fn: fr.fn, pkg: fr.pkg, opaque: true})
+			case bodyReturns == 1 && endsInReturn(g.Body) && elseReturns == 0:
+				guard(cond{expr: g.Cond, neg: true})
+			case plainElse && elseReturns == 1 && endsInReturn(e) && bodyReturns == 0:
+				guard(cond{expr: g.Cond})
+			case bodyReturns+elseReturns > 0:
+				// Any other return, as in if a { if b { return } } or an
+				// else if that returns, leaves a condition the tool
+				// doesn't follow.
+				guard(cond{expr: g.Cond, opaque: true})
 			}
 		}
 	}
 }
 
-// returnsInside reports whether n holds a return statement, outside the
-// function literals it declares.
-func returnsInside(n dst.Node) bool {
-	found := false
+// decidingExpr is what decides whether a switch or loop returns, for reports.
+func decidingExpr(s dst.Stmt) dst.Expr {
+	switch s := s.(type) {
+	case *dst.SwitchStmt:
+		if s.Tag != nil {
+			return s.Tag
+		}
+	case *dst.ForStmt:
+		if s.Cond != nil {
+			return s.Cond
+		}
+	}
+	return dst.NewIdent("a return in the statement before")
+}
+
+// countReturns counts the return statements of n, outside the function
+// literals it declares.
+func countReturns(n dst.Node) int {
+	count := 0
 	dst.Inspect(n, func(n dst.Node) bool {
 		switch n.(type) {
 		case *dst.FuncLit:
 			return false
 		case *dst.ReturnStmt:
-			found = true
+			count++
 		}
-		return !found
+		return true
 	})
-	return found
+	return count
 }
 
 func endsInReturn(b *dst.BlockStmt) bool {
@@ -887,9 +928,10 @@ func (in *interp) ifStmt(fr *frame, s *dst.IfStmt) {
 		in.stmt(fr, s.Init)
 	}
 	b, known := in.truth(fr, s.Cond)
-	if !known {
-		fr.unknownIf = s
+	if fr.unknownIfs == nil {
+		fr.unknownIfs = map[*dst.IfStmt]bool{}
 	}
+	fr.unknownIfs[s] = !known
 	if known {
 		if b {
 			in.block(fr, s.Body.List)

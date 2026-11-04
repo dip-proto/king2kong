@@ -549,7 +549,7 @@ func (c *converter) conditionalOptions(root *Package, cliName string, imports ma
 		}
 		var parts []string
 		for _, cd := range cl.conds {
-			s, ok := c.renderCond(cd, imports)
+			s, ok := c.renderCond(cd, root.Types, imports)
 			if !ok {
 				c.issue(cl.pos, "%s %q is registered under a condition the tool cannot move: %s", cl.kind, cl.name, render(cd.expr))
 				return
@@ -621,8 +621,17 @@ func quoteAll(s []string) []string {
 // renderCond renders the condition under which a registration was skipped.
 // The generated option cannot see locals, so a local set from a side-effect
 // free call is replaced by the call.
-func (c *converter) renderCond(cd cond, imports map[string]string) (string, bool) {
+func (c *converter) renderCond(cd cond, to *types.Package, imports map[string]string) (string, bool) {
 	if cd.opaque {
+		return "", false
+	}
+	// The option is written in another package, which may not see what
+	// the condition names, as a private helper of the registering package.
+	fd, found := c.prog.funcs[cd.fn]
+	if !c.movableWith(cd.pkg, cd.expr, to, func(v *types.Var) bool {
+		init := c.localInit(cd, v)
+		return found && init != nil && c.movableTo(fd.pkg, init, to)
+	}) {
 		return "", false
 	}
 	e := dst.Clone(cd.expr).(dst.Expr)

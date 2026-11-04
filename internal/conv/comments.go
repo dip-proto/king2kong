@@ -40,6 +40,12 @@ func (c *converter) keepRegistrationComments() {
 		}
 	}
 	sections := c.groups
+	docs := map[*dst.StructType][]string{}
+	for _, loc := range c.ed.typeSpecs {
+		if st, ok := loc.spec.Type.(*dst.StructType); ok && loc.gen != nil {
+			docs[st] = append(slices.Clone(loc.gen.Decs.Start), loc.spec.Decs.Start...)
+		}
+	}
 	added := map[*dst.Field]bool{}
 	for _, loc := range c.shadowFields {
 		added[loc.field] = true
@@ -133,7 +139,7 @@ func (c *converter) keepRegistrationComments() {
 				}
 			}
 			comments = c.rebasePaths(comments, s, targets[0])
-			addHeading(targets[0], comments, members, added, original[targets[0].st])
+			addHeading(targets[0], comments, members, added, original[targets[0].st], docs[targets[0].st])
 			c.ed.touch(targets[0].pkg, targets[0].file)
 		}
 	}
@@ -338,15 +344,23 @@ func addNote(loc fieldLoc, comments []string) {
 // A heading the struct had before conversion, as when the struct and the
 // registrations were both split into required and optional parts, is not
 // repeated.
-func addHeading(loc fieldLoc, comments []string, members, added map[*dst.Field]bool, original []string) {
+func addHeading(loc fieldLoc, comments []string, members, added map[*dst.Field]bool, original, doc []string) {
+	in := func(l string, lines []string) bool {
+		return slices.ContainsFunc(lines, func(m string) bool { return sameComment(l, m) })
+	}
+	// What the struct's own documentation says already is not repeated.
+	for len(comments) > 0 && in(comments[0], doc) {
+		comments = comments[1:]
+	}
+	if len(comments) == 0 {
+		return
+	}
+	has := func(lines []string) bool {
+		return !slices.ContainsFunc(comments, func(l string) bool { return !in(l, lines) })
+	}
+	f := loc.field
 	// A heading left after the last field, with no field under it, is
 	// the one moving here.
-	f := loc.field
-	has := func(lines []string) bool {
-		return !slices.ContainsFunc(comments, func(l string) bool {
-			return !slices.ContainsFunc(lines, func(m string) bool { return sameComment(l, m) })
-		})
-	}
 	if last, i := trailing(loc.st); i >= 0 && slices.Equal(trimNewlines(last.Decs.End[i:]), comments) {
 		last.Decs.End = last.Decs.End[:i]
 	} else if has(original) {
@@ -354,7 +368,16 @@ func addHeading(loc fieldLoc, comments []string, members, added map[*dst.Field]b
 		// A field added for the same flags joins the group right before it
 		// when that group has the heading, and repeats it elsewhere.
 		if !added[f] {
-			return
+			f = nil
+			for _, g := range loc.st.Fields.List {
+				if members[g] && added[g] && !has(groupHeading(loc.st, g)) {
+					f = g
+					break
+				}
+			}
+			if f == nil {
+				return
+			}
 		}
 		if has(headingBefore(loc.st, f)) {
 			f.Decs.Before = dst.NewLine
@@ -414,6 +437,17 @@ func startsWith(comments, heading []string) bool {
 		}
 	}
 	return true
+}
+
+// groupHeading returns the comments above the group of fields holding f.
+func groupHeading(st *dst.StructType, f *dst.Field) []string {
+	list := st.Fields.List
+	for j := slices.Index(list, f); j >= 0; j-- {
+		if j == 0 || list[j].Decs.Before == dst.EmptyLine {
+			return list[j].Decs.Start
+		}
+	}
+	return nil
 }
 
 // headingBefore returns the comments above the group of fields that ends

@@ -630,9 +630,15 @@ func (p *Plan) tagFor(b *binding, fieldName string) *kongtag.Tag {
 	} else if env := defaultEnvar(c); env != "" {
 		t.Set("env", kongtag.Interpolated(env))
 	}
-	if len(c.hints) > 0 {
+	hints := c.hints
+	if len(hints) == 0 && len(c.hintSources) == 0 && hookEnum && !slices.ContainsFunc(c.enum, func(v string) bool { return strings.Contains(v, ",") }) {
+		// kingpin completed an enum with its values, which an enum checked
+		// in a hook has no enum tag to give.
+		hints = c.enum
+	}
+	if len(hints) > 0 {
 		// kongcompat's completion offers them, as kingpin did.
-		t.Set("hints", kongtag.Interpolated(strings.Join(c.hints, ",")))
+		t.Set("hints", kongtag.Interpolated(strings.Join(hints, ",")))
 	}
 	if c.hasFormat {
 		t.Set("format", c.format)
