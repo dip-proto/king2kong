@@ -30,6 +30,32 @@ func (in *interp) contextFree(p *Package, e dst.Expr) bool {
 	return ok
 }
 
+// readyAtNew reports whether e, computed from locals of the function that
+// created the application, gives the same value where kingpin.New was.
+// That holds when they were all declared before it and none changed since,
+// as in a configuration loaded before New.
+// The default can then be computed where the parser is built.
+func (in *interp) readyAtNew(fr *frame, e dst.Expr) bool {
+	if fr.fn == nil || fr.fn != in.newFn {
+		return false
+	}
+	ok := true
+	dst.Inspect(e, func(n dst.Node) bool {
+		if _, isLit := n.(*dst.FuncLit); isLit {
+			ok = false
+		}
+		if id, isIdent := n.(*dst.Ident); isIdent && ok {
+			if v, isVar := fr.pkg.objectOf(id).(*types.Var); isVar && !v.IsField() && v.Parent() != nil && v.Parent() != v.Pkg().Scope() {
+				if in.app == nil || v.Pos() > in.newPos || in.changedAfterNew[v] {
+					ok = false
+				}
+			}
+		}
+		return ok
+	})
+	return ok
+}
+
 // hintOptionsExpr returns the values given to HintOptions as a []string
 // expression.
 // It reuses the call's own nodes to keep their type information.
@@ -67,6 +93,10 @@ func (in *interp) kingpinFunc(fr *frame, c *dst.CallExpr, name string, args []va
 		}
 		in.app = app
 		in.apps = append(in.apps, app)
+		in.newFn, in.changedAfterNew = fr.fn, map[types.Object]bool{}
+		if a := fr.pkg.astOf(c); a != nil {
+			in.newPos = a.Pos()
+		}
 		return []value{vClause{app}}
 	case "Separator":
 		in.grammarCalls[c] = true
@@ -141,6 +171,7 @@ func (in *interp) takePriors() {
 	for _, cl := range in.clauses {
 		if cl.dst != nil && !cl.priorTaken {
 			cl.prior, cl.hasPrior = in.priorDefault(cl.dst)
+			cl.seeded = in.seeded(cl.dst)
 			cl.priorTaken = true
 		}
 	}
@@ -272,8 +303,8 @@ func (in *interp) kingpinMethod(fr *frame, c *dst.CallExpr, cl *clause, name str
 			cl.hasDefault, cl.defaults, cl.defaultExpr = true, nil, nil
 			if len(args) == 1 {
 				if _, isSlice := args[0].(vSlice); !isSlice {
-					if _, ok := constString(args[0]); !ok && len(c.Args) == 1 {
-						if in.contextFree(fr.pkg, c.Args[0]) {
+					if _, ok := constString(args[0]); !ok && len(c.Args) == 1 && !c.Ellipsis {
+						if in.contextFree(fr.pkg, c.Args[0]) || in.readyAtNew(fr, c.Args[0]) {
 							cl.defaultExpr, cl.exprPkg = c.Args[0], fr.pkg
 							in.moved[c.Args[0]] = true
 							in.evaluations++

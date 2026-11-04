@@ -29,7 +29,10 @@ func (c *converter) convertVars() {
 	root := c.tree.RootPkg.Types
 	byClause := map[*clause][]runtimeVar{}
 	for _, v := range c.plan.vars {
-		if c.main != nil && v.pkg.Types == root && c.movableTo(v.pkg, v.expr, root) {
+		// A default computed from locals of main, such as a configuration
+		// loaded before kingpin.New, is computed where main builds the
+		// parser, which is where kingpin.New was.
+		if c.main != nil && v.pkg.Types == root && c.movableWith(v.pkg, v.expr, root, c.visibleAtParser) {
 			c.main.vars = append(c.main.vars, v)
 			continue
 		}

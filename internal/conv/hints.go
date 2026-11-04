@@ -56,6 +56,11 @@ func (c *converter) reportHints(n *node) {
 // That holds when it only names package-level things of to, exported things
 // of other packages, and what it declares itself.
 func (c *converter) movableTo(from *Package, e dst.Expr, to *types.Package) bool {
+	return c.movableWith(from, e, to, nil)
+}
+
+// movableWith is movableTo where the locals local accepts are fine too.
+func (c *converter) movableWith(from *Package, e dst.Expr, to *types.Package, local func(*types.Var) bool) bool {
 	ok := true
 	a := from.astOf(e)
 	dst.Inspect(e, func(n dst.Node) bool {
@@ -76,7 +81,8 @@ func (c *converter) movableTo(from *Package, e dst.Expr, to *types.Package) bool
 			}
 		case a != nil && o.Pos() >= a.Pos() && o.Pos() <= a.End():
 		default:
-			ok = false
+			v, isVar := o.(*types.Var)
+			ok = isVar && local != nil && local(v)
 		}
 		return ok
 	})

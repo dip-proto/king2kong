@@ -60,6 +60,11 @@ type interp struct {
 	// paramVals is the value each parameter got, or vUnknown when calls
 	// passed different ones.
 	paramVals map[types.Object]value
+	// newFn and newPos are where the last application was created, and
+	// changedAfterNew the variables written since.
+	newFn           *types.Func
+	newPos          token.Pos
+	changedAfterNew map[types.Object]bool
 	// eltVals is the value of each element of the slice literals that ran,
 	// or vUnknown when it changed from one run to another.
 	eltVals map[dst.Expr]value
@@ -629,17 +634,22 @@ func (in *interp) copyStruct(src *object) (*object, bool) {
 
 // plainData reports whether o holds only plain data, in structs it holds by
 // value included.
+// Pointers count too: the copy shares what they point to, as in Go.
 func plainData(o *object) bool {
 	if o.st == nil {
 		return false
 	}
 	for _, v := range o.fields {
-		if inner, ok := v.(vObj); ok {
-			if inner.o.parent != o || !plainData(inner.o) {
+		switch v := v.(type) {
+		case vObj:
+			if v.o.parent != o || !plainData(v.o) {
 				return false
 			}
-		} else if !isData(v) {
-			return false
+		case vPtr:
+		default:
+			if !isData(v) {
+				return false
+			}
 		}
 	}
 	return true
@@ -663,6 +673,7 @@ func (in *interp) copyPlain(src *object) *object {
 }
 
 func (in *interp) store(fr *frame, lhs dst.Expr, v value) {
+	in.markChanged(fr, lhs)
 	switch l := lhs.(type) {
 	case *dst.Ident:
 		if l.Name == "_" {
@@ -702,8 +713,46 @@ func (in *interp) store(fr *frame, lhs dst.Expr, v value) {
 	case *dst.StarExpr:
 		// Ignored: only structs are tracked through pointers, and they
 		// are shared, not copied.
+	case *dst.IndexExpr:
+		// An element of a list or a map, as in endpoints[0] = url: the
+		// whole collection is no longer known.
+		if plainExpr(l.X) {
+			in.store(fr, l.X, vUnknown{})
+		}
 	case *dst.ParenExpr:
 		in.store(fr, l.X, v)
+	}
+}
+
+// markChanged records that the variable e writes to, as x in x.Name or
+// x[0], changed after the application was created.
+func (in *interp) markChanged(fr *frame, e dst.Expr) {
+	if in.changedAfterNew == nil {
+		return
+	}
+	for {
+		switch x := e.(type) {
+		case *dst.SelectorExpr:
+			e = x.X
+			continue
+		case *dst.IndexExpr:
+			e = x.X
+			continue
+		case *dst.StarExpr:
+			e = x.X
+			continue
+		case *dst.ParenExpr:
+			e = x.X
+			continue
+		case *dst.UnaryExpr:
+			e = x.X
+			continue
+		case *dst.Ident:
+			if o := fr.pkg.objectOf(x); o != nil {
+				in.changedAfterNew[o] = true
+			}
+		}
+		return
 	}
 }
 
@@ -953,6 +1002,14 @@ func equalValues(a, b value) (equal, known bool) {
 // for code it does not follow.
 func (in *interp) forgetWrites(fr *frame, n dst.Node) {
 	forget := func(l dst.Expr) {
+		in.markChanged(fr, l)
+		for {
+			ix, ok := unparen(l).(*dst.IndexExpr)
+			if !ok {
+				break
+			}
+			l = ix.X
+		}
 		v, ok := fr.pkg.objectOf(unparen(l)).(*types.Var)
 		if !ok || v.Pkg() == nil {
 			return
@@ -1005,14 +1062,16 @@ func (in *interp) forgetWrites(fr *frame, n dst.Node) {
 // withPrefix(&spec), and the data fields of structs passed by pointer.
 // Fields holding kingpin values are kept, since helpers rarely replace
 // those and commands need them to stay reachable.
-// Structs nested by value are only gone through for calls into other
-// packages, such as json.Unmarshal(data, &cfg), since the program's own
-// helpers rarely fill a whole configuration.
+// The structs they reach are gone through as well, as a configuration
+// loader like json.Unmarshal(data, &cfg) fills them all.
 func (in *interp) forgetPointed(fr *frame, c *dst.CallExpr, recv value, args []value) {
-	fn := in.staticCallee(fr.pkg, c)
-	deep := fn != nil && !in.prog.owns(fn.Pkg())
+	seen := map[*object]bool{}
 	var forgetFields func(o *object)
 	forgetFields = func(o *object) {
+		if seen[o] {
+			return
+		}
+		seen[o] = true
 		// A missing field reads as its zero value, so it is marked unknown.
 		for i := range o.st.NumFields() {
 			f := o.st.Field(i)
@@ -1022,14 +1081,18 @@ func (in *interp) forgetPointed(fr *frame, c *dst.CallExpr, recv value, args []v
 				case *types.Basic, *types.Slice:
 					o.fields[f] = vUnknown{}
 				case *types.Struct:
-					if deep && v == nil {
+					if v == nil {
 						sub := in.newObject(f.Type(), false, o.site+"."+f.Name())
 						sub.parent, sub.pfield = o, f
 						o.fields[f] = vObj{sub}
 					}
 				}
 			case vObj:
-				if deep && v.o.parent == o && v.o.st != nil {
+				if v.o.st != nil {
+					forgetFields(v.o)
+				}
+			case vPtr:
+				if v.o.st != nil {
 					forgetFields(v.o)
 				}
 			}
@@ -1049,7 +1112,13 @@ func (in *interp) forgetPointed(fr *frame, c *dst.CallExpr, recv value, args []v
 		}
 	}
 	forgetObject(recv)
+	if sel, ok := c.Fun.(*dst.SelectorExpr); ok {
+		in.markChanged(fr, sel.X)
+	}
 	for i, a := range c.Args {
+		if isAddress(a) {
+			in.markChanged(fr, a)
+		}
 		if u, ok := unparen(a).(*dst.UnaryExpr); ok && u.Op == token.AND {
 			if v, ok := fr.pkg.objectOf(unparen(u.X)).(*types.Var); ok && !v.IsField() {
 				if _, isStruct := typeUnder(v.Type()).(*types.Struct); !isStruct {
@@ -2088,6 +2157,39 @@ func calleeName(c *dst.CallExpr) string {
 
 // priorDefault returns the non-zero constant a flag's destination already
 // holds before parsing, written the way a kong default tag expects it.
+// seeded reports whether dst already holds something kong would reset: a
+// list or a map with values, like []string{"/etc/example"}, or a custom
+// value with fields set, like dateValue{Layout: "2006-01-02"}.
+func (in *interp) seeded(dst value) bool {
+	if p, ok := dst.(vPtr); ok && p.o.st != nil {
+		for _, v := range p.o.fields {
+			switch v := v.(type) {
+			case vConst:
+				if !isZeroConst(v) {
+					return true
+				}
+			case vSlice:
+				if len(v.elems) > 0 {
+					return true
+				}
+			}
+		}
+		return false
+	}
+	fp, ok := dst.(vFieldPtr)
+	if !ok {
+		return false
+	}
+	switch v := fp.o.fields[fp.f].(type) {
+	case vSlice:
+		return len(v.elems) > 0
+	case vUnknown:
+		_, isMap := typeUnder(fp.f.Type()).(*types.Map)
+		return isMap && fp.o.known
+	}
+	return false
+}
+
 func (in *interp) priorDefault(dst value) (string, bool) {
 	var v value
 	var t types.Type

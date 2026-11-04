@@ -941,7 +941,7 @@ func (c *converter) settingsChain(p *Package, call *dst.CallExpr) (dst.Expr, boo
 			}
 			return c.mustCall(append(c.parserArgs(appName, help), opts...)), true
 		}
-		if !configNames[name] {
+		if !configNames[name] && (name != "Action" || c.genActions[c.tree.Root] == nil) {
 			break
 		}
 		switch name {
@@ -1588,7 +1588,17 @@ func (c *converter) rewriteCall(p *Package, cur *dstutil.Cursor, call *dst.CallE
 		return false
 	case "":
 		return false
-	case "Validate", "PreAction", "Action", "Interspersed", "OptionalSubcommands", "UsageFuncs", "UsageContext":
+	case "Action":
+		// The application's own Action, chained onto kingpin.New, is now
+		// the CLI's AfterApply hook.
+		if c.genActions[c.tree.Root] != nil {
+			if e, ok := c.settingsChain(p, call); ok {
+				cur.Replace(e)
+				return true
+			}
+		}
+		return false
+	case "Validate", "PreAction", "Interspersed", "OptionalSubcommands", "UsageFuncs", "UsageContext":
 		// Reported with the grammar.
 		return false
 	default:

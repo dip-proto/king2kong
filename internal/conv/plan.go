@@ -561,6 +561,9 @@ func (p *Plan) tagFor(b *binding, fieldName string) *kongtag.Tag {
 	if isSlice && p.g.prog.kingpinV3 && (c.hasEnvar || defaultEnvar(c) != "") && !c.hasSep {
 		p.issue(c.pos, "%s %q: kingpin split its environment variable on %q, kong takes it whole", c.kind, c.name, string(os.PathListSeparator))
 	}
+	if (isSlice || isMap) && c.seeded {
+		p.issue(c.pos, "%s %q: its destination already holds values, which kingpin kept and added to, but kong replaces; set them by hand", c.kind, c.name)
+	}
 	if !c.hasDefault && !c.required && !isSlice {
 		// kingpin left a destination alone when its flag was absent, but
 		// kong resets it, so the value it held becomes the default.
@@ -651,6 +654,9 @@ func (p *Plan) tagFor(b *binding, fieldName string) *kongtag.Tag {
 			t.Set("type", "noflag")
 		}
 	case "SetValue":
+		if c.seeded {
+			p.issue(c.pos, "%s %q: its custom value starts with fields set, which kong resets before calling Set; set them in a hook by hand", c.kind, c.name)
+		}
 		if !p.g.prog.kingpinV3 && c.kind == kindFlag && boolLike(b) {
 			// kingpin v2 accepts --no-x for custom booleans too.
 			t.Flag("negatable")

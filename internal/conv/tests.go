@@ -119,7 +119,9 @@ func (c *converter) convertTests(renames map[*types.Var]string) error {
 		p := &Package{Package: dp, names: c.prog.Packages[0].names}
 		for _, f := range dp.Syntax {
 			name := dp.Decorator.Filenames[f]
-			if !c.kingpinTests[name] || done[name] {
+			// The other tests of the package may use the application a
+			// kingpin test builds, as with a shared newTestApp helper.
+			if !dirs[filepath.Dir(name)] || !strings.HasSuffix(name, "_test.go") || done[name] {
 				continue
 			}
 			done[name] = true
@@ -128,6 +130,11 @@ func (c *converter) convertTests(renames map[*types.Var]string) error {
 			if err != nil {
 				c.issue(token.Position{Filename: name}, "converting this test: %v", err)
 				continue
+			}
+			if !c.kingpinTests[name] {
+				if old, err := os.ReadFile(name); err == nil && string(old) == src {
+					continue
+				}
 			}
 			c.res.Files[name] = src
 		}

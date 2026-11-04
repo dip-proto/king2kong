@@ -219,16 +219,19 @@ func keepUnselected(k *kong.Kong, path []*kong.Node) (restore func()) {
 // overrides it.
 // It also ignored the defaults of given values, and only split environment
 // variables and default lists at newlines, never a given value.
+// A list's environment variable was split into lines, without the line
+// endings at the end.
 // Only the parser's view changes, the environment is left as is.
 func readLikeKingpin(k *kong.Kong, given map[*kong.Value]bool) (restore func()) {
 	type saved struct {
 		envs        []string
 		hasDefault  bool
+		def         string
 		sep, mapSep rune
 	}
 	changed := map[*kong.Value]saved{}
 	values(k.Model.Node, func(v *kong.Value) {
-		before := saved{v.Tag.Envs, v.HasDefault, v.Tag.Sep, v.Tag.MapSep}
+		before := saved{v.Tag.Envs, v.HasDefault, v.Default, v.Tag.Sep, v.Tag.MapSep}
 		var keep []string
 		for _, e := range v.Tag.Envs {
 			if val, ok := os.LookupEnv(e); !ok || val != "" && !given[v] {
@@ -238,6 +241,15 @@ func readLikeKingpin(k *kong.Kong, given map[*kong.Value]bool) (restore func()) 
 		if len(keep) != len(v.Tag.Envs) {
 			v.Tag.Envs = keep
 			changed[v] = before
+		}
+		// kingpin split a list's environment variable into lines, ignoring
+		// the line endings at the end, so kong gets those lines as a
+		// default.
+		if text, ok := envValue(v); ok && !given[v] && (v.Tag.Sep == '\n' || v.Tag.MapSep == '\n') {
+			if lines := strings.TrimRight(strings.ReplaceAll(text, "\r\n", "\n"), "\n"); lines != text {
+				v.Tag.Envs, v.HasDefault, v.Default = nil, true, lines
+				changed[v] = before
+			}
 		}
 		if given[v] {
 			v.HasDefault = false
@@ -252,7 +264,7 @@ func readLikeKingpin(k *kong.Kong, given map[*kong.Value]bool) (restore func()) 
 	})
 	return func() {
 		for v, s := range changed {
-			v.Tag.Envs, v.HasDefault, v.Tag.Sep, v.Tag.MapSep = s.envs, s.hasDefault, s.sep, s.mapSep
+			v.Tag.Envs, v.HasDefault, v.Default, v.Tag.Sep, v.Tag.MapSep = s.envs, s.hasDefault, s.def, s.sep, s.mapSep
 		}
 	}
 }
