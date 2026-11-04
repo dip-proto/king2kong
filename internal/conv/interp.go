@@ -496,43 +496,196 @@ func decidingExpr(s dst.Stmt) dst.Expr {
 // program it calls or hands over name.
 // Structs built in place keep their identity, so flags can still write to
 // them, and initializers that may register flags are not run again.
-func (in *interp) forgetReachable(p *Package, n dst.Node) {
-	forget := func(v *types.Var) {
-		if init, ok := in.prog.varInit[v]; in.structVars[v] || ok && builtInPlace(init.pkg, init.expr) {
-			switch val := in.packageVar(v).(type) {
-			case vPtr:
-				if val.o.st != nil {
-					in.forgetFields(val.o, false, map[*object]bool{})
-				}
-			case vObj:
-				if val.o.st != nil {
-					in.forgetFields(val.o, false, map[*object]bool{})
-				}
+func (in *interp) forgetReachable(fr *frame, n dst.Node, fns ...*types.Func) {
+	p := fr.pkg
+	forgetObject := func(v value) bool {
+		switch val := v.(type) {
+		case vPtr:
+			if val.o.st != nil {
+				in.forgetFields(val.o, false, map[*object]bool{})
 			}
+			return true
+		case vObj:
+			if val.o.st != nil {
+				in.forgetFields(val.o, false, map[*object]bool{})
+			}
+			return true
+		}
+		return false
+	}
+	seen := map[types.Object]bool{}
+	var forgetGlobal func(v *types.Var)
+	forgetGlobal = func(v *types.Var) {
+		if seen[v] {
 			return
+		}
+		seen[v] = true
+		init, ok := in.prog.varInit[v]
+		// An initializer calling nothing, as &settings{}, config or
+		// loadConfig, can be read without running anything.
+		// A struct built in place is shared by every reader; another
+		// initializer calling nothing, as an alias of such a struct, can be
+		// read without running anything.
+		if in.structVars[v] || ok && builtInPlace(init.pkg, init.expr) {
+			if forgetObject(in.packageVar(v)) {
+				return
+			}
+		} else if ok && !callsAnything(init.pkg, init.expr) && forgetObject(in.eval(&frame{pkg: init.pkg, vars: map[types.Object]value{}}, init.expr)) {
+			return
+		}
+		if ok {
+			// A variable holding a function, as loader = loadConfig.
+			dst.Inspect(init.expr, func(n dst.Node) bool {
+				if id, isIdent := n.(*dst.Ident); isIdent {
+					if f, isFunc := init.pkg.objectOf(id).(*types.Func); isFunc {
+						for _, g := range in.globalsUsed(f) {
+							forgetGlobal(g)
+						}
+					}
+				}
+				return true
+			})
 		}
 		switch typeUnder(v.Type()).(type) {
 		case *types.Basic, *types.Slice, *types.Map, *types.Array:
 			in.globalWrites[v] = vUnknown{}
 		}
 	}
-	dst.Inspect(n, func(n dst.Node) bool {
-		id, ok := n.(*dst.Ident)
-		if !ok {
-			return true
+	forgetLocal := func(v *types.Var) {
+		if seen[v] {
+			return
 		}
-		switch o := p.objectOf(id).(type) {
-		case *types.Var:
-			if o.Pkg() != nil && o.Parent() == o.Pkg().Scope() {
-				forget(o)
+		seen[v] = true
+		if forgetObject(fr.vars[v]) {
+			return
+		}
+		switch typeUnder(v.Type()).(type) {
+		case *types.Basic, *types.Slice, *types.Map, *types.Array:
+			fr.vars[v] = vUnknown{}
+			in.varVals[v] = vUnknown{}
+		}
+	}
+	// Locals a closure captures, or a method value is bound to, can
+	// change when it runs later.
+	captured := map[*dst.Ident]bool{}
+	called := map[dst.Expr]bool{}
+	markAll := func(n dst.Node) {
+		dst.Inspect(n, func(k dst.Node) bool {
+			if id, ok := k.(*dst.Ident); ok {
+				captured[id] = true
 			}
-		case *types.Func:
-			for _, v := range in.globalsUsed(o) {
-				forget(v)
+			return true
+		})
+	}
+	dst.Inspect(n, func(m dst.Node) bool {
+		switch m := m.(type) {
+		case *dst.FuncLit:
+			markAll(m.Body)
+		case *dst.CallExpr:
+			called[m.Fun] = true
+		case *dst.SelectorExpr:
+			if f, ok := p.objectOf(m.Sel).(*types.Func); ok && !called[m] && f.Type().(*types.Signature).Recv() != nil {
+				if id := rootIdentOf(m.X); id != nil {
+					captured[id] = true
+				}
 			}
 		}
 		return true
 	})
+	var walk func(n dst.Node)
+	walk = func(n dst.Node) {
+		dst.Inspect(n, func(n dst.Node) bool {
+			id, ok := n.(*dst.Ident)
+			if !ok {
+				return true
+			}
+			switch o := p.objectOf(id).(type) {
+			case *types.Var:
+				switch {
+				case o.Pkg() != nil && o.Parent() == o.Pkg().Scope():
+					forgetGlobal(o)
+				case o.IsField():
+				case captured[id]:
+					forgetLocal(o)
+				default:
+					// A closure kept in a local, as load := func() {...}.
+					if !seen[o] {
+						seen[o] = true
+						for _, lit := range in.closuresOf(fr, o) {
+							markAll(lit.Body)
+							walk(lit)
+						}
+					}
+				}
+			case *types.Func:
+				for _, v := range in.globalsUsed(o) {
+					forgetGlobal(v)
+				}
+			}
+			return true
+		})
+	}
+	walk(n)
+	// The function a call resolved to, as loadConfig in
+	// load := loadConfig; load().
+	for _, f := range fns {
+		for _, v := range in.globalsUsed(f) {
+			forgetGlobal(v)
+		}
+	}
+}
+
+// closuresOf returns the function literals assigned to local v in the
+// function fr runs.
+func (in *interp) closuresOf(fr *frame, v *types.Var) []*dst.FuncLit {
+	fd, ok := in.prog.funcs[fr.fn]
+	if !ok || fd.decl.Body == nil {
+		return nil
+	}
+	var out []*dst.FuncLit
+	dst.Inspect(fd.decl.Body, func(n dst.Node) bool {
+		if as, ok := n.(*dst.AssignStmt); ok && len(as.Lhs) == len(as.Rhs) {
+			for i, l := range as.Lhs {
+				if lit, isLit := as.Rhs[i].(*dst.FuncLit); isLit && fr.pkg.objectOf(l) == v {
+					out = append(out, lit)
+				}
+			}
+		}
+		return true
+	})
+	return out
+}
+
+// rootIdentOf is the variable an expression such as config.loader.load
+// starts from, or nil.
+func rootIdentOf(e dst.Expr) *dst.Ident {
+	for {
+		switch x := unparen(e).(type) {
+		case *dst.Ident:
+			return x
+		case *dst.SelectorExpr:
+			e = x.X
+		default:
+			return nil
+		}
+	}
+}
+
+// callsAnything reports whether evaluating e calls a function, which new
+// does not count as.
+func callsAnything(p *Package, e dst.Expr) bool {
+	found := false
+	dst.Inspect(e, func(n dst.Node) bool {
+		if c, ok := n.(*dst.CallExpr); ok {
+			if id, isIdent := c.Fun.(*dst.Ident); !isIdent || id.Name != "new" || types.Universe.Lookup("new") != p.objectOf(id) {
+				if tv, ok := p.tv(c.Fun); !ok || !tv.IsType() {
+					found = true
+				}
+			}
+		}
+		return !found
+	})
+	return found
 }
 
 // globalsUsed returns the package-level variables fn and the functions of
@@ -1290,7 +1443,7 @@ func equalValues(a, b value) (equal, known bool) {
 // forgetWrites drops what the interpreter knows of the variables n assigns,
 // for code it does not follow.
 func (in *interp) forgetWrites(fr *frame, n dst.Node) {
-	in.forgetReachable(fr.pkg, n)
+	in.forgetReachable(fr, n)
 	forget := func(l dst.Expr) {
 		in.markChanged(fr, l)
 		// *cfg = Config{...}: every field of what cfg points to.
@@ -2184,6 +2337,7 @@ func (in *interp) call(fr *frame, c *dst.CallExpr) []value {
 	if fn == nil {
 		in.noteEscape(fr, c, args)
 		in.forgetPointed(fr, c, recv, args)
+		in.forgetReachable(fr, c)
 		return []value{vUnknown{}}
 	}
 	if v, ok := foldCall(fn, args, c.Ellipsis); ok {
@@ -2201,7 +2355,7 @@ func (in *interp) call(fr *frame, c *dst.CallExpr) []value {
 	// A helper not followed may still change the package-level state it
 	// reaches, as loadConfig setting config.ReadOnly, directly, through
 	// an alias, through json.Unmarshal or as a callback.
-	in.forgetReachable(fr.pkg, c)
+	in.forgetReachable(fr, c, fn)
 	n := 1
 	if sig, ok := fn.Type().(*types.Signature); ok && sig.Results().Len() > 1 {
 		n = sig.Results().Len()
@@ -2638,6 +2792,16 @@ func (in *interp) seeded(dst value) bool {
 }
 
 func (in *interp) priorDefault(dst value) (string, bool) {
+	v, t := in.priorValue(dst)
+	c, ok := v.(vConst)
+	if !ok || c.c == nil || t == nil {
+		return "", false
+	}
+	return constantDefault(c, t)
+}
+
+// priorValue returns what a flag destination holds, and its type.
+func (in *interp) priorValue(dst value) (value, types.Type) {
 	var v value
 	var t types.Type
 	switch d := dst.(type) {
@@ -2656,10 +2820,11 @@ func (in *interp) priorDefault(dst value) (string, bool) {
 		t = d.f.Type()
 		v = d.o.fields[d.f]
 	}
-	c, ok := v.(vConst)
-	if !ok || c.c == nil || t == nil {
-		return "", false
-	}
+	return v, t
+}
+
+// constantDefault writes a destination's constant value as a default.
+func constantDefault(c vConst, t types.Type) (string, bool) {
 	// A time.Duration is written the way kong parses it, as in 1m30s.
 	if named, ok := types.Unalias(t).(*types.Named); ok && named.Obj().Pkg() != nil && named.Obj().Pkg().Path() == "time" && named.Obj().Name() == "Duration" {
 		n, exact := constant.Int64Val(constant.ToInt(c.c))

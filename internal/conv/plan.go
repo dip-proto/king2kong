@@ -574,6 +574,8 @@ func (p *Plan) tagFor(b *binding, fieldName string) *kongtag.Tag {
 		// what it left alone.
 		checked := len(c.enum) > 0 && !slices.Contains(c.enum, prior) || strings.HasPrefix(c.bind, "Existing")
 		switch {
+		case c.priorUnknown:
+			p.issue(c.pos, "%s %q: its destination holds a value computed before parsing, which kingpin kept when the flag was absent but kong resets; give it as the flag's default by hand", c.kind, c.name)
 		case ok && checked:
 			p.issue(c.pos, "%s %q: kingpin kept %q when it was absent, which kong would check as a default and reject; set it after parsing by hand", c.kind, c.name, prior)
 		case ok:

@@ -104,6 +104,8 @@ type clause struct {
 	prior      string
 	hasPrior   bool
 	priorTaken bool
+	// priorUnknown is set when dst held a value only known at run time.
+	priorUnknown bool
 	// seeded is set when dst already held values kong would reset: a list
 	// or a map kingpin added to, or a custom value with fields set.
 	seeded  bool

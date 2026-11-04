@@ -313,7 +313,7 @@ func (p *Plan) commandTag(n *node, field string) *kongtag.Tag {
 	if c.defaultCmd {
 		// kingpin parsed whatever followed into the default command, which
 		// kong only allows with "withargs".
-		if len(c.args()) > 0 || len(n.children) > 0 {
+		if len(c.args()) > 0 || len(c.flags()) > 0 || len(n.children) > 0 {
 			t.Set("default", "withargs")
 		} else {
 			t.Set("default", "1")
