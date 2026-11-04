@@ -1973,7 +1973,7 @@ func (c *converter) residueHook(ci *ctorInfo, it ctorItem) bool {
 	for _, id := range renamed {
 		id.Name = c.recvPlaceholder
 	}
-	expr := renderIn(it.expr, h.imports)
+	expr := renderIn(withoutKingpinComments(it.expr), h.imports)
 	for _, id := range renamed {
 		id.Name = name
 	}
@@ -2011,6 +2011,33 @@ func (c *converter) redocKeptCtor(ci *ctorInfo) {
 	redoc := dst.Decorations{fmt.Sprintf("// %s returns a %s set up as it was before parsing.", fd.Name.Name, what), "// Its flags now come from the struct's tags."}
 	fd.Decs.Start = append(redoc, afterFirstSentence(fd.Decs.Start)...)
 	c.ed.touch(ci.decl.pkg, ci.decl.file)
+}
+
+// withoutKingpinComments returns e without the comments about kingpin it
+// holds, as "Kingpin requires the following to be initialized", which no
+// longer hold in a kong hook.
+func withoutKingpinComments(e dst.Expr) dst.Expr {
+	about := func(l string) bool { return strings.Contains(strings.ToLower(l), "kingpin") }
+	found := false
+	dst.Inspect(e, func(n dst.Node) bool {
+		if n != nil && (slices.ContainsFunc(n.Decorations().Start, about) || slices.ContainsFunc(n.Decorations().End, about)) {
+			found = true
+		}
+		return !found
+	})
+	if !found {
+		return e
+	}
+	e = dst.Clone(e).(dst.Expr)
+	dst.Inspect(e, func(n dst.Node) bool {
+		if n != nil {
+			d := n.Decorations()
+			d.Start = slices.DeleteFunc(d.Start, about)
+			d.End = slices.DeleteFunc(d.End, about)
+		}
+		return true
+	})
+	return e
 }
 
 // afterFirstSentence returns the // comment lines that follow the first

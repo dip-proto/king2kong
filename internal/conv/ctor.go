@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"go/token"
 	"go/types"
+	"slices"
 	"strings"
 
 	"github.com/dave/dst"
@@ -129,7 +130,7 @@ func (p *Plan) classifyStmt(ci *ctorInfo, s dst.Stmt) []ctorItem {
 				}
 				item := p.classifyInit(ci, f, s.Rhs[0])
 				item.stmt, item.path = s, path
-				item.comments = trimNewlines(s.Decs.Start)
+				item.comments = hookComments(s.Decs.Start)
 				if len(path) > 1 && item.kind != ctorResidue && item.kind != ctorCrossRef {
 					// Only plain values are moved to a nested field.
 					item.kind = ctorResidue
@@ -234,7 +235,7 @@ func (p *Plan) compositeInits(ci *ctorInfo, cl *dst.CompositeLit, t types.Type) 
 			continue
 		}
 		item := p.classifyInit(ci, f, val)
-		item.comments = trimNewlines(el.Decorations().Start)
+		item.comments = hookComments(el.Decorations().Start)
 		items = append(items, item)
 	}
 	return items
@@ -342,4 +343,16 @@ func (p *Plan) isCellField(f *types.Var) bool {
 		}
 	}
 	return false
+}
+
+// hookComments are the comments of constructor code that go with it into a
+// kong hook.
+// One about kingpin, as "Kingpin requires the following to be
+// initialized", no longer holds there.
+func hookComments(decs []string) []string {
+	comments := trimNewlines(decs)
+	if slices.ContainsFunc(comments, func(l string) bool { return strings.Contains(strings.ToLower(l), "kingpin") }) {
+		return nil
+	}
+	return comments
 }
