@@ -26,10 +26,6 @@ const (
 	ctorResidue                      // anything else, which must be preserved
 )
 
-func (k ctorKind) String() string {
-	return [...]string{"registration", "structure", "injection", "cell", "embed", "cross-ref", "residue"}[k]
-}
-
 // ctorItem is one piece of a constructor body.
 type ctorItem struct {
 	kind  ctorKind

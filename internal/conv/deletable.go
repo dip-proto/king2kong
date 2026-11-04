@@ -494,12 +494,6 @@ func callsBesides(p *Package, in *interp, r dst.Expr) bool {
 	return found
 }
 
-// foldable are the standard library functions the interpreter folds.
-var foldable = map[string]bool{
-	"fmt.Sprintf": true, "fmt.Sprint": true, "fmt.Sprintln": true, "strconv.Itoa": true,
-	"strings.Join": true, "strings.ToLower": true, "strings.ToUpper": true, "strings.TrimSpace": true,
-}
-
 // foldsPlainly reports whether call is one the interpreter folds, such as
 // fmt.Sprintf, and cannot run any method outside plainFormatters.
 // fmt calls the String, Error, Format and GoString methods of what it
@@ -603,7 +597,7 @@ func (c *converter) staticGrammarCall(p *Package, call *dst.CallExpr) bool {
 	if !ok || runtimeMethods[sel.Sel.Name] {
 		return false
 	}
-	return c.prog.isKingpinType(p.typeOf(sel.X)) && !c.isAppType(p.typeOf(sel.X)) ||
+	return c.prog.isKingpinType(p.typeOf(sel.X)) && !c.prog.isAppType(p.typeOf(sel.X)) ||
 		c.prog.isKingpinType(p.typeOf(sel.X)) && (sel.Sel.Name == "Flag" || sel.Sel.Name == "Arg" || sel.Sel.Name == "Command")
 }
 
@@ -632,9 +626,9 @@ func (c *converter) isClauseType(t types.Type) bool {
 	return false
 }
 
-func (c *converter) isAppType(t types.Type) bool {
+func (prog *Program) isAppType(t types.Type) bool {
 	n, ok := deref(t).(*types.Named)
-	return ok && n.Obj().Name() == "Application" && c.prog.isKingpinType(t)
+	return ok && n.Obj().Name() == "Application" && prog.isKingpinType(t)
 }
 
 // literalOrAppend reports whether e is a composite literal or an append call,

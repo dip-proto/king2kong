@@ -91,7 +91,7 @@ func (c *converter) hostVars(n *node, vars []runtimeVar) {
 		if !ok || !c.prog.owns(host.Obj().Pkg()) || !c.allMovable(vars, host.Obj().Pkg()) {
 			continue
 		}
-		if c.hasMethod(host, "Vars") || slices.Contains(memberNames(host), "Vars") {
+		if hasMethod(host, "Vars") || slices.Contains(memberNames(host), "Vars") {
 			for _, v := range vars {
 				c.issue(v.cl.pos, "%s %q: its %s is computed at run time, and %s already has a Vars member to give it to kong; give kong the %s variable by hand", v.cl.kind, v.cl.name, v.what, host.Obj().Name(), v.name)
 			}
@@ -104,7 +104,7 @@ func (c *converter) hostVars(n *node, vars []runtimeVar) {
 			c.issue(token.Position{}, "%v", err)
 			return
 		}
-		c.ed.insertAfter(loc.pkg, loc.file, c.lastMethodOrType(host, loc.gen), decls)
+		c.addMethods(host, decls)
 		c.commandVars = true
 		return
 	}

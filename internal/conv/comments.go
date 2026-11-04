@@ -10,17 +10,12 @@ import (
 	"github.com/dave/dst"
 )
 
-// keepRegistrationComments moves the comments written above flag
-// registrations the conversion removed onto the fields that now declare those
-// flags.
-// Notes such as "Required." or "NOTE: this defaults to read-only" would
-// otherwise go away with the constructors.
+// keepRegistrationComments moves the comments above removed flag registrations onto the fields that now declare those flags.
+// Otherwise notes like "Required." would go away with the constructors.
 //
-// A comment set apart by an empty line is a heading for the registrations
-// that follow it, up to the next empty line, and goes above the fields of
-// those flags.
-// Another comment is a note on the flag registered right below it, added to
-// the documentation of its field.
+// A comment with an empty line before it is a heading.
+// It goes above the fields of every flag registered below it, up to the next empty line.
+// Any other comment is a note about the flag right below it, and goes into that field's doc.
 func (c *converter) keepRegistrationComments() {
 	bindings := map[*clause]*binding{}
 	for _, b := range c.plan.bindings {
@@ -39,7 +34,6 @@ func (c *converter) keepRegistrationComments() {
 			}
 		}
 	}
-	sections := c.groups
 	docs := map[*dst.StructType][]string{}
 	for _, loc := range c.ed.typeSpecs {
 		if st, ok := loc.spec.Type.(*dst.StructType); ok && loc.gen != nil {
@@ -65,8 +59,8 @@ func (c *converter) keepRegistrationComments() {
 			}
 			heading := s.Decorations().Before == dst.EmptyLine
 			scope := []dst.Stmt{s}
-			if heading && sections[s] != nil {
-				scope = sections[s]
+			if heading && c.groups[s] != nil {
+				scope = c.groups[s]
 			}
 			inScope := map[*binding]bool{}
 			for _, t := range scope {
@@ -76,11 +70,8 @@ func (c *converter) keepRegistrationComments() {
 					}
 				}
 			}
-			// A note goes to the innermost field holding nothing but flags
-			// of its statement, such as the field embedding a shared
-			// options struct rather than the options' own fields.
-			// A heading goes to the outermost one in the same package, so
-			// it covers a struct of flags it heads and its neighbors.
+			// A note goes on the innermost field holding only this statement's flags, such as the field embedding a shared options struct.
+			// A heading goes on the outermost one in the same package, so it also covers the struct of flags it heads.
 			ownField := func(b *binding, outer bool) (fieldLoc, bool) {
 				var found fieldLoc
 				for _, loc := range fields[b] {
@@ -145,9 +136,7 @@ func (c *converter) keepRegistrationComments() {
 	}
 }
 
-// rebasePaths rewrites the relative file paths of comments moved from
-// statement s to a field in another directory, as ./usage.go becoming
-// ../app/usage.go.
+// rebasePaths fixes relative paths in comments moved to a field in another directory, so ./usage.go can become ../app/usage.go.
 // Paths to files that don't exist are left alone.
 func (c *converter) rebasePaths(comments []string, s dst.Stmt, to fieldLoc) []string {
 	from := c.stmtDirs[s]
@@ -176,10 +165,8 @@ func (c *converter) rebasePaths(comments []string, s dst.Stmt, to fieldLoc) []st
 
 var relPath = regexp.MustCompile(`\.\.?/[\w./-]*\w`)
 
-// registeredBy returns the clauses each statement registered, directly or
-// through the calls it made.
-// A statement run twice, as by a constructor two commands share, counts its
-// clauses twice.
+// registeredBy returns the clauses each statement registered, directly or through the functions it called.
+// A statement that runs more than once, like one in a constructor two commands share, collects the clauses of every run.
 func (c *converter) registeredBy() map[dst.Stmt][]*clause {
 	if c.registered != nil {
 		return c.registered
@@ -197,9 +184,8 @@ func (c *converter) registeredBy() map[dst.Stmt][]*clause {
 	return c.registered
 }
 
-// ownComments returns the comments above the statements that registered b's
-// flag alone, and takes them off those statements, for a field generated
-// from source: a heading starts with an empty line.
+// ownComments takes the comments off the statements that registered only b's flag, for a field generated as source.
+// A heading comes back with an empty line in front.
 func (c *converter) ownComments(b *binding) string {
 	var lines []string
 	heading := false
@@ -226,9 +212,8 @@ func (c *converter) ownComments(b *binding) string {
 	return out
 }
 
-// sections maps each statement following an empty line to the statements of
-// its group, up to the next empty line, before the conversion changes them.
-// It also records the directory of every statement.
+// sections maps each statement that follows an empty line to the statements of its group, up to the next empty line.
+// It also records the directory of every statement, so it must run before the conversion edits anything.
 func (c *converter) sections() map[dst.Stmt][]dst.Stmt {
 	out := map[dst.Stmt][]dst.Stmt{}
 	c.stmtDirs = map[dst.Stmt]string{}
@@ -257,10 +242,9 @@ func (c *converter) sections() map[dst.Stmt][]dst.Stmt {
 	return out
 }
 
-// fieldsOf returns the fields a flag goes through, innermost first: the field
-// declaring it, then the embedded fields leading to it.
+// fieldsOf returns the fields a flag goes through, innermost first: the field declaring it, then the embedded fields leading to it.
 func (c *converter) fieldsOf(b *binding) []fieldLoc {
-	if b.storage {
+	if b.mode == modeStorage {
 		return nil
 	}
 	if b.mode == modeShadow {
@@ -281,9 +265,8 @@ func (c *converter) fieldsOf(b *binding) []fieldLoc {
 	return out
 }
 
-// liveStmts returns the statements left in the program, and the comments
-// still attached to some node, which a rewritten statement may have taken
-// over.
+// liveStmts returns the statements still in the program, and the comments still attached to a node.
+// A rewritten statement can keep the comments of the one it replaced.
 func (c *converter) liveStmts() (map[dst.Stmt]bool, map[*string]bool) {
 	stmts := map[dst.Stmt]bool{}
 	decs := map[*string]bool{}
@@ -324,8 +307,7 @@ func structComments(st *dst.StructType) []string {
 	return out
 }
 
-// addNote adds comments to the documentation of a field, unless it already
-// says the same.
+// addNote adds comments to a field's doc, unless it already says the same thing.
 func addNote(loc fieldLoc, comments []string) {
 	f := loc.field
 	if !slices.ContainsFunc(comments, func(l string) bool { return !slices.Contains(f.Decs.Start, l) }) {
@@ -338,17 +320,14 @@ func addNote(loc fieldLoc, comments []string) {
 	onOwnLine(f)
 }
 
-// addHeading puts a heading above a field and its documentation.
-// The fields the tool added for members of the heading join its group, and
-// one added for another flag ends it.
-// A heading the struct had before conversion, as when the struct and the
-// registrations were both split into required and optional parts, is not
-// repeated.
+// addHeading puts a heading above a field and its doc.
+// Fields the tool added for the heading's flags join its group, and one added for another flag ends it.
+// A heading the struct already had, as when both the struct and the registrations were split into required and optional parts, isn't repeated.
 func addHeading(loc fieldLoc, comments []string, members, added map[*dst.Field]bool, original, doc []string) {
 	in := func(l string, lines []string) bool {
 		return slices.ContainsFunc(lines, func(m string) bool { return sameComment(l, m) })
 	}
-	// What the struct's own documentation says already is not repeated.
+	// Skip what the struct's own doc already says.
 	for len(comments) > 0 && in(comments[0], doc) {
 		comments = comments[1:]
 	}
@@ -359,18 +338,17 @@ func addHeading(loc fieldLoc, comments []string, members, added map[*dst.Field]b
 		return !slices.ContainsFunc(comments, func(l string) bool { return !in(l, lines) })
 	}
 	f := loc.field
-	// A heading left after the last field, with no field under it, is
-	// the one moving here.
+	list := loc.st.Fields.List
+	// A heading stranded after the last field is the one moving here.
 	if last, i := trailing(loc.st); i >= 0 && slices.Equal(trimNewlines(last.Decs.End[i:]), comments) {
 		last.Decs.End = last.Decs.End[:i]
 	} else if has(original) {
-		// The struct's own fields are under that heading already.
-		// A field added for the same flags joins the group right before it
-		// when that group has the heading, and repeats it elsewhere.
+		// The struct already has this heading over its own fields, so only a field the tool added may need it.
+		// That field joins the group right before it when that group has the heading, and gets a copy otherwise.
 		if !added[f] {
 			f = nil
-			for _, g := range loc.st.Fields.List {
-				if members[g] && added[g] && !has(groupHeading(loc.st, g)) {
+			for i, g := range list {
+				if members[g] && added[g] && !has(headingOf(list, i)) {
 					f = g
 					break
 				}
@@ -379,7 +357,7 @@ func addHeading(loc fieldLoc, comments []string, members, added map[*dst.Field]b
 				return
 			}
 		}
-		if has(headingBefore(loc.st, f)) {
+		if has(headingOf(list, slices.Index(list, f)-1)) {
 			f.Decs.Before = dst.NewLine
 			return
 		}
@@ -388,21 +366,18 @@ func addHeading(loc fieldLoc, comments []string, members, added map[*dst.Field]b
 		comments = append(slices.Clone(comments), "\n")
 	}
 	f.Decs.Start = append(comments, f.Decs.Start...)
-	list := loc.st.Fields.List
 	i := slices.Index(list, f)
 	if i > 0 {
 		f.Decs.Before = dst.EmptyLine
 	}
 	for _, g := range list[i+1:] {
 		if start := g.Decs.Start; members[g] && g.Decs.Before == dst.EmptyLine && startsWith(start, comments) {
-			// The same heading further down, over more of these flags,
-			// merges with this one.
+			// The same heading further down, over more of these flags, merges into this one.
 			g.Decs.Start, g.Decs.Before = trimNewlines(start[len(comments):]), dst.NewLine
 			continue
 		}
 		if !members[g] {
-			// The struct's own layout stays, but a field added
-			// for another flag is set apart.
+			// The struct's own layout stays, but a field added for another flag is set apart.
 			if added[g] {
 				g.Decs.Before = dst.EmptyLine
 			}
@@ -417,8 +392,7 @@ func addHeading(loc fieldLoc, comments []string, members, added map[*dst.Field]b
 	onOwnLine(f)
 }
 
-// sameComment reports whether two comment lines say the same, as
-// "// Optional." and "// Optional".
+// sameComment reports whether two comment lines say the same thing, as "// Optional." and "// optional" do.
 func sameComment(a, b string) bool {
 	norm := func(s string) string {
 		return strings.ToLower(strings.TrimRight(strings.TrimSpace(strings.TrimPrefix(s, "//")), ".:"))
@@ -426,7 +400,7 @@ func sameComment(a, b string) bool {
 	return norm(a) == norm(b)
 }
 
-// startsWith reports whether comments start with the lines of heading.
+// startsWith reports whether comments start with the lines of heading, compared with sameComment.
 func startsWith(comments, heading []string) bool {
 	if len(comments) < len(heading) {
 		return false
@@ -439,31 +413,17 @@ func startsWith(comments, heading []string) bool {
 	return true
 }
 
-// groupHeading returns the comments above the group of fields holding f.
-func groupHeading(st *dst.StructType, f *dst.Field) []string {
-	list := st.Fields.List
-	for j := slices.Index(list, f); j >= 0; j-- {
-		if j == 0 || list[j].Decs.Before == dst.EmptyLine {
-			return list[j].Decs.Start
+// headingOf returns the comments above the group of fields holding list[i], or nil when i is negative.
+func headingOf(list []*dst.Field, i int) []string {
+	for ; i >= 0; i-- {
+		if i == 0 || list[i].Decs.Before == dst.EmptyLine {
+			return list[i].Decs.Start
 		}
 	}
 	return nil
 }
 
-// headingBefore returns the comments above the group of fields that ends
-// right before f, or holds it.
-func headingBefore(st *dst.StructType, f *dst.Field) []string {
-	list := st.Fields.List
-	for j := slices.Index(list, f) - 1; j >= 0; j-- {
-		if j == 0 || list[j].Decs.Before == dst.EmptyLine {
-			return list[j].Decs.Start
-		}
-	}
-	return nil
-}
-
-// onOwnLine makes sure a field with comments is not on the line of the
-// struct's brace, as in struct{ Output }.
+// onOwnLine keeps a field with comments off the line of the struct's brace, as in struct{ Output }.
 func onOwnLine(f *dst.Field) {
 	if f.Decs.Before == dst.None {
 		f.Decs.Before = dst.NewLine

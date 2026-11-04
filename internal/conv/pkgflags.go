@@ -46,7 +46,7 @@ func (c *converter) collectPkgFlags() map[*Package]*pkgFlags {
 	root := c.tree.RootPkg
 	out := map[*Package]*pkgFlags{}
 	for _, b := range c.plan.bindings {
-		if !b.storage || b.cl.parent != c.tree.Root.cl {
+		if b.mode != modeStorage || b.cl.parent != c.tree.Root.cl {
 			continue
 		}
 		v, p, spec, file, gd := c.storageVar(b.cl)
@@ -162,14 +162,10 @@ func (c *converter) convertPkgFlags(groups map[*Package]*pkgFlags, imports map[s
 		taken := map[string]bool{}
 		for i := range g.flags {
 			b := g.flags[i].b
-			name := c.prog.identFromName(b.cl.name)
-			for taken[name] {
-				name += "Value"
-			}
-			taken[name] = true
+			name := c.fieldNameFor(b, taken)
 			g.flags[i].field = name
 			tag := c.plan.tagFor(b, name)
-			fields = append(fields, fmt.Sprintf("%s %s %s", name, typeExpr(b.cl.storageType, g.pkg.Types, pkgImports), tagLiteral(tag.String())))
+			fields = append(fields, fmt.Sprintf("%s %s %s", name, typeExpr(b.cl.storageType, g.pkg.Types, pkgImports), tag.Literal()))
 		}
 		src := fmt.Sprintf(`// %[1]s are the command-line flags the %[3]s package declares. The
 // program's CLI embeds them.

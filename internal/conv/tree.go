@@ -1,7 +1,6 @@
 package conv
 
 import (
-	"fmt"
 	"go/token"
 	"go/types"
 	"sort"
@@ -30,6 +29,17 @@ type node struct {
 	// field is the name of this node's field in its parent's container.
 	field string
 	tag   *kongtag.Tag
+}
+
+// child returns the child of n held in field f, or nil.
+func (n *node) child(f string) *node {
+	var out *node
+	for _, ch := range n.children {
+		if ch.field == f {
+			out = ch
+		}
+	}
+	return out
 }
 
 // Tree is the kong grammar to generate.
@@ -132,18 +142,7 @@ func (p *Plan) parsingPackage() *Package {
 				if !ok {
 					return true
 				}
-				name := ""
-				switch fun := call.Fun.(type) {
-				case *dst.Ident:
-					if fun.Path != "" && p.g.prog.isKingpinPath(fun.Path) {
-						name = fun.Name
-					}
-				case *dst.SelectorExpr:
-					if t, ok := deref(pkg.typeOf(fun.X)).(*types.Named); ok && p.g.prog.isKingpinType(t) && t.Obj().Name() == "Application" {
-						name = fun.Sel.Name
-					}
-				}
-				if name == "Parse" || name == "MustParse" {
+				if name := p.g.prog.runtimeCall(pkg, call); name == "Parse" || name == "MustParse" {
 					parsing[pkg] = true
 				}
 				return true
@@ -403,34 +402,4 @@ func (g *importGraph) canAdd(from, to string) bool {
 		return false
 	}
 	return !reaches(to)
-}
-
-// Describe writes the planned grammar, for debugging.
-func (t *Tree) Describe() string {
-	var out string
-	var walk func(n *node, indent string)
-	walk = func(n *node, indent string) {
-		where := ""
-		if len(n.children) > 0 {
-			if n.containerOwn {
-				where = " (subcommands on the command struct)"
-			} else {
-				where = " (subcommands on a generated struct)"
-			}
-		}
-		typ := "<none>"
-		if n.typ != nil {
-			typ = types.TypeString(n.typ, shortQual)
-		}
-		if n.parent == nil {
-			out += fmt.Sprintf("%sroot in %s%s\n", indent, t.RootPkg.PkgPath, where)
-		} else {
-			out += fmt.Sprintf("%s%s %s `%s`%s\n", indent, n.field, typ, n.tag.String(), where)
-		}
-		for _, ch := range n.children {
-			walk(ch, indent+"  ")
-		}
-	}
-	walk(t.Root, "")
-	return out
 }

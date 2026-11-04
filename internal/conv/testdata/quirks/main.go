@@ -1,10 +1,7 @@
-// Command quirks registers values kingpin parsed in its own way: a
-// positional boolean, an enum that lists the empty value, a default read
-// from the environment, a default path, lists whose environment variables
-// are split at newlines but whose command-line values are not, a counter
-// with an environment variable, a file, and custom values: a list with
-// defaults, a list taking the remaining arguments, and a boolean with a
-// third state.
+// Command quirks registers values that kingpin parses in its own way.
+// There's a positional bool, an enum that accepts the empty value, a default read from the environment, a default file path, a counter with an environment variable, and a file.
+// Lists split their environment variables at newlines, but not their command-line values.
+// The custom values are a list with defaults, a list taking the remaining arguments, and a bool with a third state.
 package main
 
 import (

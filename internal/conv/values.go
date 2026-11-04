@@ -32,6 +32,17 @@ type vObj struct{ o *object }
 // vPtr points at a struct object.
 type vPtr struct{ o *object }
 
+// structObj returns the object behind a struct value or struct pointer, or nil.
+func structObj(v value) *object {
+	switch v := v.(type) {
+	case vObj:
+		return v.o
+	case vPtr:
+		return v.o
+	}
+	return nil
+}
+
 // vFieldPtr points at a non-struct field of an object, the usual destination
 // of a kingpin *Var binder.
 type vFieldPtr struct {

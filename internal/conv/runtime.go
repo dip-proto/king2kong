@@ -254,7 +254,7 @@ func (c *converter) atCall(p *Package, call *dst.CallExpr) (*types.Tuple, int, [
 		t := params.At(i).Type()
 		pruned, nils := sig.params[i], sig.nils[i]
 		switch {
-		case (pruned || nils || kept) && c.isAppType(t):
+		case (pruned || nils || kept) && c.prog.isAppType(t):
 			app = i
 		case !pruned && c.isInjectedType(t):
 			bound = append(bound, i)
@@ -540,15 +540,7 @@ func (c *converter) newApplication(p *Package, cur *dstutil.Cursor, call *dst.Ca
 	}
 	args = append(args, c.bindCalls(p.position(call), binds, typs, p.PkgPath, kongOption)...)
 	args = append(args, c.newOptions(c.qualifier(p, root))...)
-	newCall := callOf(c.compatIdent("New"), args...)
-	c.parserCalls = append(c.parserCalls, newCall)
-	if len(args) > 3 {
-		for _, a := range args[1:] {
-			a.Decorations().Before = dst.NewLine
-		}
-		args[len(args)-1].Decorations().After = dst.NewLine
-	}
-	cur.Replace(newCall)
+	cur.Replace(c.parserCall(c.compatIdent("New"), args))
 }
 
 // newOptions returns the options kongcompat.New takes after the bindings:
@@ -830,7 +822,7 @@ func (c *converter) followPrunedAssign(p *Package, cur *dstutil.Cursor, as *dst.
 	// The commands now come from the application the call received.
 	var app dst.Expr
 	for i, a := range call.Args {
-		if i < orig.Params().Len() && c.isAppType(orig.Params().At(i).Type()) {
+		if i < orig.Params().Len() && c.prog.isAppType(orig.Params().At(i).Type()) {
 			app = dst.Clone(a).(dst.Expr)
 		}
 	}

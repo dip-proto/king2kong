@@ -88,7 +88,7 @@ func (c *converter) cleanupWiring() {
 					fd.Body.List, changed = c.pruneDeadUses(p, fd.Body.List, dead)
 				}
 				hadResults := fd.Type.Results != nil && len(fd.Type.Results.List) > 0
-				c.pruneSignature(p, fd, dead)
+				c.pruneSignature(p, fd)
 				tidyBody(fd)
 				c.ed.touch(p, f)
 				if c.dropIfEmpty(p, f, fd) {
@@ -1518,14 +1518,9 @@ func (c *converter) pureCall(p *Package, e dst.Expr) bool {
 // and results that only returned removed values.
 // When fd must keep its signature, its callers pass nil to those
 // parameters instead.
-func (c *converter) pruneSignature(p *Package, fd *dst.FuncDecl, dead map[types.Object]bool) {
+func (c *converter) pruneSignature(p *Package, fd *dst.FuncDecl) {
 	fn, _ := p.objectOf(fd.Name).(*types.Func)
 	sig := prunedSig{params: map[int]bool{}, nils: map[int]bool{}}
-	defer func() {
-		if fn != nil && (len(sig.params) > 0 || len(sig.nils) > 0 || sig.results) {
-			c.pruned[fn] = sig
-		}
-	}()
 	fixed := c.fixedResults
 	if fd.Type.Params != nil {
 		var kept []*dst.Field
@@ -1565,6 +1560,9 @@ func (c *converter) pruneSignature(p *Package, fd *dst.FuncDecl, dead map[types.
 		(len(results.List[0].Names) == 0 || c.deadNamedResults(p, fd)) {
 		fd.Type.Results = nil
 		sig.results = true
+	}
+	if fn != nil && (len(sig.params) > 0 || len(sig.nils) > 0 || sig.results) {
+		c.pruned[fn] = sig
 	}
 }
 

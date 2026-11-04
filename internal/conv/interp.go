@@ -180,7 +180,6 @@ func (in *interp) newClause(kind clauseKind, parent *clause, pos token.Position,
 	c := &clause{id: in.nextID, kind: kind, parent: parent, pos: pos}
 	if fr != nil {
 		c.conds = append(c.conds, fr.conds...)
-		c.pkg = fr.pkg
 	}
 	if n := len(in.stmtStack); n > 0 {
 		c.stmt = in.stmtStack[n-1]
@@ -893,9 +892,7 @@ func (in *interp) declStmt(fr *frame, s *dst.DeclStmt) {
 // structs, the zero constant for basic types.
 func (in *interp) zeroOf(t types.Type, site string) value {
 	if structOf(t) != nil {
-		if _, isPtr := t.Underlying().(*types.Pointer); !isPtr {
-			return vObj{in.newObject(t, true, site)}
-		}
+		return vObj{in.newObject(t, true, site)}
 	}
 	return zeroValue(t)
 }
@@ -948,20 +945,11 @@ func (in *interp) copyData(rhs dst.Expr, v value) value {
 // copyValue is copyData for a value already read, like a range variable.
 func (in *interp) copyValue(v value) value {
 	if vo, ok := v.(vObj); ok {
-		if o, ok := in.copyStruct(vo.o); ok {
-			return vObj{o}
+		if plainData(vo.o) {
+			return vObj{in.copyPlain(vo.o)}
 		}
 	}
 	return v
-}
-
-// copyStruct copies an object of plain data, nested structs included.
-// It returns false if the object holds anything else.
-func (in *interp) copyStruct(src *object) (*object, bool) {
-	if !plainData(src) {
-		return nil, false
-	}
-	return in.copyPlain(src), true
 }
 
 // plainData reports whether o holds only plain data, in structs it holds by
@@ -1036,10 +1024,8 @@ func (in *interp) store(fr *frame, lhs dst.Expr, v value) {
 	case *dst.SelectorExpr:
 		obj, f := in.fieldLoc(fr, l)
 		if obj != nil && f != nil {
-			if vo, ok := v.(vObj); ok && vo.o.parent == nil && vo.o != obj && structOf(f.Type()) != nil {
-				if _, isPtr := f.Type().Underlying().(*types.Pointer); !isPtr && vo.o.typ != nil {
-					vo.o.parent, vo.o.pfield = obj, f
-				}
+			if vo, ok := v.(vObj); ok && vo.o.parent == nil && vo.o != obj && structOf(f.Type()) != nil && vo.o.typ != nil {
+				vo.o.parent, vo.o.pfield = obj, f
 			}
 			in.logWrite(location{o: obj, f: f})
 			if in.changedObjects != nil {
@@ -1164,21 +1150,16 @@ func (in *interp) readField(o *object, f *types.Var) value {
 	}
 	ft := f.Type()
 	if structOf(ft) != nil {
-		if _, isPtr := ft.Underlying().(*types.Pointer); !isPtr {
-			sub := in.newObject(ft, o.known, o.site+"."+f.Name())
-			sub.parent, sub.pfield = o, f
-			o.fields[f] = vObj{sub}
-			return vObj{sub}
-		}
+		sub := in.newObject(ft, o.known, o.site+"."+f.Name())
+		sub.parent, sub.pfield = o, f
+		o.fields[f] = vObj{sub}
+		return vObj{sub}
 	}
 	if o.known {
 		return zeroValue(ft)
 	}
 	// Remember opaque values so repeated reads see the same object.
 	v := in.opaque(ft, o.site+"."+f.Name())
-	if p, ok := v.(vPtr); ok {
-		p.o.parent, p.o.pfield = nil, nil
-	}
 	o.fields[f] = v
 	return v
 }
@@ -1984,10 +1965,8 @@ func (in *interp) unary(fr *frame, u *dst.UnaryExpr) value {
 					return vUnknown{}
 				}
 				if structOf(f.Type()) != nil {
-					if _, isPtr := f.Type().Underlying().(*types.Pointer); !isPtr {
-						if o, ok := in.readField(obj, f).(vObj); ok {
-							return vPtr{o.o}
-						}
+					if o, ok := in.readField(obj, f).(vObj); ok {
+						return vPtr{o.o}
 					}
 				}
 				return vFieldPtr{obj, f}
@@ -2230,9 +2209,7 @@ func (in *interp) composite(fr *frame, cl *dst.CompositeLit, t types.Type) value
 				in.escapes = append(in.escapes, escape{pos: fr.pkg.position(cl), what: fmt.Sprintf("the kingpin %s is stored in a %s, which belongs to code the tool does not follow: it may register more grammar or parse there", kc.c.kind, types.TypeString(t, nil)), report: true, fatal: kc.c.kind == kindApp})
 			}
 			if vo, ok := v.(vObj); ok && vo.o.parent == nil && structOf(f.Type()) != nil {
-				if _, isPtr := f.Type().Underlying().(*types.Pointer); !isPtr {
-					vo.o.parent, vo.o.pfield = o, f
-				}
+				vo.o.parent, vo.o.pfield = o, f
 			}
 			o.fields[f] = v
 		}
@@ -2618,12 +2595,18 @@ func (in *interp) builtin(fr *frame, name string, c *dst.CallExpr) value {
 	return vUnknown{}
 }
 
+// foldable are the standard library functions foldCall folds.
+var foldable = map[string]bool{
+	"fmt.Sprintf": true, "fmt.Sprint": true, "fmt.Sprintln": true, "strconv.Itoa": true,
+	"strings.Join": true, "strings.ToLower": true, "strings.ToUpper": true, "strings.TrimSpace": true,
+}
+
 // foldCall evaluates calls to a few pure standard library functions when all
 // their arguments are known.
 // That way, help strings built with fmt.Sprintf from constants become
 // constants.
 func foldCall(fn *types.Func, args []value, packed bool) (value, bool) {
-	if fn.Pkg() == nil {
+	if fn.Pkg() == nil || !foldable[fn.Pkg().Path()+"."+fn.Name()] {
 		return nil, false
 	}
 	str := types.Typ[types.String]
@@ -2797,8 +2780,6 @@ func calleeName(c *dst.CallExpr) string {
 	return ""
 }
 
-// priorDefault returns the non-zero constant a flag's destination already
-// holds before parsing, written the way a kong default tag expects it.
 // seeded reports whether dst already holds something kong would reset: a
 // list or a map with values, like []string{"/etc/example"}, or a custom
 // value with fields set, like dateValue{Layout: "2006-01-02"}.
@@ -2832,6 +2813,8 @@ func (in *interp) seeded(dst value) bool {
 	return false
 }
 
+// priorDefault returns the non-zero constant a flag's destination already
+// holds before parsing, written the way a kong default tag expects it.
 func (in *interp) priorDefault(dst value) (string, bool) {
 	v, t := in.priorValue(dst)
 	c, ok := v.(vConst)

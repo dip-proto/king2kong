@@ -66,8 +66,8 @@ func TestLayoutFields(t *testing.T) {
 				}
 			}
 			l := layoutFields(st.Fields.List, key)
-			if l.ok != tc.ok {
-				t.Fatalf("ok = %v, want %v", l.ok, tc.ok)
+			if ok := len(l.crossing) == 0; ok != tc.ok {
+				t.Fatalf("ok = %v, want %v", ok, tc.ok)
 			}
 			if !tc.ok {
 				return

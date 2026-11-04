@@ -1,6 +1,5 @@
-// Command copies builds its flag names from structs that Go copies, by
-// assignment, range, parameter or receiver, and registers some flags only
-// after a branch that returns.
+// Command copies builds flag names from copies of structs, made by assignment, range, parameter and receiver.
+// It also registers a flag after a branch that may return.
 package main
 
 import (

@@ -83,8 +83,7 @@ func (n *namer) free(owner *types.Named, name string) bool {
 		if n.taken[t][name] {
 			return false
 		}
-		obj, _, _ := types.LookupFieldOrMethod(types.NewPointer(t), true, t.Obj().Pkg(), name)
-		if obj != nil {
+		if lookupMethod(t, name) != nil {
 			return false
 		}
 	}

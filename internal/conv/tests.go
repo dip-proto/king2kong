@@ -2,7 +2,6 @@ package conv
 
 import (
 	"bytes"
-	"fmt"
 	"go/ast"
 	"go/token"
 	"go/types"
@@ -14,7 +13,6 @@ import (
 
 	"github.com/dave/dst"
 	"github.com/dave/dst/decorator"
-	"github.com/dave/dst/decorator/resolver/guess"
 	"github.com/dave/dst/dstutil"
 	"golang.org/x/tools/go/packages"
 )
@@ -71,30 +69,26 @@ func (c *converter) convertTests(renames map[*types.Var]string) error {
 		Dir:   c.prog.Dir,
 		Tests: true,
 	}
-	dpkgs, err := decorator.Load(cfg, patterns...)
+	dpkgs, err := loadDecorated(cfg, patterns...)
 	if err != nil {
 		return err
 	}
 	fset := c.prog.Packages[0].Fset
-	key := func(fs *token.FileSet, pos token.Pos) string {
-		p := fs.Position(pos)
-		return fmt.Sprintf("%s:%d", p.Filename, p.Offset)
-	}
-	pruned := map[string]prunedSig{}
+	pruned := map[posKey]prunedSig{}
 	for fn, sig := range c.pruned {
-		pruned[key(fset, fn.Pos())] = sig
+		pruned[keyOf(fset, fn.Pos())] = sig
 	}
-	emptied := map[string]bool{}
+	emptied := map[posKey]bool{}
 	for fn := range c.emptied {
-		emptied[key(fset, fn.Pos())] = true
+		emptied[keyOf(fset, fn.Pos())] = true
 	}
-	renamed := map[string]string{}
+	renamed := map[posKey]string{}
 	for v, name := range renames {
-		renamed[key(fset, v.Pos())] = name
+		renamed[keyOf(fset, v.Pos())] = name
 	}
 	// The fields that held a command's kingpin clause are gone; a test still
 	// reaching for one gets the command from the application.
-	clauseFields := map[string]bool{}
+	clauseFields := map[posKey]bool{}
 	for obj := range c.ed.typeSpecs {
 		st := structOf(obj.Type())
 		if st == nil || !c.prog.owns(obj.Pkg()) {
@@ -102,19 +96,19 @@ func (c *converter) convertTests(renames map[*types.Var]string) error {
 		}
 		for i := 0; i < st.NumFields(); i++ {
 			if f := st.Field(i); c.isClauseType(f.Type()) {
-				clauseFields[key(fset, f.Pos())] = true
+				clauseFields[keyOf(fset, f.Pos())] = true
 			}
 		}
 	}
 	// Kept constructors that do nothing but build their command.
-	pureCtors := map[string]bool{}
+	pureCtors := map[posKey]bool{}
 	for _, ci := range c.keptCtors {
 		pure := true
 		for _, it := range ci.items {
 			pure = pure && it.kind != ctorResidue
 		}
 		if pure {
-			pureCtors[key(fset, ci.fn.Pos())] = true
+			pureCtors[keyOf(fset, ci.fn.Pos())] = true
 		}
 	}
 	done := map[string]bool{}
@@ -131,7 +125,7 @@ func (c *converter) convertTests(renames map[*types.Var]string) error {
 				continue
 			}
 			done[name] = true
-			t := &testConversion{c: c, p: p, pruned: pruned, emptied: emptied, renamed: renamed, clauseFields: clauseFields, pureCtors: pureCtors, key: func(pos token.Pos) string { return key(dp.Fset, pos) }}
+			t := &testConversion{c: c, p: p, pruned: pruned, emptied: emptied, renamed: renamed, clauseFields: clauseFields, pureCtors: pureCtors, key: func(pos token.Pos) posKey { return keyOf(dp.Fset, pos) }}
 			src, err := t.convert(f, name)
 			if err != nil {
 				c.issue(token.Position{Filename: name}, "converting this test: %v", err)
@@ -154,15 +148,15 @@ type testConversion struct {
 	// clauseFields are the fields that held kingpin clauses, pureCtors the
 	// kept constructors that only build their command, and used the
 	// variables the conversion made the test use.
-	clauseFields map[string]bool
-	pureCtors    map[string]bool
+	clauseFields map[posKey]bool
+	pureCtors    map[posKey]bool
 	used         map[types.Object]bool
 	// injected are the names of the types hooks take.
 	injected map[string]bool
-	pruned   map[string]prunedSig
-	emptied  map[string]bool
-	renamed  map[string]string
-	key      func(token.Pos) string
+	pruned   map[posKey]prunedSig
+	emptied  map[posKey]bool
+	renamed  map[posKey]string
+	key      func(token.Pos) posKey
 }
 
 func (t *testConversion) convert(f *dst.File, name string) (string, error) {
@@ -213,7 +207,7 @@ func (t *testConversion) convert(f *dst.File, name string) (string, error) {
 					n.Sel.Name = name
 				}
 				if t.clauseFields[t.key(v.Pos())] {
-					if app := onlyVarAt(p, n, func(v *types.Var) bool { return c.isAppType(v.Type()) }); app != nil {
+					if app := onlyVarAt(p, n, func(v *types.Var) bool { return c.prog.isAppType(v.Type()) }); app != nil {
 						// x.CmdClause becomes app.CommandOf(x): the command
 						// whose struct has x's type.
 						t.used[app] = true
@@ -227,7 +221,7 @@ func (t *testConversion) convert(f *dst.File, name string) (string, error) {
 	}, nil)
 	t.dropUnusedGrammar(f)
 	var buf bytes.Buffer
-	r := decorator.NewRestorerWithImports(p.PkgPath, importResolver{names: p.names, fallback: guess.New()})
+	r := decorator.NewRestorerWithImports(p.PkgPath, p.importNames())
 	if err := r.Fprint(&buf, f); err != nil {
 		return "", err
 	}
@@ -493,7 +487,7 @@ func (t *testConversion) bindAtCall(cur *dstutil.Cursor, s dst.Stmt) {
 	for i := range call.Args {
 		typ := params.At(i).Type()
 		switch {
-		case t.c.isAppType(typ):
+		case t.c.prog.isAppType(typ):
 			app = i
 		case !sig.params[i] && injected[types.TypeString(typ, nil)]:
 			bound = append(bound, i)
@@ -519,12 +513,14 @@ func (c *converter) prunedCallers() map[string]bool {
 	if len(c.pruned) == 0 {
 		return out
 	}
+	seen := map[string]bool{}
 	for _, p := range c.prog.Packages {
 		for _, f := range p.Syntax {
 			dir := filepath.Dir(p.filename(f))
-			if out[dir] {
+			if seen[dir] {
 				continue
 			}
+			seen[dir] = true
 			tests, _ := filepath.Glob(filepath.Join(dir, "*_test.go"))
 			for _, t := range tests {
 				src, err := os.ReadFile(t)

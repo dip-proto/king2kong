@@ -55,7 +55,7 @@ func (c *converter) convertTree() {
 	}
 	c.cliVar = c.freeName(root, "cli", "kongCLI")
 	var generated []string
-	imports := map[string]string{"github.com/alecthomas/kong": "kong"}
+	imports := map[string]string{kongPath: "kong"}
 	c.rootImports = imports
 	paths := c.nodePaths()
 
@@ -81,7 +81,7 @@ func (c *converter) convertTree() {
 		case len(n.children) > 0 && !n.containerOwn:
 			names[n] = c.freeName(root, c.containerName(n))
 		case n.typ == nil && (len(storage[n]) > 0 || c.genActions[n] != nil || len(n.cl.actionLits) > 0):
-			names[n] = c.freeName(root, unexported(c.prog.identFromName(strings.ReplaceAll(n.cl.fullName(), " ", "-")))+"Command")
+			names[n] = c.freeName(root, unexported(c.prog.identFromName(n.cl.fullName()))+"Command")
 		}
 	}
 	rootTaken := generatedMethods()
@@ -132,7 +132,7 @@ func (c *converter) convertTree() {
 		}
 		var lines []string
 		for _, ch := range n.children {
-			lines = append(lines, fmt.Sprintf("%s %s %s", ch.field, c.nodeType(ch, names, n, lineImports), tagLiteral(ch.tag.String())))
+			lines = append(lines, fmt.Sprintf("%s %s %s", ch.field, c.nodeType(ch, names, n, lineImports), ch.tag.Literal()))
 		}
 		switch {
 		case n.parent == nil:
@@ -186,7 +186,7 @@ func (c *converter) convertTree() {
 		if c.main.version != nil || c.hasVersionCall() {
 			// A command or flag may already be named Version.
 			field := firstFree(func(n string) bool { return rootTaken[n] }, "Version", "VersionFlag")
-			line := field + " kong.VersionFlag " + tagLiteral(versionTag(t.Root.cl, field).String())
+			line := field + " kong.VersionFlag " + versionTag(t.Root.cl, field).Literal()
 			flagLines = append(flagLines, line)
 			c.fieldOrder[line] = 2*t.Root.cl.versionAt + 1
 		}
@@ -205,7 +205,7 @@ func (c *converter) convertTree() {
 		rootLines = append(rootLines, fmt.Sprintf("Help %s.HelpCommand `cmd:\"\" help:\"Show help.\"`\n", name))
 	}
 	for _, ch := range t.Root.children {
-		rootLines = append(rootLines, fmt.Sprintf("%s %s %s", ch.field, c.nodeType(ch, names, t.Root, imports), tagLiteral(ch.tag.String())))
+		rootLines = append(rootLines, fmt.Sprintf("%s %s %s", ch.field, c.nodeType(ch, names, t.Root, imports), ch.tag.Literal()))
 	}
 	cliName := c.cliName
 	var src strings.Builder
@@ -249,7 +249,7 @@ func (c *converter) convertTree() {
 	if opts := c.conditionalOptions(root, cliName, imports); opts != "" {
 		src.WriteString("\n" + opts)
 	}
-	c.newFile(root, c.freeFile(root, "cli.go", "kong_cli.go"), imports, src.String())
+	c.newFile(root, c.freeFile(root, "cli", "kong_cli"), imports, src.String())
 }
 
 // versionTag returns the tag of the --version flag, including what the
@@ -277,7 +277,7 @@ func versionTag(app *clause, field string) *kongtag.Tag {
 
 func (c *converter) hasStorage(n *node) bool {
 	for _, b := range c.plan.bindings {
-		if b.storage && b.cl.parent == n.cl {
+		if b.mode == modeStorage && b.cl.parent == n.cl {
 			return true
 		}
 	}
@@ -296,7 +296,7 @@ func (c *converter) versionArg() dst.Expr {
 	root := c.tree.RootPkg
 	for _, f := range root.Syntax {
 		dst.Inspect(f, func(n dst.Node) bool {
-			if call, ok := n.(*dst.CallExpr); ok && len(call.Args) == 1 && c.runtimeCall(root, call) == "Version" {
+			if call, ok := n.(*dst.CallExpr); ok && len(call.Args) == 1 && c.prog.runtimeCall(root, call) == "Version" {
 				arg = call.Args[0]
 			}
 			return arg == nil
@@ -379,8 +379,8 @@ func (c *converter) reserveLocals(p *Package) {
 	}
 }
 
-// freeFile returns the first candidate file name, or the first one with a
-// number before the extension, that does not exist in the package directory.
+// freeFile returns the first candidate base name, or the first one with a
+// number, whose .go file does not exist in the package directory.
 func (c *converter) freeFile(p *Package, candidates ...string) string {
 	dir := ""
 	for _, f := range p.Syntax {
@@ -395,21 +395,11 @@ func (c *converter) freeFile(p *Package, candidates ...string) string {
 		_, err := os.Stat(path)
 		return err == nil
 	}
-	for _, cand := range candidates {
-		if !exists(cand) {
-			return cand
-		}
-	}
-	base := strings.TrimSuffix(candidates[0], ".go")
-	for i := 2; ; i++ {
-		if cand := fmt.Sprintf("%s%d.go", base, i); !exists(cand) {
-			return cand
-		}
-	}
+	return firstFree(func(name string) bool { return exists(name + ".go") }, candidates...) + ".go"
 }
 
 func (c *converter) containerName(n *node) string {
-	return unexported(c.prog.identFromName(strings.ReplaceAll(n.cl.fullName(), " ", "-"))) + "Commands"
+	return unexported(c.prog.identFromName(n.cl.fullName())) + "Commands"
 }
 
 // unexported lowers the first word of an identifier, keeping initialisms
@@ -442,7 +432,7 @@ func (c *converter) addCmdFields(n *node, lines []string, imports map[string]str
 func (c *converter) appFlagBindings() []*binding {
 	var out []*binding
 	for _, b := range c.plan.bindings {
-		if b.cmd.kind == kindApp && !b.storage && (b.dstVar == nil || c.main == nil) {
+		if b.cmd.kind == kindApp && b.mode != modeStorage && (b.dstVar == nil || c.main == nil) {
 			out = append(out, b)
 		}
 	}
@@ -503,15 +493,7 @@ func (c *converter) rootFlagsEmbed(imports map[string]string) (line string) {
 			continue
 		}
 		name := c.nm.exportField(owner, b.field)
-		tag := c.plan.tagFor(b, name)
-		shared, err := c.ed.addTag(b.field, tag.String())
-		if err != nil {
-			c.issue(b.cl.pos, "%v", err)
-			continue
-		}
-		c.reportSharedKeys(b, b.field, shared)
-		c.rename(b.field, name)
-		c.tagged[b.field] = true
+		c.tagField(b, b.field, name, c.plan.tagFor(b, name).String())
 	}
 	if holder == nil {
 		return ""
@@ -774,7 +756,7 @@ func (c *converter) hideOtherFields() {
 					visit(n)
 					continue
 				}
-				if !f.Exported() || structOf(deref(f.Type())) == nil && !isInterface(f.Type()) {
+				if !f.Exported() || structOf(deref(f.Type())) == nil && !types.IsInterface(f.Type()) {
 					continue
 				}
 			} else if !f.Exported() {
@@ -794,11 +776,6 @@ func (c *converter) hideOtherFields() {
 	if c.rootFlags != nil {
 		visit(c.rootFlags)
 	}
-}
-
-func isInterface(t types.Type) bool {
-	_, ok := t.Underlying().(*types.Interface)
-	return ok
 }
 
 func (c *converter) isEmbedTagged(f *types.Var) bool {
@@ -867,7 +844,7 @@ func (c *converter) writeHooks() {
 			for _, name := range pnames {
 				params = append(params, name+" "+h.beforeParams[name])
 			}
-			src.WriteString(hookDoc("BeforeApply", t, len(params) > 0))
+			src.WriteString(beforeApplyDoc(len(params) > 0))
 			fmt.Fprintf(&src, "func (%s *%s) BeforeApply(%s) error {\n", recv, recvType(t), strings.Join(params, ", "))
 			for _, s := range h.before {
 				src.WriteString(renameIdent(s, c.recvPlaceholder, recv) + "\n")
@@ -900,7 +877,7 @@ func (c *converter) writeHooks() {
 		if h.anchor != nil {
 			c.ed.insertAt(h.anchor.pkg, h.anchor.file, h.anchor.decl, decls)
 		} else {
-			c.ed.insertAfter(loc.pkg, loc.file, c.lastMethodOrType(t, loc.gen), decls)
+			c.addMethods(t, decls)
 		}
 	}
 }
@@ -948,16 +925,11 @@ func lineComment(text string) string {
 	return b.String()
 }
 
-func hookDoc(hook string, t *types.Named, params bool) string {
-	switch hook {
-	case "BeforeApply":
-		if params {
-			return "// BeforeApply sets the command up with the values bound when the parser\n// was built, before kong applies the command line.\n"
-		}
-		return "// BeforeApply sets the command up before kong applies the command line.\n"
-	default:
-		return "// AfterApply hands the parsed flags over to the fields the command\n// reads them from.\n"
+func beforeApplyDoc(params bool) string {
+	if params {
+		return "// BeforeApply sets the command up with the values bound when the parser\n// was built, before kong applies the command line.\n"
 	}
+	return "// BeforeApply sets the command up before kong applies the command line.\n"
 }
 
 // withReceiver renames the placeholder receiver c of generated statements.

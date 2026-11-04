@@ -70,14 +70,7 @@ func (c *converter) findCommandList(p *Package, f *dst.File, fd *dst.FuncDecl) {
 	if listType == nil {
 		return
 	}
-	var app *dst.Ident
-	for _, field := range fd.Type.Params.List {
-		for _, nm := range field.Names {
-			if o := p.objectOf(nm); o != nil && nm.Name != "_" && c.isAppType(o.Type()) {
-				app = nm
-			}
-		}
-	}
+	app := c.appParam(p, fd)
 	if app == nil {
 		return
 	}
@@ -391,12 +384,8 @@ func (c *converter) pointRemovedCalls() {
 
 func (c *converter) pointCallsIn(p *Package, f *dst.File, fd *dst.FuncDecl, results map[*dst.CallExpr]*object) {
 	var app *types.Var
-	for _, field := range fd.Type.Params.List {
-		for _, nm := range field.Names {
-			if v, ok := p.objectOf(nm).(*types.Var); ok && nm.Name != "_" && c.isAppType(v.Type()) {
-				app = v
-			}
-		}
+	if id := c.appParam(p, fd); id != nil {
+		app, _ = p.objectOf(id).(*types.Var)
 	}
 	listCLI := ""
 	if fn, _ := p.objectOf(fd.Name).(*types.Func); c.cmdLists[fn] != nil {
@@ -415,7 +404,7 @@ func (c *converter) pointCallsIn(p *Package, f *dst.File, fd *dst.FuncDecl, resu
 		// arguments must have nothing to compute.
 		var given dst.Expr
 		for _, arg := range call.Args {
-			if c.isAppType(p.typeOf(arg)) {
+			if c.prog.isAppType(p.typeOf(arg)) {
 				given = arg
 			} else if callsBesides(p, c.g.in, arg) {
 				found = false
@@ -424,17 +413,11 @@ func (c *converter) pointCallsIn(p *Package, f *dst.File, fd *dst.FuncDecl, resu
 		var cli dst.Expr
 		switch {
 		case given != nil:
-			cli = &dst.TypeAssertExpr{
-				X:    &dst.SelectorExpr{X: given, Sel: dst.NewIdent("Grammar")},
-				Type: &dst.StarExpr{X: &dst.Ident{Name: c.cliName, Path: c.qualifier(p, c.tree.RootPkg)}},
-			}
+			cli = c.grammarOf(p, given)
 		case listCLI != "":
 			cli = dst.NewIdent(listCLI)
 		case app != nil && c.namesAt(p, call, app):
-			cli = &dst.TypeAssertExpr{
-				X:    &dst.SelectorExpr{X: dst.NewIdent(app.Name()), Sel: dst.NewIdent("Grammar")},
-				Type: &dst.StarExpr{X: &dst.Ident{Name: c.cliName, Path: c.qualifier(p, c.tree.RootPkg)}},
-			}
+			cli = c.grammarOf(p, dst.NewIdent(app.Name()))
 		}
 		if !found || cli == nil || !c.canNameCLI(p) {
 			c.issue(p.position(call), "%s calls %s, which no longer exists; use the command the CLI holds instead", fd.Name.Name, render(call.Fun))
@@ -444,6 +427,27 @@ func (c *converter) pointCallsIn(p *Package, f *dst.File, fd *dst.FuncDecl, resu
 		c.ed.touch(p, f)
 		return false
 	}, nil)
+}
+
+// grammarOf is app.Grammar.(*CLI), written in package p.
+func (c *converter) grammarOf(p *Package, app dst.Expr) dst.Expr {
+	return &dst.TypeAssertExpr{
+		X:    &dst.SelectorExpr{X: app, Sel: dst.NewIdent("Grammar")},
+		Type: &dst.StarExpr{X: &dst.Ident{Name: c.cliName, Path: c.qualifier(p, c.tree.RootPkg)}},
+	}
+}
+
+// appParam returns the parameter of fd holding the kingpin application, or nil.
+func (c *converter) appParam(p *Package, fd *dst.FuncDecl) *dst.Ident {
+	var app *dst.Ident
+	for _, field := range fd.Type.Params.List {
+		for _, nm := range field.Names {
+			if o := p.objectOf(nm); o != nil && nm.Name != "_" && c.prog.isAppType(o.Type()) {
+				app = nm
+			}
+		}
+	}
+	return app
 }
 
 // namesAt reports whether v's name means v at node n.
@@ -464,14 +468,10 @@ func (c *converter) namesAt(p *Package, n dst.Node, v *types.Var) bool {
 // keeping command lists.
 func (c *converter) declareListCLIs() {
 	for _, l := range c.cmdLists {
-		cliType := &dst.StarExpr{X: &dst.Ident{Name: c.cliName, Path: c.qualifier(l.pkg, c.tree.RootPkg)}}
 		decl := &dst.AssignStmt{
 			Lhs: []dst.Expr{dst.NewIdent(l.local)},
 			Tok: token.DEFINE,
-			Rhs: []dst.Expr{&dst.TypeAssertExpr{
-				X:    &dst.SelectorExpr{X: dst.NewIdent(l.app), Sel: dst.NewIdent("Grammar")},
-				Type: cliType,
-			}},
+			Rhs: []dst.Expr{c.grammarOf(l.pkg, dst.NewIdent(l.app))},
 		}
 		decl.Decs.After = dst.EmptyLine
 		l.fd.Body.List = append([]dst.Stmt{decl}, l.fd.Body.List...)
@@ -552,21 +552,14 @@ func (c *converter) keepStructure(ci *ctorInfo) {
 // Only constructors that take the application and build a single command
 // qualify.
 func (c *converter) attachKeptCtor(ci *ctorInfo) {
-	if c.main != nil || c.compatPath == "" || ci.local == nil {
+	if ci.local == nil {
 		return
 	}
 	p, fd := ci.decl.pkg, ci.decl.decl
 	if !c.canNameCLI(p) {
 		return
 	}
-	var app *dst.Ident
-	for _, field := range fd.Type.Params.List {
-		for _, nm := range field.Names {
-			if o := p.objectOf(nm); o != nil && nm.Name != "_" && c.isAppType(o.Type()) {
-				app = nm
-			}
-		}
-	}
+	app := c.appParam(p, fd)
 	var inst *object
 	for _, s := range c.g.in.sites {
 		if s.callee == ci.fn {
@@ -624,10 +617,7 @@ func (c *converter) attachKeptCtor(ci *ctorInfo) {
 		} else {
 			inits = append(inits, &dst.AssignStmt{Lhs: []dst.Expr{&dst.StarExpr{X: dst.NewIdent(local)}}, Tok: token.ASSIGN, Rhs: []dst.Expr{c.keepSubcommands(start, path, dst.NewIdent(local))}})
 		}
-		cli := &dst.TypeAssertExpr{
-			X:    &dst.SelectorExpr{X: dst.NewIdent(app.Name), Sel: dst.NewIdent("Grammar")},
-			Type: &dst.StarExpr{X: &dst.Ident{Name: c.cliName, Path: c.qualifier(p, c.tree.RootPkg)}},
-		}
+		cli := c.grammarOf(p, dst.NewIdent(app.Name))
 		def := &dst.AssignStmt{
 			Lhs: []dst.Expr{dst.NewIdent(ci.local.Name())},
 			Tok: token.DEFINE,

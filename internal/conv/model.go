@@ -42,11 +42,10 @@ type clause struct {
 	name, help     string
 	nameOK, helpOK bool
 
-	aliases     []string
-	hidden      bool
-	defaultCmd  bool
-	instance    *object
-	builtinHelp bool
+	aliases    []string
+	hidden     bool
+	defaultCmd bool
+	instance   *object
 	// helpFlag is the application's built-in --help flag, set when the
 	// program changes it, for example to add -h.
 	helpFlag *clause
@@ -93,12 +92,10 @@ type clause struct {
 	// hintSources are the hints computed at run time, in the order kingpin
 	// asked them.
 	hintSources []hintSource
-	// notes are reported but, unlike issues, don't block the conversion.
-	notes   []string
-	noEnvar bool
-	action  value
-	bind    string
-	dst     value
+	noEnvar     bool
+	action      value
+	bind        string
+	dst         value
 	// prior is what dst held when the program parsed, if hasPrior.
 	// priorTaken is set once that has been looked at.
 	prior      string
@@ -129,7 +126,6 @@ type clause struct {
 	// stack holds the statements being run when the clause was registered,
 	// outermost first: the calls leading to stmt, then stmt.
 	stack []dst.Stmt
-	pkg   *Package
 }
 
 func (c *clause) issue(msg string) {

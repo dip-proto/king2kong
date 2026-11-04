@@ -15,6 +15,8 @@ import (
 	"github.com/dave/dst/decorator/resolver"
 	"github.com/dave/dst/decorator/resolver/goast"
 	"github.com/dave/dst/decorator/resolver/guess"
+
+	"king2kong/kongtag"
 )
 
 // editor applies changes to the decorated syntax of the loaded packages and
@@ -214,7 +216,7 @@ func (e *editor) addTag(v *types.Var, tag string) ([]string, error) {
 	if tag == "" {
 		return nil, nil
 	}
-	loc.field.Tag = &dst.BasicLit{Kind: token.STRING, Value: tagLiteral(tag)}
+	loc.field.Tag = &dst.BasicLit{Kind: token.STRING, Value: kongtag.Literal(tag)}
 	e.touch(loc.pkg, loc.file)
 	return shared, nil
 }
@@ -261,16 +263,6 @@ func tagPairs(tag string) [][2]string {
 		tag = tag[i+1:]
 	}
 	return out
-}
-
-func tagLiteral(tag string) string {
-	if tag == "" {
-		return ""
-	}
-	if strings.ContainsRune(tag, '`') {
-		return strconv.Quote(tag)
-	}
-	return "`" + tag + "`"
 }
 
 // renameField renames a field everywhere it is used in the loaded packages.
@@ -479,17 +471,12 @@ func importNameAvoiding(imports map[string]string, path, name string, taken map[
 		}
 		return false
 	}
-	alias := name
-	if used(alias) {
-		alias = preferredAliases[path]
-		if alias == "" || used(alias) {
-			parent := filepath.Base(filepath.Dir(path))
-			alias = strings.ToLower(parent) + name
-			for i := 2; used(alias); i++ {
-				alias = fmt.Sprintf("%s%d", name, i)
-			}
-		}
+	candidates := []string{name}
+	if preferred := preferredAliases[path]; preferred != "" {
+		candidates = append(candidates, preferred)
 	}
+	candidates = append(candidates, strings.ToLower(filepath.Base(filepath.Dir(path)))+name)
+	alias := firstFree(used, candidates...)
 	imports[path] = alias
 	return alias
 }
@@ -518,5 +505,5 @@ func (r importResolver) ResolvePackage(path string) (string, error) {
 // knownPackageNames covers packages generated code imports whose name differs
 // from the last element of their path.
 var knownPackageNames = map[string]string{
-	"github.com/alecthomas/kong": "kong",
+	kongPath: "kong",
 }

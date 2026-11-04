@@ -7,7 +7,6 @@ import (
 	"os"
 	"regexp"
 	"slices"
-	"sort"
 	"strconv"
 	"strings"
 
@@ -28,11 +27,9 @@ const (
 	// modeShadow adds a tagged field to the command struct and copies its
 	// value to the real destination once kong has parsed it.
 	modeShadow
+	// modeStorage is for a value method such as String(): the value gets a new field in the grammar, named after the flag.
+	modeStorage
 )
-
-func (m bindMode) String() string {
-	return [...]string{"direct", "embed", "shadow"}[m]
-}
 
 // binding is how one registered flag or argument maps onto the kong grammar.
 type binding struct {
@@ -66,9 +63,6 @@ type binding struct {
 	cell bool
 	// shadowField is the name of the field added for a shadow binding.
 	shadowField string
-	// storage is set for a value method such as String(): the value gets a
-	// new field in the grammar, named after the flag.
-	storage bool
 
 	tag *kongtag.Tag
 }
@@ -96,9 +90,7 @@ func (b *binding) enumInHook() bool {
 type Plan struct {
 	g        *Grammar
 	bindings []*binding
-	// fieldTags are the tags placed on existing fields.
-	fieldTags map[*types.Var]*fieldTag
-	wrappers  map[*types.Named]*wrapperType
+	wrappers map[*types.Named]*wrapperType
 	// vars are the kong variables of values only known at run time.
 	vars    []runtimeVar
 	markers map[*types.Named]*wrapperType
@@ -111,12 +103,6 @@ type Plan struct {
 type failure struct {
 	cl     *clause
 	reason string
-}
-
-type fieldTag struct {
-	field    *types.Var
-	tag      string
-	bindings []*binding
 }
 
 // Issue is something the conversion cannot do on its own.
@@ -137,11 +123,10 @@ func (p *Plan) issue(pos token.Position, format string, args ...any) {
 // NewPlan decides how every registration maps onto kong.
 func NewPlan(g *Grammar) *Plan {
 	p := &Plan{
-		g:         g,
-		fieldTags: map[*types.Var]*fieldTag{},
-		wrappers:  map[*types.Named]*wrapperType{},
-		markers:   map[*types.Named]*wrapperType{},
-		issued:    map[Issue]bool{},
+		g:        g,
+		wrappers: map[*types.Named]*wrapperType{},
+		markers:  map[*types.Named]*wrapperType{},
+		issued:   map[Issue]bool{},
 	}
 	// Discover the was-set wrapper types first, so a registration of a
 	// wrapper's value without its Set action is recognized wherever it is.
@@ -156,22 +141,19 @@ func NewPlan(g *Grammar) *Plan {
 		if c.kind != kindFlag && c.kind != kindArg {
 			continue
 		}
-		if c.builtinHelp {
-			continue
-		}
 		if b := p.bind(c); b != nil {
 			p.bindings = append(p.bindings, b)
 		} else if n := len(p.Issues); n > 0 {
 			p.failed = append(p.failed, failure{c, p.Issues[n-1].Reason})
 		}
 	}
-	p.collectFieldTags()
+	p.checkFieldTags()
 	return p
 }
 
 // bind works out where a flag's value lands relative to its command.
 func (p *Plan) bind(c *clause) *binding {
-	for _, is := range append(c.issues, c.notes...) {
+	for _, is := range c.issues {
 		p.issue(c.pos, "%s %q: %s", c.kind, c.name, is)
 	}
 	if len(c.issues) > 0 {
@@ -184,7 +166,7 @@ func (p *Plan) bind(c *clause) *binding {
 		return nil
 	}
 	if _, ok := c.dst.(vStorage); ok {
-		b.storage = true
+		b.mode = modeStorage
 		b.tag = p.tagFor(b, p.g.prog.identFromName(c.name))
 		return b
 	}
@@ -220,41 +202,29 @@ func (p *Plan) bind(c *clause) *binding {
 		return nil
 	}
 
+	wrapped := false
 	if c.action != nil {
 		w, wrapperObj, ok := p.wrapperFor(c.action, b.holder, b.field)
-		switch {
-		case ok:
-			b.wrapper = w
+		if ok {
+			b.wrapper, wrapped = w, true
 			b.field, b.holder = wrapperObj.pfield, wrapperObj.parent
-		case p.foreignMark(c.action) != nil:
-			// The action marks another value as given, as in
-			// .Action(c.Password.Set).StringVar(&c.Pipeline.Value).
-			// Keep the mark, and copy the flag's own value when it is given.
-			b.marks = p.foreignMark(c.action)
-			if b.holder != nil && b.holder.parent != nil {
-				if w := p.wrapperOf(b.holder.typ); w != nil && w.value == b.field {
-					b.valueOfWrapper = true
-				}
-			}
-		default:
+		} else if b.marks = p.foreignMark(c.action); b.marks == nil {
 			p.issue(c.pos, "%s %q: its Action callback has no kong equivalent", c.kind, c.name)
 			return nil
 		}
-	} else if b.holder != nil && b.holder.parent != nil {
+		// Otherwise the action marks another value as given, as in
+		// .Action(c.Password.Set).StringVar(&c.Pipeline.Value).
+		// The mark stays, and the flag's own value is copied when it is given.
+	}
+	if !wrapped && b.holder != nil && b.holder.parent != nil {
 		if w := p.wrapperOf(b.holder.typ); w != nil && w.value == b.field {
 			b.valueOfWrapper = true
 		}
 	}
 
-	defer func() {
-		if b.marks != nil && !b.storage {
-			b.mode, b.keepPrior = modeShadow, true
-		}
-	}()
 	switch {
 	case b.dstVar != nil:
 		b.mode = modeShadow
-		b.keepPrior = true
 	case b.inst == nil:
 		// Application flags: the root grammar embeds the struct holding them.
 		b.mode = modeDirect
@@ -278,6 +248,9 @@ func (p *Plan) bind(c *clause) *binding {
 		b.dstExpr, b.keepPrior = p.shadowTarget(b)
 	}
 	b.tag = p.tagFor(b, p.tagFieldName(b))
+	if b.marks != nil {
+		b.mode, b.keepPrior = modeShadow, true
+	}
 	return b
 }
 
@@ -330,12 +303,8 @@ func (p *Plan) shadowTarget(b *binding) (string, bool) {
 	// The prior value only matters when it can differ from the zero value
 	// kong starts the shadow with.
 	prior := shared || !b.holder.root().known
-	if v, ok := b.holder.fields[b.field]; ok {
-		if _, isZero := v.(vConst); !isZero {
-			prior = true
-		} else if !isZeroConst(v) {
-			prior = true
-		}
+	if v, ok := b.holder.fields[b.field]; ok && !isZeroConst(v) {
+		prior = true
 	}
 	return "c." + strings.Join(parts, "."), prior
 }
@@ -355,13 +324,7 @@ func (p *Plan) wrapperFor(action value, holder *object, field *types.Var) (*wrap
 	if !ok || fv.fn == nil || holder == nil || field == nil {
 		return nil, nil, false
 	}
-	var recv *object
-	switch r := fv.recv.(type) {
-	case vObj:
-		recv = r.o
-	case vPtr:
-		recv = r.o
-	}
+	recv := structObj(fv.recv)
 	if recv == nil {
 		return nil, nil, false
 	}
@@ -417,13 +380,7 @@ func (p *Plan) foreignMark(action value) *mark {
 	if !ok || fv.fn == nil {
 		return nil
 	}
-	var recv *object
-	switch r := fv.recv.(type) {
-	case vObj:
-		recv = r.o
-	case vPtr:
-		recv = r.o
-	}
+	recv := structObj(fv.recv)
 	if recv == nil {
 		return nil
 	}
@@ -499,23 +456,20 @@ func markerAssign(fd funcDecl) *types.Var {
 	return f
 }
 
-// collectFieldTags groups direct and embed bindings by field.
-// Every command sharing a field must register it the same way, since a struct
-// tag is the same for every use of the type.
-func (p *Plan) collectFieldTags() {
+// checkFieldTags reports fields that commands register with different settings.
+// A struct tag is the same for every use of the type, so they must all agree.
+func (p *Plan) checkFieldTags() {
+	tags := map[*types.Var]string{}
 	for _, b := range p.bindings {
 		if b.mode == modeShadow || b.field == nil {
 			continue
 		}
-		ft := p.fieldTags[b.field]
 		tag := b.tag.String()
-		if ft == nil {
-			ft = &fieldTag{field: b.field, tag: tag}
-			p.fieldTags[b.field] = ft
-		} else if ft.tag != tag {
-			p.issue(b.cl.pos, "field %s is registered with different flag settings by different commands (%s vs %s)", b.field.Name(), ft.tag, tag)
+		if first, ok := tags[b.field]; !ok {
+			tags[b.field] = tag
+		} else if first != tag {
+			p.issue(b.cl.pos, "field %s is registered with different flag settings by different commands (%s vs %s)", b.field.Name(), first, tag)
 		}
-		ft.bindings = append(ft.bindings, b)
 	}
 }
 
@@ -832,7 +786,7 @@ func wrappedStringPlaceholder(b *binding) string {
 
 // tagFieldName is the name the tagged field will have after conversion.
 func (p *Plan) tagFieldName(b *binding) string {
-	if b.mode == modeShadow || b.field == nil || b.storage {
+	if b.mode == modeShadow || b.field == nil || b.mode == modeStorage {
 		return p.g.prog.identFromName(b.cl.name)
 	}
 	return p.g.prog.exported(b.field.Name())
@@ -866,7 +820,7 @@ func hasIsCumulative(t types.Type) bool {
 }
 
 func (p *Plan) isSliceDest(b *binding) bool {
-	if b.storage {
+	if b.mode == modeStorage {
 		_, ok := b.cl.storageType.Underlying().(*types.Slice)
 		return ok
 	}
@@ -890,46 +844,4 @@ func (p *Plan) isSliceDest(b *binding) bool {
 	}
 	_, ok := t.Underlying().(*types.Slice)
 	return ok
-}
-
-// Summary writes the plan's statistics, for debugging.
-func (p *Plan) Summary() string {
-	modes := map[string]int{}
-	for _, b := range p.bindings {
-		k := b.mode.String()
-		if b.wrapper != nil {
-			k += "+wrapper"
-		}
-		if b.valueOfWrapper {
-			k += "+unmarked"
-		}
-		if b.keepPrior {
-			k += "+keep"
-		}
-		modes[k]++
-	}
-	var keys []string
-	for k := range modes {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
-	var sb strings.Builder
-	for _, k := range keys {
-		fmt.Fprintf(&sb, "%6d %s\n", modes[k], k)
-	}
-	fmt.Fprintf(&sb, "%6d tagged fields\n", len(p.fieldTags))
-	fmt.Fprintf(&sb, "%6d wrapper types\n", len(p.wrappers))
-	reasons := map[string]int{}
-	for _, is := range p.Issues {
-		reasons[is.Reason]++
-	}
-	var rs []string
-	for r := range reasons {
-		rs = append(rs, r)
-	}
-	sort.Slice(rs, func(i, j int) bool { return reasons[rs[i]] > reasons[rs[j]] })
-	for _, r := range rs {
-		fmt.Fprintf(&sb, "issue x%d: %s\n", reasons[r], r)
-	}
-	return sb.String()
 }

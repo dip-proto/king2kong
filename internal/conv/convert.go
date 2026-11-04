@@ -213,7 +213,6 @@ func (ci cliInit) expr(rootPath string) dst.Expr {
 
 // hookSet gathers the statements of the hooks generated for one type.
 type hookSet struct {
-	typ          *types.Named
 	before       []string
 	beforeParams map[string]string // parameter name -> type source
 	after        []string
@@ -284,13 +283,12 @@ func (h *hookSet) paramToLocal(name, typ, decl string) bool {
 // param adds a parameter to the BeforeApply hook and returns its name, with a
 // number appended when a parameter of another type already uses it.
 func (h *hookSet) param(name, typ string) string {
-	for n, i := name, 2; ; i++ {
-		if t, ok := h.beforeParams[n]; !ok || t == typ {
-			h.beforeParams[n] = typ
-			return n
-		}
-		n = fmt.Sprintf("%s%d", name, i)
-	}
+	n := firstFree(func(n string) bool {
+		t, ok := h.beforeParams[n]
+		return ok && t != typ
+	}, name)
+	h.beforeParams[n] = typ
+	return n
 }
 
 // Options tunes a conversion.
@@ -357,7 +355,7 @@ func Convert(prog *Program, opts Options) (*Result, error) {
 		// kong calls a command's methods with these names on its own while
 		// parsing, which kingpin never did.
 		for _, name := range []string{"BeforeReset", "BeforeResolve", "BeforeApply", "AfterApply", "Validate", "AfterRun"} {
-			if _, ok := lookupMethod(n.typ, name).(*types.Func); ok {
+			if hasMethod(n.typ, name) {
 				c.issue(n.cl.pos, "command %q: kong calls %s.%s on its own while parsing, which kingpin never did; rename it if it isn't meant for that", n.cl.fullName(), n.typ.Obj().Name(), name)
 			}
 		}
@@ -393,7 +391,7 @@ func Convert(prog *Program, opts Options) (*Result, error) {
 	// application are reported here.
 	holders := map[*object]*clause{}
 	for _, n := range c.tree.nodes {
-		for _, is := range append(n.cl.issues, n.cl.notes...) {
+		for _, is := range n.cl.issues {
 			c.issue(n.cl.pos, "%s: %s", describeClause(n.cl), is)
 		}
 		// kong gives each command a struct of its own.
@@ -514,7 +512,7 @@ func (c *converter) issue(pos token.Position, format string, args ...any) {
 func (c *converter) hookFor(t *types.Named) *hookSet {
 	h := c.hooks[t]
 	if h == nil {
-		h = &hookSet{typ: t, beforeParams: map[string]string{}, imports: map[string]string{}}
+		h = &hookSet{beforeParams: map[string]string{}, imports: map[string]string{}}
 		c.hooks[t] = h
 	}
 	return h
@@ -546,7 +544,6 @@ func (c *converter) convertFlags() {
 		dst  string
 	}
 	shadows := map[shadowKey]*binding{}
-	shadowName := map[shadowKey]string{}
 
 	reported := map[*types.Var]bool{}
 	for _, b := range c.plan.bindings {
@@ -557,7 +554,7 @@ func (c *converter) convertFlags() {
 		if b.cl.kind == kindArg {
 			c.res.Stats.Args++
 		}
-		if b.storage {
+		if b.mode == modeStorage {
 			// Added as a new field later, with the command tree.
 			continue
 		}
@@ -574,16 +571,7 @@ func (c *converter) convertFlags() {
 					if s.f.Anonymous() || c.tagged[s.f] {
 						continue
 					}
-					sOwner := c.nm.declaringType(s.f)
-					name := c.nm.exportField(sOwner, s.f)
-					shared, err := c.ed.addTag(s.f, `embed:""`)
-					if err != nil {
-						c.issue(b.cl.pos, "%v", err)
-						continue
-					}
-					c.reportSharedKeys(b, s.f, shared)
-					c.rename(s.f, name)
-					c.tagged[s.f] = true
+					c.tagField(b, s.f, c.nm.exportField(c.nm.declaringType(s.f), s.f), `embed:""`)
 				}
 			}
 			if c.tagged[b.field] {
@@ -594,15 +582,7 @@ func (c *converter) convertFlags() {
 				c.issue(b.cl.pos, "no free name to export field %s", b.field.Name())
 				continue
 			}
-			tag := c.plan.tagFor(b, name)
-			shared, err := c.ed.addTag(b.field, tag.String())
-			if err != nil {
-				c.issue(b.cl.pos, "%v", err)
-				continue
-			}
-			c.reportSharedKeys(b, b.field, shared)
-			c.rename(b.field, name)
-			c.tagged[b.field] = true
+			c.tagField(b, b.field, name, c.plan.tagFor(b, name).String())
 		case modeShadow:
 			if b.inst == nil {
 				if c.main != nil && b.dstVar != nil {
@@ -623,7 +603,7 @@ func (c *converter) convertFlags() {
 				if prev.tag.String() != b.tag.String() {
 					c.issue(b.cl.pos, "flag %q is registered differently by commands sharing %s", b.cl.name, host.Obj().Name())
 				}
-				b.shadowField = shadowName[key]
+				b.shadowField = prev.shadowField
 				if loc, ok := c.shadowFields[prev]; ok {
 					c.shadowFields[b] = loc
 				}
@@ -635,7 +615,6 @@ func (c *converter) convertFlags() {
 				c.issue(b.cl.pos, "no free field name for flag %q", b.cl.name)
 				continue
 			}
-			shadowName[key] = name
 			c.addShadow(host, name, expr, b)
 			b.shadowField = name
 		}
@@ -649,7 +628,7 @@ func (c *converter) checkArgOrder() {
 	seq := 0
 	keys := map[*binding][]int{}
 	for _, b := range c.plan.bindings {
-		if b.cl.kind != kindArg || b.inst == nil || b.storage {
+		if b.cl.kind != kindArg || b.inst == nil || b.mode == modeStorage {
 			continue
 		}
 		var key []int
@@ -675,7 +654,7 @@ func (c *converter) checkArgOrder() {
 	for cmd, list := range byCmd {
 		sorted := true
 		for i := 1; i < len(list); i++ {
-			if lessKey(keys[list[i]], keys[list[i-1]]) {
+			if slices.Compare(keys[list[i]], keys[list[i-1]]) < 0 {
 				sorted = false
 			}
 		}
@@ -762,15 +741,6 @@ func (c *converter) reorderArgs(list []*binding) bool {
 // by position somewhere, which adding or reordering fields would break.
 func (c *converter) unkeyedLiterals(t *types.Named) bool {
 	return c.prog.unkeyedLiterals(t)
-}
-
-func lessKey(a, b []int) bool {
-	for i := 0; i < len(a) && i < len(b); i++ {
-		if a[i] != b[i] {
-			return a[i] < b[i]
-		}
-	}
-	return len(a) < len(b)
 }
 
 // indexOf returns the position of a field in the struct declaring it.
@@ -923,7 +893,7 @@ func (c *converter) convertEnumChecks() {
 			// --role=.
 			if b.cl.kind == kindFlag && c.compatPath != "" {
 				h.checksGiven = true
-				h.imports["github.com/alecthomas/kong"] = "kong"
+				h.imports[kongPath] = "kong"
 				name := importName(h.imports, c.compatPath, "kongcompat")
 				guard = "(" + val + ` != "" || ` + name + ".Given(ctx, " + strconv.Quote(b.cl.name) + ")) && "
 			}
@@ -998,16 +968,11 @@ func (c *converter) unprivateHeading(f *types.Var) {
 		return
 	}
 	list := loc.st.Fields.List
-	for j := slices.Index(list, loc.field); j >= 0; j-- {
-		if j == 0 || list[j].Decs.Before == dst.EmptyLine {
-			start := list[j].Decs.Start
-			for i, l := range start {
-				if r := privateFields.ReplaceAllString(l, "$2"); r != l {
-					start[i] = r
-					c.ed.touch(loc.pkg, loc.file)
-				}
-			}
-			return
+	start := headingOf(list, slices.Index(list, loc.field))
+	for i, l := range start {
+		if r := privateFields.ReplaceAllString(l, "$2"); r != l {
+			start[i] = r
+			c.ed.touch(loc.pkg, loc.file)
 		}
 	}
 }
@@ -1051,7 +1016,7 @@ func (c *converter) addShadow(host *types.Named, name, dstExpr string, b *bindin
 		h.after = append(h.after, fmt.Sprintf("%s = c.%s", dstExpr, name))
 	}
 	tag := c.plan.tagFor(b, name)
-	decls, err := snippet(pkg.Name(), h.imports, fmt.Sprintf("type _ struct {\n%s %s %s\n}", name, fieldType, tagLiteral(tag.String())))
+	decls, err := snippet(pkg.Name(), h.imports, fmt.Sprintf("type _ struct {\n%s %s %s\n}", name, fieldType, tag.Literal()))
 	if err != nil {
 		c.issue(b.cl.pos, "%v", err)
 		return
@@ -1109,13 +1074,13 @@ func (c *converter) addDecode(w *wrapperType) {
 		c.issue(token.Position{}, "%s has a Decode method kong does not know, so kong cannot decode it; rename that method", w.named.Obj().Name())
 		return
 	}
-	if c.hasMethod(w.named, "Decode") {
+	if hasMethod(w.named, "Decode") {
 		return
 	}
 	recv := c.methodRecv(w.named, "o")
 	t := recvType(w.named)
 	v := w.value.Name()
-	imports := map[string]string{"github.com/alecthomas/kong": "kong"}
+	imports := map[string]string{kongPath: "kong"}
 	var body string
 	named, _ := w.value.Type().(*types.Named)
 	switch u := w.value.Type().Underlying().(type) {
@@ -1252,7 +1217,7 @@ func (%[1]s *%[2]s) IsCumulative() bool {
 		c.issue(token.Position{}, "%v", err)
 		return
 	}
-	c.ed.insertAfter(loc.pkg, loc.file, c.lastMethodOrType(w.named, loc.gen), decls)
+	c.addMethods(w.named, decls)
 }
 
 // numericDecode is the Decode method of a was-set wrapper holding a number,
@@ -1327,11 +1292,11 @@ func negatedNote(negated bool) string {
 // that records whether a flag was given.
 func (c *converter) addMarkerHook(m *types.Named, w *wrapperType) {
 	loc, ok := c.ed.typeSpecs[m.Obj()]
-	if !ok || c.hasMethod(m, "AfterApply") || c.hasMethod(w.named, "Decode") {
+	if !ok || hasMethod(m, "AfterApply") || hasMethod(w.named, "Decode") {
 		return
 	}
 	recv := c.methodRecv(m, "o")
-	imports := map[string]string{"github.com/alecthomas/kong": "kong", "slices": "slices"}
+	imports := map[string]string{kongPath: "kong", "slices": "slices"}
 	body := fmt.Sprintf(`// AfterApply records that the flag was given on the command line.
 // Kong also calls it for flags that only received a default or an environment
 // variable, which do not count, hence the check of the parse path.
@@ -1356,17 +1321,15 @@ func (%[1]s *%[2]s) AfterApply(ctx *kong.Context, path *kong.Path) error {
 }
 
 // hasMethod reports whether t or *t declares or promotes a method.
-func (c *converter) hasMethod(t *types.Named, name string) bool {
-	obj, _, _ := types.LookupFieldOrMethod(types.NewPointer(t), true, t.Obj().Pkg(), name)
-	_, isFunc := obj.(*types.Func)
+func hasMethod(t *types.Named, name string) bool {
+	_, isFunc := lookupMethod(t, name).(*types.Func)
 	return isFunc
 }
 
 // foreignDecode reports whether t has a Decode method kong would not call, as
 // for envconfig's Decode(string) error, which leaves no name for kong's.
 func (c *converter) foreignDecode(t *types.Named) bool {
-	obj, _, _ := types.LookupFieldOrMethod(types.NewPointer(t), true, t.Obj().Pkg(), "Decode")
-	fn, ok := obj.(*types.Func)
+	fn, ok := lookupMethod(t, "Decode").(*types.Func)
 	if !ok {
 		return false
 	}
@@ -1438,14 +1401,25 @@ func isTypeParam(t *types.Named, name string) bool {
 	return false
 }
 
-// lastMethodOrType returns the declaration after which new methods of t read
-// best: its last method in the file declaring the type, or the type itself.
-func (c *converter) lastMethodOrType(t *types.Named, gen *dst.GenDecl) dst.Decl {
+// tagField tags f, one of the fields on the way to b's value, and exports it as name.
+func (c *converter) tagField(b *binding, f *types.Var, name, tag string) {
+	shared, err := c.ed.addTag(f, tag)
+	if err != nil {
+		c.issue(b.cl.pos, "%v", err)
+		return
+	}
+	c.reportSharedKeys(b, f, shared)
+	c.rename(f, name)
+	c.tagged[f] = true
+}
+
+// addMethods inserts decls where new methods of t read best: after its last method in the file declaring the type, or after the type itself.
+func (c *converter) addMethods(t *types.Named, decls []dst.Decl) {
 	loc := c.ed.typeSpecs[t.Obj()]
-	var last dst.Decl = gen
+	var last dst.Decl = loc.gen
 	seen := false
 	for _, d := range loc.file.Decls {
-		if d == dst.Decl(gen) {
+		if d == dst.Decl(loc.gen) {
 			seen = true
 			continue
 		}
@@ -1462,7 +1436,7 @@ func (c *converter) lastMethodOrType(t *types.Named, gen *dst.GenDecl) dst.Decl 
 			}
 		}
 	}
-	return last
+	c.ed.insertAfter(loc.pkg, loc.file, last, decls)
 }
 
 // convertConstructors removes the functions that built commands, moving what
@@ -1783,8 +1757,6 @@ func sameConstant(p *Package, args []dst.Expr) (string, types.Type, bool) {
 // constLiteral writes a constant value as Go source.
 func constLiteral(v constant.Value) string {
 	switch v.Kind() {
-	case constant.String:
-		return strconv.Quote(constant.StringVal(v))
 	case constant.Float:
 		if n := constant.ToInt(v); n.Kind() == constant.Int {
 			return n.ExactString()
@@ -1826,15 +1798,11 @@ func (c *converter) visibleAtParser(v *types.Var) bool {
 	for _, f := range root.Syntax {
 		dst.Inspect(f, func(n dst.Node) bool {
 			call, ok := n.(*dst.CallExpr)
-			if !ok || c.runtimeCall(root, call) != "New" {
+			if !ok || c.prog.runtimeCall(root, call) != "New" {
 				return true
 			}
-			if a := root.astOf(call); a != nil {
-				if scope := root.Types.Scope().Innermost(a.Pos()); scope != nil {
-					if _, obj := scope.LookupParent(v.Name(), a.Pos()); obj == v {
-						visible = true
-					}
-				}
+			if c.namesAt(root, call, v) {
+				visible = true
 			}
 			return true
 		})

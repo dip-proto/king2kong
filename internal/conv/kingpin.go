@@ -431,7 +431,7 @@ func (in *interp) kingpinMethod(fr *frame, c *dst.CallExpr, cl *clause, name str
 // helpClause returns the help flag kingpin creates for every application.
 func (in *interp) helpClause(app *clause) *clause {
 	if app.helpFlag == nil {
-		app.helpFlag = &clause{kind: kindFlag, parent: app, name: "help", nameOK: true, builtinHelp: true}
+		app.helpFlag = &clause{kind: kindFlag, parent: app, name: "help", nameOK: true}
 	}
 	return app.helpFlag
 }
@@ -440,7 +440,7 @@ func (in *interp) helpClause(app *clause) *clause {
 // can change through the application's VersionFlag field.
 func (in *interp) versionClause(app *clause) *clause {
 	if app.versionFlag == nil {
-		app.versionFlag = &clause{kind: kindFlag, parent: app, name: "version", nameOK: true, builtinHelp: true}
+		app.versionFlag = &clause{kind: kindFlag, parent: app, name: "version", nameOK: true}
 	}
 	return app.versionFlag
 }

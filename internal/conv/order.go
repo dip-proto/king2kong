@@ -45,7 +45,7 @@ func (c *converter) reorderFlags() {
 		last := map[*dst.Field]int{}
 		holdsArg := map[*dst.Field]bool{}
 		for _, b := range byCmd[n.cl] {
-			for _, loc := range c.flagFields(b, n) {
+			for _, loc := range c.flagFields(b) {
 				if b.cl.kind != kindFlag {
 					holdsArg[loc.field] = true
 					continue
@@ -98,7 +98,7 @@ func (c *converter) reorderFlags() {
 			continue
 		}
 		owner := c.structOwner(locs[st])
-		if owner == nil || !plan.ok || c.unkeyedLiterals(owner) || c.convertedStruct(owner) {
+		if owner == nil || len(plan.crossing) > 0 || c.unkeyedLiterals(owner) || c.convertedStruct(owner) {
 			unordered = append(unordered, wantedBy[st]...)
 			continue
 		}
@@ -210,7 +210,7 @@ func (c *converter) addFlagOrders(nodes []*node) {
 			c.issue(token.Position{}, "%v", err)
 			continue
 		}
-		c.ed.insertAfter(loc.pkg, loc.file, c.lastMethodOrType(t, loc.gen), decls)
+		c.addMethods(t, decls)
 	}
 }
 
@@ -245,9 +245,7 @@ type fieldLayout struct {
 	moves map[*dst.Field]fieldMove
 	// crossing lists the fields that would leave a group under a heading
 	// comment, or take a comment of their own to another group.
-	// ok is false when there are so many that the headings would end up
-	// describing the wrong fields.
-	ok       bool
+	// Any of them would put a field under the wrong comment, so the struct keeps its layout and FlagOrder keeps the help right instead.
 	crossing []*dst.Field
 	// headingMoves counts the moved fields that start a commented group.
 	headingMoves int
@@ -361,9 +359,6 @@ func layoutKeeping(old []*dst.Field, key map[*dst.Field]int, stays map[*dst.Fiel
 		layout.moves[f] = m
 	}
 	layout.list = list
-	// A field leaving its commented group would end up under the wrong
-	// comment; FlagOrder keeps the help right instead.
-	layout.ok = len(layout.crossing) == 0
 	return layout
 }
 
@@ -519,13 +514,13 @@ func interleaved(keys map[*dst.StructType]map[*dst.Field]int, last map[*dst.Fiel
 	return false
 }
 
-// flagFields returns the fields on the way from command n to the value of
-// b's flag or argument: the command's field embedding a struct, that
+// flagFields returns the fields on the way from b's command to the value of
+// its flag or argument: the command's field embedding a struct, that
 // struct's field, and so on down to the value's own field or the field
 // added for it.
-func (c *converter) flagFields(b *binding, n *node) []fieldLoc {
+func (c *converter) flagFields(b *binding) []fieldLoc {
 	switch {
-	case b.storage:
+	case b.mode == modeStorage:
 		return nil
 	case b.mode == modeShadow && b.inst == nil:
 		// A global flag has no command struct holding its copy.
@@ -536,7 +531,7 @@ func (c *converter) flagFields(b *binding, n *node) []fieldLoc {
 			return nil
 		}
 		// The field was added to the command struct the value is reached
-		// from, which n's struct may embed.
+		// from, which the command's own struct may embed.
 		var out []fieldLoc
 		for _, s := range b.path[:len(b.path)-len(rest)] {
 			loc, ok := c.ed.fieldDecl(s.f)

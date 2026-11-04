@@ -48,7 +48,7 @@ func (c *converter) addSetDecode(t *types.Named, b *binding) {
 		c.issue(b.cl.pos, "%s %q: %s has a Decode method kong does not know, so kong cannot decode it; rename that method", b.cl.kind, b.cl.name, t.Obj().Name())
 		return
 	}
-	if c.hasMethod(t, "Decode") {
+	if hasMethod(t, "Decode") {
 		return
 	}
 	loc, ok := c.ed.typeSpecs[t.Obj()]
@@ -56,7 +56,7 @@ func (c *converter) addSetDecode(t *types.Named, b *binding) {
 		c.issue(b.cl.pos, "%s %q: kong cannot decode %s, which is declared elsewhere; register a kong mapper for it", b.cl.kind, b.cl.name, t.Obj().Name())
 		return
 	}
-	if !c.hasMethod(t, "Set") {
+	if !hasMethod(t, "Set") {
 		c.issue(b.cl.pos, "%s %q: %s has no Set method", b.cl.kind, b.cl.name, t.Obj().Name())
 		return
 	}
@@ -81,7 +81,7 @@ func (%[1]s *%[2]s) Decode(ctx *kong.DecodeContext) error {
 func (%[1]s *%[2]s) IsBool() bool {
 	return %[1]s.IsBoolFlag()
 }`, recv, name)
-	} else if c.hasMethod(t, "IsCumulative") {
+	} else if hasMethod(t, "IsCumulative") {
 		body = fmt.Sprintf(`// Decode implements kong.MapperValue with Set, which kingpin called for
 // each value.
 // An argument takes the rest of the command line, and a default or an
@@ -117,7 +117,7 @@ func (%[1]s *%[2]s) Decode(ctx *kong.DecodeContext) error {
 	return %[1]s.Set(value)
 }`, recv, name)
 	}
-	imports := map[string]string{"github.com/alecthomas/kong": "kong"}
+	imports := map[string]string{kongPath: "kong"}
 	for _, pkg := range []string{"fmt", "strings"} {
 		if strings.Contains(body, pkg+".") {
 			imports[pkg] = pkg
@@ -128,6 +128,6 @@ func (%[1]s *%[2]s) Decode(ctx *kong.DecodeContext) error {
 		c.issue(token.Position{}, "%v", err)
 		return
 	}
-	c.ed.insertAfter(loc.pkg, loc.file, c.lastMethodOrType(t, loc.gen), decls)
+	c.addMethods(t, decls)
 	c.cmdTypes[t] = true
 }

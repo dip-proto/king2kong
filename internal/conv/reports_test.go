@@ -7,8 +7,7 @@ import (
 	"testing"
 )
 
-// TestReports checks that programs the tool can't fully convert get a
-// report instead of a silent change.
+// TestReports checks that programs the tool can't fully convert get a report instead of a silent change.
 func TestReports(t *testing.T) {
 	cmdPkg := `package cmd
 
@@ -175,20 +174,17 @@ func main() {
 	}
 }
 
-// convertProbe converts a module named probe made of files, using kingpin v2.
+// convertProbe converts a kingpin v2 module named probe, made of the given files.
 func convertProbe(t *testing.T, files map[string]string) *Result {
 	t.Helper()
 	dir := t.TempDir()
-	mod, err := os.ReadFile(filepath.Join("testdata", "classic", "go.mod"))
-	if err != nil {
-		t.Fatal(err)
+	for _, name := range []string{"go.mod", "go.sum"} {
+		b, err := os.ReadFile(filepath.Join("testdata", "classic", name))
+		if err != nil {
+			t.Fatal(err)
+		}
+		writeFile(t, filepath.Join(dir, name), strings.Replace(string(b), "module classic", "module probe", 1))
 	}
-	writeFile(t, filepath.Join(dir, "go.mod"), strings.Replace(string(mod), "module classic", "module probe", 1))
-	sum, err := os.ReadFile(filepath.Join("testdata", "classic", "go.sum"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	writeFile(t, filepath.Join(dir, "go.sum"), string(sum))
 	for name, src := range files {
 		writeFile(t, filepath.Join(dir, name), src)
 	}

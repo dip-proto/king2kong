@@ -5,9 +5,7 @@ import (
 	"testing"
 )
 
-// TestRegistrationComments checks that the comments above flag registrations
-// end up on the fields declaring the flags, and those of moved setup in the
-// hooks.
+// TestRegistrationComments checks that comments above flag registrations end up on the flags' fields, and that comments on moved setup code follow it into the hooks.
 func TestRegistrationComments(t *testing.T) {
 	for _, tc := range []struct {
 		name  string
@@ -151,8 +149,7 @@ func main() {
 			file: "cmd.go",
 			want: []string{
 				"\t// Required.\n\n\t// name is what to call it.\n\tNameFlag ",
-				// The fields added for flags writing into Globals join
-				// the groups of their headings.
+				// The fields added for flags writing into Globals join the groups of their headings.
 				"`name:\"name\" required:\"\"`\n\tToken    *string\n\t// NOTE: it never changes after creation.\n\tRegion ",
 				"\n\n\t// Optional.\n\tForce bool  `negatable:\"\"`\n\tDebug *bool `negatable:\"\"`\n\tOutput\n\n",
 				"\n\n\t// Zero disables the timeout.\n\tRead ",
@@ -195,14 +192,11 @@ func main() {
 		t.Run(tc.name, func(t *testing.T) {
 			res := convertProbe(t, tc.files)
 			var src string
-			for path, s := range res.Files {
-				if strings.HasSuffix(path, "/"+tc.file) {
-					src = s
-				}
-			}
-			for path, s := range res.NewFiles {
-				if strings.HasSuffix(path, "/"+tc.file) {
-					src = s
+			for _, files := range []map[string]string{res.Files, res.NewFiles} {
+				for path, s := range files {
+					if strings.HasSuffix(path, "/"+tc.file) {
+						src = s
+					}
 				}
 			}
 			for _, want := range tc.want {

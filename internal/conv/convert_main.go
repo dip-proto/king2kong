@@ -95,7 +95,7 @@ func (c *converter) detectMain() bool {
 			if !ok || found {
 				return !found
 			}
-			switch c.runtimeCall(root, call) {
+			switch c.prog.runtimeCall(root, call) {
 			case "Parse", "MustParse", "ParseContext":
 				found = true
 			}
@@ -107,18 +107,28 @@ func (c *converter) detectMain() bool {
 
 // runtimeCall returns the name of the kingpin function or application method
 // that call invokes, or "".
-func (c *converter) runtimeCall(p *Package, call *dst.CallExpr) string {
+func (prog *Program) runtimeCall(p *Package, call *dst.CallExpr) string {
 	switch fun := call.Fun.(type) {
 	case *dst.Ident:
-		if fun.Path != "" && c.prog.isKingpinPath(fun.Path) {
+		if fun.Path != "" && prog.isKingpinPath(fun.Path) {
 			return fun.Name
 		}
 	case *dst.SelectorExpr:
-		if c.isAppType(p.typeOf(fun.X)) {
+		if prog.isAppType(p.typeOf(fun.X)) {
 			return fun.Sel.Name
 		}
 	}
 	return ""
+}
+
+// fieldNameFor picks the name of the field generated for b, adding Value until it is free, and takes it.
+func (c *converter) fieldNameFor(b *binding, taken map[string]bool) string {
+	name := c.prog.identFromName(b.cl.name)
+	for taken[name] {
+		name += "Value"
+	}
+	taken[name] = true
+	return name
 }
 
 // boundVar is a variable bound for the hooks, as the type they take.
@@ -134,21 +144,17 @@ type boundVar struct {
 func (c *converter) storageFields(n *node, pkg *types.Package, imports map[string]string, path string, taken map[string]bool) []string {
 	var lines []string
 	for _, b := range c.plan.bindings {
-		if !b.storage || b.cl.parent != n.cl || c.pkgFlagsOf[b.cl] {
+		if b.mode != modeStorage || b.cl.parent != n.cl || c.pkgFlagsOf[b.cl] {
 			continue
 		}
-		name := c.prog.identFromName(b.cl.name)
-		for taken[name] {
-			name += "Value"
-		}
-		taken[name] = true
+		name := c.fieldNameFor(b, taken)
 		t := b.cl.storageType
 		if t == nil {
 			c.issue(b.cl.pos, "%s %q: cannot tell the type of its value", b.cl.kind, b.cl.name)
 			continue
 		}
 		tag := c.plan.tagFor(b, name)
-		line := c.ownComments(b) + fmt.Sprintf("%s %s %s", name, typeExpr(t, pkg, imports), tagLiteral(tag.String()))
+		line := c.ownComments(b) + fmt.Sprintf("%s %s %s", name, typeExpr(t, pkg, imports), tag.Literal())
 		lines = append(lines, line)
 		c.fieldOrder[line] = 2 * b.cl.id
 		if n.cl.kind == kindApp {
@@ -221,13 +227,9 @@ func (c *converter) prepareMain(taken map[string]bool) {
 			c.issue(b.cl.pos, "flag %q writes into a variable of package %s, which cannot see the CLI; make it a field of a struct of that package the CLI can embed", b.cl.name, b.dstVar.Pkg().Name())
 			continue
 		}
-		name := c.prog.identFromName(b.cl.name)
-		for taken[name] {
-			name += "Value"
-		}
-		taken[name] = true
+		name := c.fieldNameFor(b, taken)
 		tag := c.plan.tagFor(b, name)
-		line := c.ownComments(b) + fmt.Sprintf("%s %s %s", name, typeExpr(b.dstVar.Type(), c.tree.RootPkg.Types, c.rootImports), tagLiteral(tag.String()))
+		line := c.ownComments(b) + fmt.Sprintf("%s %s %s", name, typeExpr(b.dstVar.Type(), c.tree.RootPkg.Types, c.rootImports), tag.Literal())
 		mp.extraFields = append(mp.extraFields, line)
 		c.fieldOrder[line] = 2 * b.cl.id
 		c.rootFieldNames[b.cl] = name
@@ -358,12 +360,7 @@ func (c *converter) startPath(path string) ([]string, bool) {
 	fields := strings.Split(strings.TrimPrefix(path, c.cliVar+"."), ".")
 	n := c.tree.Root
 	for i, f := range fields {
-		var next *node
-		for _, ch := range n.children {
-			if ch.field == f {
-				next = ch
-			}
-		}
+		next := n.child(f)
 		if next == nil || next.typ == nil || i < len(fields)-1 && !next.containerOwn {
 			return nil, false
 		}
@@ -428,10 +425,8 @@ func (c *converter) cliStart() *dst.CompositeLit {
 	for _, st := range c.main.starts {
 		cur, n := cli, c.tree.Root
 		for i, f := range st.path {
-			for _, ch := range n.children {
-				if ch.field == f {
-					n = ch
-				}
+			if ch := n.child(f); ch != nil {
+				n = ch
 			}
 			if i == len(st.path)-1 {
 				st.lit.Type = c.typeIdent(n.typ)
@@ -697,7 +692,7 @@ func (c *converter) rewriteMain() {
 					// (*kingpin.Application)(nil).Name, keeps the kingpin
 					// type, since the kong parser has none of its fields.
 					if tv, ok := p.tv(n.Fun); ok && tv.IsType() && read[n] != "" {
-						if c.isAppType(tv.Type) && slices.ContainsFunc(n.Args, func(a dst.Expr) bool { return c.isAppType(p.typeOf(a)) && !isNilIdent(p, a) }) {
+						if c.prog.isAppType(tv.Type) && slices.ContainsFunc(n.Args, func(a dst.Expr) bool { return c.prog.isAppType(p.typeOf(a)) && !isNilIdent(p, a) }) {
 							c.issue(p.position(n), "this reads the kingpin application's %s, which the kong parser that replaced it does not have; rewrite it by hand", read[n])
 						}
 						for _, a := range n.Args {
@@ -709,7 +704,7 @@ func (c *converter) rewriteMain() {
 					// Kept code now passes the kong parser around where it
 					// passed the application.
 					if n.Name == "Application" && c.prog.isKingpinPath(n.Path) {
-						n.Name, n.Path = "Kong", "github.com/alecthomas/kong"
+						n.Name, n.Path = "Kong", kongPath
 						c.ed.touch(p, f)
 					}
 				}
@@ -733,7 +728,7 @@ func (c *converter) retypeApplication(p *Package, f *dst.File, n dst.Node) {
 			}
 		}
 		if id, ok := cur.Node().(*dst.Ident); ok && id.Name == "Application" && c.prog.isKingpinPath(id.Path) {
-			id.Name, id.Path = "Kong", "github.com/alecthomas/kong"
+			id.Name, id.Path = "Kong", kongPath
 			c.ed.touch(p, f)
 		}
 		return true
@@ -813,7 +808,7 @@ func (c *converter) reportMethodValue(p *Package, cur *dstutil.Cursor, sel *dst.
 	case "Errorf", "Fatalf", "FatalIfError":
 		return
 	}
-	if s := p.selection(sel); s != nil && s.Kind() == types.MethodVal && c.isAppType(s.Recv()) {
+	if s := p.selection(sel); s != nil && s.Kind() == types.MethodVal && c.prog.isAppType(s.Recv()) {
 		c.issue(p.position(sel), "%s is used as a value, but the kong parser has no such method; rewrite it by hand", render(sel))
 	}
 }
@@ -829,7 +824,7 @@ func (c *converter) adaptErrors(p *Package, sel *dst.SelectorExpr) bool {
 		return false
 	}
 	s := p.selection(sel)
-	if s == nil || !c.isAppType(s.Recv()) {
+	if s == nil || !c.prog.isAppType(s.Recv()) {
 		return false
 	}
 	if s.Kind() != types.MethodVal {
@@ -942,7 +937,7 @@ func (c *converter) settingsChain(p *Package, call *dst.CallExpr) (dst.Expr, boo
 		if !ok {
 			break
 		}
-		name := c.runtimeCall(p, link)
+		name := c.prog.runtimeCall(p, link)
 		if name == "New" {
 			var appName, help dst.Expr
 			if len(link.Args) >= 1 {
@@ -1065,7 +1060,7 @@ func (c *converter) wireFlags(p *Package, f *dst.File) bool {
 		fd.Body.List = insertBefore(fd.Body.List, func(s dst.Stmt, calls []*dst.CallExpr) []dst.Stmt {
 			builds := slices.ContainsFunc(calls, func(call *dst.CallExpr) bool {
 				_, packageLevel := call.Fun.(*dst.Ident)
-				name := c.runtimeCall(p, call)
+				name := c.prog.runtimeCall(p, call)
 				return name == "New" || name == "Parse" && packageLevel
 			})
 			if done || !builds || !c.namesAt(p, s, w.v) {
@@ -1124,7 +1119,7 @@ func (c *converter) declareParsers(p *Package, f *dst.File) bool {
 		fd.Body.List = insertBefore(fd.Body.List, func(s dst.Stmt, calls []*dst.CallExpr) []dst.Stmt {
 			i := slices.IndexFunc(calls, func(call *dst.CallExpr) bool {
 				_, ok := call.Fun.(*dst.Ident)
-				return ok && c.runtimeCall(p, call) == "Parse" && len(call.Args) == 0
+				return ok && c.prog.runtimeCall(p, call) == "Parse" && len(call.Args) == 0
 			})
 			if i < 0 {
 				return nil
@@ -1231,7 +1226,7 @@ var configNames = map[string]bool{
 func (c *converter) configChain(p *Package, call *dst.CallExpr) ([]*dst.CallExpr, dst.Expr) {
 	var chain []*dst.CallExpr
 	for {
-		if !configNames[c.runtimeCall(p, call)] {
+		if !configNames[c.prog.runtimeCall(p, call)] {
 			return nil, nil
 		}
 		chain = append([]*dst.CallExpr{call}, chain...)
@@ -1240,7 +1235,7 @@ func (c *converter) configChain(p *Package, call *dst.CallExpr) ([]*dst.CallExpr
 			return chain, nil
 		}
 		inner, ok := sel.X.(*dst.CallExpr)
-		if !ok || c.runtimeCall(p, inner) == "" {
+		if !ok || c.prog.runtimeCall(p, inner) == "" {
 			if id, ok := sel.X.(*dst.Ident); ok && id.Name == "CommandLine" && c.prog.isKingpinPath(id.Path) {
 				return chain, nil
 			}
@@ -1254,7 +1249,7 @@ func (c *converter) configChain(p *Package, call *dst.CallExpr) ([]*dst.CallExpr
 // application recv.
 // Settings collected by scanAppSettings leave nothing behind.
 func (c *converter) configStmt(p *Package, call *dst.CallExpr, recv dst.Expr) ([]dst.Stmt, bool) {
-	name := c.runtimeCall(p, call)
+	name := c.prog.runtimeCall(p, call)
 	switch name {
 	case "Version", "UsageTemplate", "Author", "DefaultEnvars", "UsageContext":
 		return nil, true
@@ -1339,7 +1334,7 @@ func (c *converter) scanAppSettings() {
 				if len(x.Args) != 1 {
 					return true
 				}
-				name := c.runtimeCall(root, x)
+				name := c.prog.runtimeCall(root, x)
 				if name != "Version" && name != "UsageTemplate" && name != "Author" && name != "UsageContext" {
 					return true
 				}
@@ -1427,7 +1422,7 @@ func (c *converter) scanPackageSettings() {
 				}
 				for _, link := range chain {
 					args := link.Args
-					switch c.runtimeCall(root, link) {
+					switch c.prog.runtimeCall(root, link) {
 					case "Terminate":
 						mp.exit = dst.Clone(args[0]).(dst.Expr)
 					case "Writers":
@@ -1464,7 +1459,7 @@ func (c *converter) isAppSetting(p *Package, s *dst.AssignStmt) bool {
 	if id, ok := sel.X.(*dst.Ident); ok && id.Name == "CommandLine" && c.prog.isKingpinPath(id.Path) {
 		return true
 	}
-	return c.isAppType(p.typeOf(sel.X))
+	return c.prog.isAppType(p.typeOf(sel.X))
 }
 
 func (c *converter) replaced(p *Package, e dst.Expr) (replacement, bool) {
@@ -1486,16 +1481,17 @@ func kongIdent(name string) *dst.Ident {
 	return &dst.Ident{Name: name, Path: kongPath}
 }
 
-// mustCall is kong.Must(&cli, options...), with one option per line when
-// there are more than two.
+// mustCall is kong.Must(&cli, options...).
 func (c *converter) mustCall(args []dst.Expr) *dst.CallExpr {
-	call := callOf(kongIdent("Must"), args...)
+	return c.parserCall(kongIdent("Must"), args)
+}
+
+// parserCall calls the function building the parser, with one option per line when there are more than two.
+func (c *converter) parserCall(fun dst.Expr, args []dst.Expr) *dst.CallExpr {
+	call := callOf(fun, args...)
 	c.parserCalls = append(c.parserCalls, call)
 	if len(args) > 3 {
-		for _, a := range args[1:] {
-			a.Decorations().Before = dst.NewLine
-		}
-		args[len(args)-1].Decorations().After = dst.NewLine
+		onePerLine(args[1:])
 	}
 	return call
 }
@@ -1537,7 +1533,7 @@ func (c *converter) rewriteCall(p *Package, cur *dstutil.Cursor, call *dst.CallE
 		}
 	}
 	osArgs := &dst.SliceExpr{X: &dst.Ident{Name: "Args", Path: "os"}, Low: &dst.BasicLit{Kind: token.INT, Value: "1"}}
-	switch name := c.runtimeCall(p, call); name {
+	switch name := c.prog.runtimeCall(p, call); name {
 	case "New":
 		var name, help dst.Expr
 		if len(call.Args) >= 1 {
@@ -1566,7 +1562,7 @@ func (c *converter) rewriteCall(p *Package, cur *dstutil.Cursor, call *dst.CallE
 	case "MustParse":
 		if len(call.Args) == 1 {
 			if inner, ok := call.Args[0].(*dst.CallExpr); ok {
-				if isel, ok := inner.Fun.(*dst.SelectorExpr); ok && c.runtimeCall(p, inner) == "Parse" && len(inner.Args) == 1 {
+				if isel, ok := inner.Fun.(*dst.SelectorExpr); ok && c.prog.runtimeCall(p, inner) == "Parse" && len(inner.Args) == 1 {
 					cur.Replace(callOf(c.compatIdent("MustParse"), isel.X, inner.Args[0], c.usageExpr()))
 					return true
 				}
@@ -1757,7 +1753,7 @@ func (c *converter) needsValues() bool {
 		}
 		var t types.Type
 		switch {
-		case b.storage:
+		case b.mode == modeStorage:
 			t = b.cl.storageType
 		case b.field != nil:
 			t = b.field.Type()
@@ -1868,8 +1864,6 @@ func (c *converter) compatTemplate(e dst.Expr) dst.Expr {
 	return e
 }
 
-// dropReplacedLocals removes the declarations of local variables replaced by
-// fields of the CLI.
 // pointInto makes the locals s gives a command struct point to that struct
 // in the CLI: a := &A{label: 7} becomes cli.A = A{label: 7} and
 // a := &cli.A, and other shapes, such as a, n := pair(), are followed by
@@ -2065,6 +2059,8 @@ func (c *converter) pointStorage(p *Package, s dst.Stmt, body *dst.BlockStmt) bo
 	return changed
 }
 
+// dropReplacedLocals removes the declarations of local variables replaced by
+// fields of the CLI.
 func (c *converter) dropReplacedLocals(p *Package, body *dst.BlockStmt) bool {
 	changed := false
 	branches := labelJumps(body, func(*dst.BranchStmt) bool { return true })
@@ -2442,12 +2438,7 @@ func (c *converter) replacesAny(p *Package, names []dst.Expr) bool {
 func (c *converter) nodeAt(path string) *node {
 	n := c.tree.Root
 	for f := range strings.SplitSeq(strings.TrimPrefix(strings.TrimPrefix(path, c.cliVar), "."), ".") {
-		var next *node
-		for _, ch := range n.children {
-			if ch.field == f {
-				next = ch
-			}
-		}
+		next := n.child(f)
 		if next == nil {
 			return nil
 		}
@@ -2530,7 +2521,7 @@ func (c *converter) localCLI() *dst.FuncDecl {
 				continue
 			}
 			dst.Inspect(fd.Body, func(n dst.Node) bool {
-				if call, ok := n.(*dst.CallExpr); ok && c.runtimeCall(root, call) == "New" {
+				if call, ok := n.(*dst.CallExpr); ok && c.prog.runtimeCall(root, call) == "New" {
 					fn = fd
 				}
 				return true

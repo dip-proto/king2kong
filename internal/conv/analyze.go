@@ -18,7 +18,6 @@ type Grammar struct {
 	in      *interp
 	Apps    []*clause
 	roots   []*types.Func
-	Issues  []string
 	touched map[dst.Stmt]bool
 }
 
@@ -99,10 +98,8 @@ func (in *interp) findRoots() []*types.Func {
 			return false
 		}
 		for i := 0; i < sig.Results().Len(); i++ {
-			if t := sig.Results().At(i).Type(); in.prog.isKingpinType(t) {
-				if n, ok := deref(t).(*types.Named); ok && n.Obj().Name() == "Application" {
-					return true
-				}
+			if in.prog.isAppType(sig.Results().At(i).Type()) {
+				return true
 			}
 		}
 		return false
@@ -312,13 +309,7 @@ func embeds(outer, inner *object, depth int) bool {
 		if !f.Anonymous() {
 			continue
 		}
-		var o *object
-		switch v := outer.fields[f].(type) {
-		case vObj:
-			o = v.o
-		case vPtr:
-			o = v.o
-		}
+		o := structObj(outer.fields[f])
 		if o == nil {
 			continue
 		}

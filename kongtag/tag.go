@@ -67,14 +67,20 @@ func (t *Tag) String() string {
 	return strings.Join(parts, " ")
 }
 
-// Literal returns the tag as Go source: a raw string literal when possible,
-// or an interpreted one when the content contains a backtick.
+// Literal returns the tag as Go source.
 func (t *Tag) Literal() string {
-	s := t.String()
-	if strings.ContainsRune(s, '`') {
-		return strconv.Quote(s)
+	return Literal(t.String())
+}
+
+// Literal writes a struct tag as Go source: a raw string when possible, a quoted one when the tag has a backtick, and nothing when it's empty.
+func Literal(tag string) string {
+	if tag == "" {
+		return ""
 	}
-	return "`" + s + "`"
+	if strings.ContainsRune(tag, '`') {
+		return strconv.Quote(tag)
+	}
+	return "`" + tag + "`"
 }
 
 // Interpolated escapes a value kong would otherwise treat as containing ${var}

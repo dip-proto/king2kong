@@ -12,16 +12,15 @@ import (
 	"golang.org/x/tools/go/packages"
 )
 
-// fieldKey identifies a field across separately loaded copies of a package by
-// where it is declared.
-type fieldKey struct {
+// posKey identifies a declaration across separately loaded copies of a package by where it is.
+type posKey struct {
 	file   string
 	offset int
 }
 
-func keyOf(fset *token.FileSet, v *types.Var) fieldKey {
-	p := fset.Position(v.Pos())
-	return fieldKey{p.Filename, p.Offset}
+func keyOf(fset *token.FileSet, pos token.Pos) posKey {
+	p := fset.Position(pos)
+	return posKey{p.Filename, p.Offset}
 }
 
 // renameInTests applies field renames to the test files of the packages
@@ -34,7 +33,7 @@ func (c *converter) renameInTests(renames map[*types.Var]string) error {
 	if len(renames) == 0 {
 		return nil
 	}
-	byKey := map[fieldKey]string{}
+	byKey := map[posKey]string{}
 	pkgPaths := map[string]bool{}
 	for v, name := range renames {
 		if v.Pkg() == nil {
@@ -44,7 +43,7 @@ func (c *converter) renameInTests(renames map[*types.Var]string) error {
 		if p == nil {
 			continue
 		}
-		byKey[keyOf(p.Fset, v)] = name
+		byKey[keyOf(p.Fset, v.Pos())] = name
 		pkgPaths[v.Pkg().Path()] = true
 	}
 	var patterns []string
@@ -90,7 +89,7 @@ func (c *converter) renameInTests(renames map[*types.Var]string) error {
 				if !ok || !v.IsField() {
 					return true
 				}
-				if newName, ok := byKey[keyOf(p.Fset, v)]; ok && id.Name != newName {
+				if newName, ok := byKey[keyOf(p.Fset, v.Pos())]; ok && id.Name != newName {
 					edits = append(edits, edit{p.Fset.Position(id.Pos()).Offset, id.Name, newName})
 				}
 				return true

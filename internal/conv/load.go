@@ -138,6 +138,39 @@ type varInit struct {
 	expr dst.Expr
 }
 
+// loadDecorated is decorator.Load without decorating the dependencies.
+// The conversion only reads their types, and decorating every dependency took most of the time on a large program.
+func loadDecorated(cfg *packages.Config, patterns ...string) ([]*decorator.Package, error) {
+	pkgs, err := packages.Load(cfg, patterns...)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]*decorator.Package, 0, len(pkgs))
+	for _, pkg := range pkgs {
+		p := &decorator.Package{Package: pkg}
+		if len(pkg.Syntax) > 0 {
+			// Like decorator.Load, skip the preprocessed cgo files.
+			goFiles := make(map[string]bool, len(pkg.GoFiles))
+			for _, path := range pkg.GoFiles {
+				goFiles[path] = true
+			}
+			p.Decorator = decorator.NewDecoratorFromPackage(pkg)
+			for _, f := range pkg.Syntax {
+				if !goFiles[pkg.Fset.File(f.Pos()).Name()] {
+					continue
+				}
+				file, err := p.Decorator.DecorateFile(f)
+				if err != nil {
+					return nil, err
+				}
+				p.Syntax = append(p.Syntax, file)
+			}
+		}
+		out = append(out, p)
+	}
+	return out, nil
+}
+
 // Load type-checks and decorates the packages matching patterns under dir.
 func Load(dir string, patterns ...string) (*Program, error) {
 	cfg := &packages.Config{
@@ -146,7 +179,7 @@ func Load(dir string, patterns ...string) (*Program, error) {
 			packages.NeedSyntax | packages.NeedTypesInfo | packages.NeedModule,
 		Dir: dir,
 	}
-	dpkgs, err := decorator.Load(cfg, patterns...)
+	dpkgs, err := loadDecorated(cfg, patterns...)
 	if err != nil {
 		return nil, fmt.Errorf("loading packages: %w", err)
 	}

@@ -170,7 +170,7 @@ func (c *converter) convertHints() {
 				c.issue(token.Position{}, "%v", err)
 				break
 			}
-			c.ed.insertAfter(loc.pkg, loc.file, c.lastMethodOrType(host, loc.gen), decls)
+			c.addMethods(host, decls)
 			break
 		}
 		if !hosted {
