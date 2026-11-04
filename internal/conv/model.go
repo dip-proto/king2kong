@@ -90,10 +90,11 @@ type clause struct {
 	// localHelp is set when the help text is computed from local values, so
 	// it cannot move to where the parser is built.
 	localHelp bool
-	// hintExpr, in hintPkg, computes the hints given to HintOptions or
-	// HintAction at run time.
-	hintExpr dst.Expr
-	hintPkg  *Package
+	// hintExpr, in hintPkg, computes the hints given to HintOptions at run
+	// time, or is the function given to HintAction, when hintAction is set.
+	hintExpr   dst.Expr
+	hintAction bool
+	hintPkg    *Package
 	// notes are reported but, unlike issues, don't block the conversion.
 	notes   []string
 	noEnvar bool

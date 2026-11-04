@@ -822,6 +822,11 @@ func (p *Plan) isSliceDest(b *binding) bool {
 	if t == nil {
 		return false
 	}
+	// A custom value that kingpin let repeat is a list too, whatever it
+	// holds, as type headers map[string]string with IsCumulative.
+	if named, ok := deref(t).(*types.Named); ok && strings.TrimSuffix(b.cl.bind, "Var") == "SetValue" && lookupMethod(named, "IsCumulative") != nil {
+		return true
+	}
 	_, ok := t.Underlying().(*types.Slice)
 	return ok
 }

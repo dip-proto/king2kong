@@ -49,6 +49,13 @@ func (in *interp) readyAtNew(fr *frame, e dst.Expr) bool {
 				if in.app == nil || v.Pos() > in.newPos || in.changedAfterNew[v] {
 					ok = false
 				}
+				// Or through a pointer, as a helper given &cfg does.
+				switch val := fr.vars[v].(type) {
+				case vObj:
+					ok = ok && !in.changedObjects[val.o.root()]
+				case vPtr:
+					ok = ok && !in.changedObjects[val.o.root()]
+				}
 			}
 		}
 		return ok
@@ -93,7 +100,7 @@ func (in *interp) kingpinFunc(fr *frame, c *dst.CallExpr, name string, args []va
 		}
 		in.app = app
 		in.apps = append(in.apps, app)
-		in.newFn, in.changedAfterNew = fr.fn, map[types.Object]bool{}
+		in.newFn, in.changedAfterNew, in.changedObjects = fr.fn, map[types.Object]bool{}, map[*object]bool{}
 		if a := fr.pkg.astOf(c); a != nil {
 			in.newPos = a.Pos()
 		}
@@ -372,7 +379,7 @@ func (in *interp) kingpinMethod(fr *frame, c *dst.CallExpr, cl *clause, name str
 					if !ok || strings.Contains(s, ",") {
 						// Not a constant, or one with a comma, which the
 						// hints tag would split: a Hints method returns it.
-						cl.hintExpr, cl.hintPkg = hintOptionsExpr(c), fr.pkg
+						cl.hintExpr, cl.hintPkg, cl.hintAction = hintOptionsExpr(c), fr.pkg, false
 						return self
 					}
 					hints = append(hints, s)
@@ -382,7 +389,7 @@ func (in *interp) kingpinMethod(fr *frame, c *dst.CallExpr, cl *clause, name str
 			return self
 		case "HintAction":
 			if len(c.Args) == 1 {
-				cl.hintExpr, cl.hintPkg = callOf(c.Args[0]), fr.pkg
+				cl.hintExpr, cl.hintPkg, cl.hintAction = c.Args[0], fr.pkg, true
 			}
 			return self
 		case "Action", "PreAction":
@@ -408,6 +415,7 @@ func (in *interp) kingpinMethod(fr *frame, c *dst.CallExpr, cl *clause, name str
 			if p, ok := fr.pkg.typeOf(c).(*types.Pointer); ok {
 				cl.storageType = p.Elem()
 			}
+			in.storageCalls[c] = cl
 			return []value{vStorage{cl}}
 		}
 	}

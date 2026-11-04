@@ -240,7 +240,7 @@ func (p *Plan) embeddedTypes() map[*types.Named]bool {
 // generatedMethods returns the methods the conversion may add to a command
 // struct, as names its fields must not take.
 func generatedMethods() map[string]bool {
-	return map[string]bool{"Hints": true, "Vars": true, "BeforeApply": true, "AfterApply": true}
+	return map[string]bool{"Hints": true, "HintActions": true, "Vars": true, "BeforeApply": true, "AfterApply": true}
 }
 
 // nameFields picks each command's field name in its parent container and

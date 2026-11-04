@@ -73,9 +73,12 @@ type converter struct {
 	pkgFlagsOf map[*clause]bool
 	// injected are the types hooks take as parameters, which kong.Bind must
 	// provide where the parser is built, unless boundAtCall already does.
-	injected    []types.Type
-	boundAtNew  []types.Type
-	boundAtCall []types.Type
+	// unexportedNodes are the commands already reported for a type the
+	// CLI can't name.
+	unexportedNodes map[*node]bool
+	injected        []types.Type
+	boundAtNew      []types.Type
+	boundAtCall     []types.Type
 	// pruned are functions that lost parameters or results with the wiring,
 	// so their callers must be updated too.
 	pruned map[*types.Func]prunedSig
@@ -225,6 +228,12 @@ func (h *hookSet) paramOfType(typ string) string {
 	return ""
 }
 
+// lookupMethod returns the method name of t or *t, or nil.
+func lookupMethod(t *types.Named, name string) types.Object {
+	obj, _, _ := types.LookupFieldOrMethod(types.NewPointer(t), true, t.Obj().Pkg(), name)
+	return obj
+}
+
 // builtByCall reports whether s creates a command struct with a function
 // call, as in j := defaultJob(), rather than a literal or new.
 func builtByCall(s dst.Stmt) bool {
@@ -282,35 +291,36 @@ type Options struct {
 // Convert rewrites the program to declare its command line with kong.
 func Convert(prog *Program, opts Options) (*Result, error) {
 	c := &converter{
-		prog:           prog,
-		ed:             newEditor(prog),
-		nm:             newNamer(prog),
-		res:            &Result{Files: map[string]string{}, NewFiles: map[string]string{}},
-		tagged:         map[*types.Var]bool{},
-		pureCalls:      map[*types.Func]bool{},
-		pkgFlagVars:    map[types.Object]bool{},
-		unmapped:       map[string]bool{},
-		boundValues:    map[string]string{},
-		funcWork:       map[*types.Func]bool{},
-		hooks:          map[*types.Named]*hookSet{},
-		valueEmbeds:    map[*types.Var]bool{},
-		cmdTypes:       map[*types.Named]bool{},
-		renames:        map[*types.Var]string{},
-		opts:           opts,
-		storagePaths:   map[*clause]string{},
-		genActions:     map[*node]*genActions{},
-		fieldOrder:     map[string]int{},
-		rootFieldNames: map[*clause]string{},
-		removedCtors:   map[*types.Func]bool{},
-		emptied:        map[*types.Func]bool{},
-		pruned:         map[*types.Func]prunedSig{},
-		kingpinTests:   map[string]bool{},
-		keep:           map[types.Object]bool{},
-		keepStmts:      map[dst.Stmt]bool{},
-		hiddenEmbeds:   map[*types.Var]bool{},
-		declared:       map[dst.Node]map[string]bool{},
-		cmdLists:       map[*types.Func]*cmdList{},
-		listParams:     map[types.Object]bool{},
+		prog:            prog,
+		ed:              newEditor(prog),
+		nm:              newNamer(prog),
+		res:             &Result{Files: map[string]string{}, NewFiles: map[string]string{}},
+		tagged:          map[*types.Var]bool{},
+		pureCalls:       map[*types.Func]bool{},
+		pkgFlagVars:     map[types.Object]bool{},
+		unmapped:        map[string]bool{},
+		boundValues:     map[string]string{},
+		funcWork:        map[*types.Func]bool{},
+		hooks:           map[*types.Named]*hookSet{},
+		valueEmbeds:     map[*types.Var]bool{},
+		cmdTypes:        map[*types.Named]bool{},
+		renames:         map[*types.Var]string{},
+		opts:            opts,
+		storagePaths:    map[*clause]string{},
+		genActions:      map[*node]*genActions{},
+		fieldOrder:      map[string]int{},
+		rootFieldNames:  map[*clause]string{},
+		removedCtors:    map[*types.Func]bool{},
+		emptied:         map[*types.Func]bool{},
+		pruned:          map[*types.Func]prunedSig{},
+		kingpinTests:    map[string]bool{},
+		keep:            map[types.Object]bool{},
+		keepStmts:       map[dst.Stmt]bool{},
+		hiddenEmbeds:    map[*types.Var]bool{},
+		declared:        map[dst.Node]map[string]bool{},
+		cmdLists:        map[*types.Func]*cmdList{},
+		unexportedNodes: map[*node]bool{},
+		listParams:      map[types.Object]bool{},
 	}
 	c.g = Analyze(prog)
 	c.plan = NewPlan(c.g)
@@ -331,15 +341,24 @@ func Convert(prog *Program, opts Options) (*Result, error) {
 			continue
 		}
 		c.cmdTypes[n.typ] = true
+		// kong calls a command's methods with these names on its own while
+		// parsing, which kingpin never did.
+		for _, name := range []string{"BeforeReset", "BeforeResolve", "BeforeApply", "AfterApply", "Validate", "AfterRun"} {
+			if _, ok := lookupMethod(n.typ, name).(*types.Func); ok {
+				c.issue(n.cl.pos, "command %q: kong calls %s.%s on its own while parsing, which kingpin never did; rename it if it isn't meant for that", n.cl.fullName(), n.typ.Obj().Name(), name)
+			}
+		}
 		if n.containerOwn {
 			for _, ch := range n.children {
 				c.nm.claim(n.typ, ch.field)
 			}
 		}
-		// convertHints may add a Hints method here or on an embedded type.
+		// convertHints may add Hints and HintActions methods here or on an
+		// embedded type.
 		if slices.ContainsFunc(n.cl.children, func(ch *clause) bool { return ch.hintExpr != nil }) {
 			for _, t := range append([]*types.Named{n.typ}, embeddedClosure(n.typ)...) {
 				c.nm.claim(t, "Hints")
+				c.nm.claim(t, "HintActions")
 			}
 		}
 	}
@@ -667,17 +686,49 @@ func (c *converter) reorderArgs(list []*binding) bool {
 	for _, f := range fields {
 		isArg[f] = true
 	}
-	next := 0
+	// Each field keeps its comments, and each place its spacing.
+	var slots []int
 	for i, f := range st.Fields.List {
 		if isArg[f] {
-			moved := fields[next]
-			moved.Decs, f.Decs = f.Decs, moved.Decs
-			st.Fields.List[i] = moved
-			next++
+			slots = append(slots, i)
 		}
+	}
+	type spacing struct{ before, after dst.SpaceType }
+	spaces := make([]spacing, len(slots))
+	for k, i := range slots {
+		d := st.Fields.List[i].Decs
+		spaces[k] = spacing{d.Before, d.After}
+	}
+	// Empty lines split the fields into groups, which comments usually
+	// head; a field moved to another such group lands under the wrong one.
+	group := make([]int, len(st.Fields.List))
+	headed := false
+	for i, f := range st.Fields.List {
+		if i > 0 {
+			group[i] = group[i-1]
+			if f.Decs.Before == dst.EmptyLine {
+				group[i]++
+			}
+		}
+		if len(f.Decs.Start) > 0 && (i == 0 || f.Decs.Before == dst.EmptyLine) {
+			headed = true
+		}
+	}
+	regrouped := false
+	for k, i := range slots {
+		if from := slices.Index(st.Fields.List, fields[k]); headed && from >= 0 && group[from] != group[i] {
+			regrouped = true
+		}
+	}
+	for k, i := range slots {
+		fields[k].Decs.Before, fields[k].Decs.After = spaces[k].before, spaces[k].after
+		st.Fields.List[i] = fields[k]
 	}
 	loc, _ := c.ed.fieldDecl(list[0].field)
 	c.ed.touch(loc.pkg, loc.file)
+	if regrouped {
+		c.res.Notes = append(c.res.Notes, fmt.Sprintf("%s: the argument fields of %s moved across commented groups, to follow the order they were registered in; check the comments.", loc.pkg.position(st), owner.Obj().Name()))
+	}
 	return true
 }
 

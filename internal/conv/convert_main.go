@@ -201,7 +201,7 @@ func (c *converter) prepareMain(taken map[string]bool) {
 			// A copy of a command struct, as in snapshot := cmd, stays a
 			// copy.
 			// Only the variable kingpin wrote into is replaced.
-			if p, ok := c.instancePath(val.o); ok && !c.copiesVariable(obj) {
+			if p, ok := c.instancePath(val.o); ok && !c.copiesVariable(obj, val.o) {
 				mp.repl[obj] = replacement{p, false}
 			}
 		}
@@ -467,10 +467,13 @@ func (c *converter) typeIdent(t *types.Named) *dst.Ident {
 
 // copiesVariable reports whether a variable of the root package is
 // initialized from another variable.
-func (c *converter) copiesVariable(o types.Object) bool {
+func (c *converter) copiesVariable(o types.Object, held *object) bool {
 	root := c.tree.RootPkg
 	copied := false
-	// A variable or what a pointer variable points to, as in *serve.
+	// A variable or what a pointer variable points to, as in *serve,
+	// sharing the struct o holds.
+	// A plain struct copied before registration, as in serve := defaults,
+	// is a struct of its own, which the flags write into.
 	isVar := func(e dst.Expr) bool {
 		e = unparen(e)
 		if star, ok := e.(*dst.StarExpr); ok {
@@ -478,8 +481,17 @@ func (c *converter) copiesVariable(o types.Object) bool {
 		}
 		switch e.(type) {
 		case *dst.Ident, *dst.SelectorExpr:
-			_, ok := root.objectOf(e).(*types.Var)
-			return ok
+			v, ok := root.objectOf(e).(*types.Var)
+			if !ok {
+				return false
+			}
+			switch src := c.g.in.varVals[v].(type) {
+			case vObj:
+				return src.o == held
+			case vPtr:
+				return src.o == held
+			}
+			return true
 		}
 		return false
 	}
@@ -1729,8 +1741,8 @@ func onePerLine(elts []dst.Expr) []dst.Expr {
 // needsValues reports whether a flag or argument needs kongcompat.Values
 // because kingpin decoded it differently from kong.
 // That covers ints and []int (kingpin parsed them as floats), []bool,
-// map[string]string, counters, files, existing files and directories,
-// positional booleans, and kingpin v3 booleans named no-x.
+// map[string]string, counters, files, regular expressions, existing files
+// and directories, positional booleans, and kingpin v3 booleans named no-x.
 func (c *converter) needsValues() bool {
 	for _, b := range c.plan.bindings {
 		if b.tag != nil {
@@ -1751,7 +1763,8 @@ func (c *converter) needsValues() bool {
 		if t == nil {
 			continue
 		}
-		if types.TypeString(t, nil) == "*os.File" {
+		switch types.TypeString(t, nil) {
+		case "*os.File", "*regexp.Regexp", "[]*regexp.Regexp":
 			return true
 		}
 		switch u := t.Underlying().(type) {
@@ -1941,12 +1954,99 @@ func (c *converter) pointInto(p *Package, s dst.Stmt, vals []value) ([]dst.Stmt,
 // around it.
 const spliceMarker = "// king2kong:splice"
 
+// pointList replaces a call building a list of commands, as in
+// commands := define(app), with that list taken from the CLI:
+// commands := []Command{&cli.Serve}.
+// It only does so in main, which can see the CLI, and when every element
+// is a command struct of the CLI.
+func (c *converter) pointList(p *Package, s dst.Stmt, body *dst.BlockStmt) bool {
+	as, ok := s.(*dst.AssignStmt)
+	if !ok || len(as.Rhs) != 1 || len(as.Lhs) != 1 || c.main.local != nil && c.main.local.Body != body {
+		return false
+	}
+	call, ok := unparen(as.Rhs[0]).(*dst.CallExpr)
+	vals := c.g.in.stmtVals[s]
+	if !ok || len(vals) != 1 || !c.isGrammarList(vals[0]) {
+		return false
+	}
+	t, ok := typeUnder(p.typeOf(call)).(*types.Slice)
+	if !ok {
+		return false
+	}
+	var elts []dst.Expr
+	for _, e := range vals[0].(vSlice).elems {
+		ptr, isPtr := e.(vPtr)
+		if !isPtr {
+			return false
+		}
+		path, found := c.instancePath(ptr.o)
+		if !found {
+			return false
+		}
+		elts = append(elts, &dst.UnaryExpr{Op: token.AND, X: pathExpr(path)})
+	}
+	elem, ok := typeAt(t.Elem(), p.PkgPath)
+	if !ok {
+		return false
+	}
+	as.Rhs[0] = &dst.CompositeLit{Type: &dst.ArrayType{Elt: elem}, Elts: elts}
+	return true
+}
+
+// pointStorage points the flag value pointers that s keeps somewhere other
+// than a local the CLI replaces, as in cfg.port = app.Flag("port", "").Int()
+// or var cfg = &config{port: app.Flag("port", "").Int()}, into the CLI.
+// Where the CLI can't be reached from, as in a helper when the CLI is a
+// local of main, they are reported.
+func (c *converter) pointStorage(p *Package, s dst.Stmt, body *dst.BlockStmt) bool {
+	switch s := s.(type) {
+	case *dst.AssignStmt:
+		if c.replacesAny(p, s.Lhs) {
+			return false
+		}
+	case *dst.DeclStmt:
+		if c.replacesAny(p, declaredNames(s)) {
+			return false
+		}
+	case *dst.BlockStmt, *dst.IfStmt, *dst.ForStmt, *dst.RangeStmt, *dst.SwitchStmt, *dst.TypeSwitchStmt, *dst.SelectStmt, *dst.LabeledStmt:
+		// Their statements are looked at one by one.
+		return false
+	}
+	reachable := c.main.local == nil || c.main.local.Body == body
+	changed := false
+	dstutil.Apply(s, func(cur *dstutil.Cursor) bool {
+		if _, lit := cur.Node().(*dst.FuncLit); lit {
+			return false
+		}
+		call, ok := cur.Node().(*dst.CallExpr)
+		if !ok {
+			return true
+		}
+		cl := c.g.in.storageCalls[call]
+		path, ok := c.storagePaths[cl]
+		if cl == nil || !ok {
+			return true
+		}
+		if !reachable {
+			c.issue(p.position(call), "flag %q: its value pointer is kept here, where the CLI, local to main, can't be reached; pass it in by hand", cl.name)
+			return false
+		}
+		cur.Replace(&dst.UnaryExpr{Op: token.AND, X: pathExpr(path)})
+		changed = true
+		return false
+	}, nil)
+	return changed
+}
+
 func (c *converter) dropReplacedLocals(p *Package, body *dst.BlockStmt) bool {
 	changed := false
 	branches := labelJumps(body, func(*dst.BranchStmt) bool { return true })
 	// lower returns what replaces a statement defining variables the CLI
 	// replaces, and false for any other statement.
 	lower := func(s dst.Stmt) ([]dst.Stmt, bool) {
+		if c.pointList(p, s, body) || c.pointStorage(p, s, body) {
+			return []dst.Stmt{s}, true
+		}
 		if _, decl := s.(*dst.DeclStmt); !decl {
 			if stmts, ok := c.pointInto(p, s, c.g.in.stmtVals[s]); ok {
 				return stmts, true
@@ -2182,6 +2282,13 @@ func (c *converter) initialAssignments(p *Package, s dst.Stmt, names, values []d
 			// A command built anew over one built before starts empty.
 			lit = emptyLiteral(values[i])
 		}
+		if lit == nil && structCopy(p, values[i]) {
+			// A command copied from another struct, as in
+			// serve := defaults, starts as that struct.
+			as.Lhs = append(as.Lhs, pathExpr(r.path))
+			as.Rhs = append(as.Rhs, dst.Clone(values[i]).(dst.Expr))
+			continue
+		}
 		if lit == nil {
 			continue
 		}
@@ -2246,7 +2353,7 @@ func (c *converter) splitCommands(p *Package, s dst.Stmt, names, values []dst.Ex
 		rebuilt := !tuple && !c.declares(p, l) && emptyLiteral(value) != nil
 		switch {
 		case !replaced:
-		case !tuple && initialValues(value) != nil || rebuilt:
+		case !tuple && (initialValues(value) != nil || structCopy(p, value)) || rebuilt:
 			if lit := structLiteral(value); lit != nil {
 				c.keepSubcommands(lit, r.path, pathExpr(r.path))
 			}
@@ -2423,6 +2530,13 @@ func (c *converter) localCLI() *dst.FuncDecl {
 			if ov, ok := o.(*types.Var); ok && ov.Pkg() == root.Types && !ov.IsField() && !inside(o) && c.usedAsGrammar(o) {
 				return nil
 			}
+		}
+	}
+	// Nor can a helper keeping a flag's value pointer, as in
+	// return &config{port: app.Flag("port", "").Int()}.
+	for call := range c.g.in.storageCalls {
+		if a := root.astOf(call); a != nil && (a.Pos() < n.Pos() || a.Pos() > n.End()) {
+			return nil
 		}
 	}
 	return fn

@@ -337,9 +337,21 @@ func (c *converter) initializesCommand(p *Package, names, values []dst.Expr) boo
 		return false
 	}
 	for i, l := range names {
-		if _, ok := c.main.repl[p.objectOf(l)]; ok && initialValues(values[i]) != nil {
+		if _, ok := c.main.repl[p.objectOf(l)]; ok && (initialValues(values[i]) != nil || structCopy(p, values[i])) {
 			return true
 		}
+	}
+	return false
+}
+
+// structCopy reports whether e is a struct variable copied by value, as
+// defaults in serve := defaults.
+func structCopy(p *Package, e dst.Expr) bool {
+	switch unparen(e).(type) {
+	case *dst.Ident, *dst.SelectorExpr:
+		_, isStruct := typeUnder(p.typeOf(e)).(*types.Struct)
+		_, isVar := p.objectOf(unparen(e)).(*types.Var)
+		return isStruct && isVar
 	}
 	return false
 }

@@ -328,6 +328,10 @@ func (c *converter) nodeType(n *node, names map[*node]string, parent *node, impo
 	} else {
 		pkg = parent.typ.Obj().Pkg()
 	}
+	if obj := n.typ.Obj(); !obj.Exported() && obj.Pkg() != pkg && !c.unexportedNodes[n] {
+		c.unexportedNodes[n] = true
+		c.issue(n.cl.pos, "command %q: its type %s is not exported, so the CLI in package %s can't hold it; export it", n.cl.fullName(), types.TypeString(n.typ, shortQual), pkg.Name())
+	}
 	return typeExpr(n.typ, pkg, imports)
 }
 
@@ -814,9 +818,13 @@ func (c *converter) writeHooks() {
 		for _, m := range []string{"BeforeApply", "AfterApply"} {
 			needed := m == "BeforeApply" && len(h.before) > 0 || m == "AfterApply" && len(h.after)+len(h.checks)+len(h.actions) > 0
 			_, method := c.ed.methods[t][m]
-			if needed && (method || slices.Contains(members, m)) {
+			if !needed || !method && !slices.Contains(members, m) {
+				continue
+			}
+			conflict = true
+			// A command's own hook method is reported with the command.
+			if !c.cmdTypes[t] || !method {
 				c.issue(loc.pkg.position(loc.spec), "%s already has a %s method or field; the generated hook has to be merged by hand", t.Obj().Name(), m)
-				conflict = true
 			}
 		}
 		if conflict {

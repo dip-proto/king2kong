@@ -11,14 +11,15 @@ import (
 	"github.com/dave/dst"
 )
 
-// hintsMethod returns the source of a Hints method on typeName, in package
-// pkg, giving the completion hints that kingpin's HintOptions or HintAction
-// computed at run time for n's flags and arguments.
-// kongcompat's completion reads it.
+// hintsMethod returns the source of the methods giving the completion hints
+// of n's flags and arguments that kingpin computed at run time, for
+// typeName in package pkg: Hints for HintOptions values, and HintActions
+// for HintAction functions, which completion only calls when it needs them.
+// kongcompat's completion reads both.
 // It returns "" when there are none, and false when one of them cannot be
 // computed from pkg.
 func (c *converter) hintsMethod(n *node, pkg *types.Package, typeName, recv string, imports map[string]string) (string, bool) {
-	var entries []string
+	var options, actions []string
 	for _, ch := range n.cl.children {
 		if ch.hintExpr == nil {
 			continue
@@ -26,20 +27,37 @@ func (c *converter) hintsMethod(n *node, pkg *types.Package, typeName, recv stri
 		if !c.movableTo(ch.hintPkg, ch.hintExpr, pkg) {
 			return "", false
 		}
-		entries = append(entries, fmt.Sprintf("%s: %s,", strconv.Quote(ch.name), renderIn(ch.hintExpr, imports)))
+		entry := fmt.Sprintf("%s: %s,", strconv.Quote(ch.name), renderIn(ch.hintExpr, imports))
+		if ch.hintAction {
+			actions = append(actions, entry)
+		} else {
+			options = append(options, entry)
+		}
 	}
-	if len(entries) == 0 {
-		return "", true
-	}
-	sort.Strings(entries)
-	return fmt.Sprintf(`// Hints returns the completion hints of the flags whose values are only
-// known at run time, as kingpin's HintOptions and HintAction gave them.
+	var src []string
+	if len(options) > 0 {
+		sort.Strings(options)
+		src = append(src, fmt.Sprintf(`// Hints returns the completion hints of the flags whose values are only
+// known at run time, as kingpin's HintOptions gave them.
 func (%s *%s) Hints() map[string][]string {
 	return map[string][]string{
 %s
 	}
 }
-`, recv, typeName, strings.Join(entries, "\n")), true
+`, recv, typeName, strings.Join(options, "\n")))
+	}
+	if len(actions) > 0 {
+		sort.Strings(actions)
+		src = append(src, fmt.Sprintf(`// HintActions returns the functions completing the flags whose values
+// are only known at run time, as kingpin's HintAction did.
+func (%s *%s) HintActions() map[string]func() []string {
+	return map[string]func() []string{
+%s
+	}
+}
+`, recv, typeName, strings.Join(actions, "\n")))
+	}
+	return strings.Join(src, "\n"), true
 }
 
 // reportHints reports the hints of n that could not be kept.
@@ -122,8 +140,8 @@ func (c *converter) convertHints() {
 				break
 			}
 			done[host] = src
-			if obj, _, _ := types.LookupFieldOrMethod(types.NewPointer(host), true, host.Obj().Pkg(), "Hints"); obj != nil {
-				c.issue(n.cl.pos, "%s already has a member named Hints; completion hints computed at run time are not kept", host.Obj().Name())
+			if lookupMethod(host, "Hints") != nil || lookupMethod(host, "HintActions") != nil {
+				c.issue(n.cl.pos, "%s already has a member named Hints or HintActions; completion hints computed at run time are not kept", host.Obj().Name())
 				break
 			}
 			decls, err := snippet(loc.pkg.Name, imports, src)

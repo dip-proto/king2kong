@@ -212,6 +212,17 @@ func keepUnselected(k *kong.Kong, path []*kong.Node) (restore func()) {
 	}
 }
 
+// fillMaps gives each map flag left nil an empty map, as kingpin's
+// StringMap allocated one even when the flag was absent.
+// Values runs it after kong resets the values and before the actions.
+func fillMaps(k *kong.Kong) {
+	values(k.Model.Node, func(v *kong.Value) {
+		if t := v.Target; t.IsValid() && t.Kind() == reflect.Map && t.IsNil() && t.CanSet() {
+			t.Set(reflect.MakeMap(t.Type()))
+		}
+	})
+}
+
 // readLikeKingpin makes kong read values the way kingpin did, until restore
 // is called.
 // kingpin ignored empty environment variables, and those of values given on

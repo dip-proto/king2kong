@@ -7,6 +7,7 @@ import (
 	"net/url"
 	"os"
 	"reflect"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -83,7 +84,9 @@ func checkValue(v *kong.Value, value string) error {
 //   - a boolarg value is a positional boolean, given as true or false;
 //   - a counter's environment variable or default counts as one, whatever
 //     it says;
-//   - a file is opened by the name given, and "-" is just a file name.
+//   - a file is opened by the name given, and "-" is just a file name;
+//   - a regular expression is compiled, in lists too;
+//   - a map flag left out holds an empty map, not nil.
 func Values() kong.Option {
 	return kong.OptionFunc(func(k *kong.Kong) error {
 		for _, opt := range []kong.Option{
@@ -96,6 +99,11 @@ func Values() kong.Option {
 			kong.NamedMapper("boolarg", kong.MapperFunc(boolArg)),
 			kong.NamedMapper("counter", kong.MapperFunc(counter)),
 			kong.TypeMapper(reflect.TypeOf((*os.File)(nil)), kong.MapperFunc(openFile)),
+			kong.TypeMapper(reflect.TypeOf((*regexp.Regexp)(nil)), kong.MapperFunc(compileRegexp)),
+			kong.WithBeforeApply(func(ctx *kong.Context) error {
+				fillMaps(ctx.Kong)
+				return nil
+			}),
 		} {
 			if err := opt.Apply(k); err != nil {
 				return err
@@ -166,6 +174,21 @@ func counter(ctx *kong.DecodeContext, target reflect.Value) error {
 	default:
 		return fmt.Errorf("a counter needs an integer, not %s", target.Type())
 	}
+	return nil
+}
+
+// compileRegexp compiles a regular expression, which kong's own decoding
+// can't do into a list.
+func compileRegexp(ctx *kong.DecodeContext, target reflect.Value) error {
+	texts, err := valueTexts(ctx, -1, false)
+	if err != nil {
+		return err
+	}
+	re, err := regexp.Compile(texts[0])
+	if err != nil {
+		return err
+	}
+	target.Set(reflect.ValueOf(re))
 	return nil
 }
 

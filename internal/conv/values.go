@@ -24,10 +24,9 @@ type vConst struct {
 }
 
 // vObj is a struct value.
-// A copy shares the original object.
-// Registration code reads copied structs (value receivers, option structs)
-// without changing them, and sharing keeps the field paths back to the
-// command struct.
+// Copying a struct of plain data gives a new object, as Go does.
+// A struct holding grammar, such as a command, stays shared when copied,
+// which keeps the field paths back to the command struct.
 type vObj struct{ o *object }
 
 // vPtr points at a struct object.

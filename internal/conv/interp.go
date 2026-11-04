@@ -60,16 +60,24 @@ type interp struct {
 	// paramVals is the value each parameter got, or vUnknown when calls
 	// passed different ones.
 	paramVals map[types.Object]value
+	// logs are the write logs of the branches running, innermost last.
+	logs []writeLog
 	// newFn and newPos are where the last application was created, and
 	// changedAfterNew the variables written since.
 	newFn           *types.Func
 	newPos          token.Pos
 	changedAfterNew map[types.Object]bool
+	// changedObjects are the structs a field of which was written since,
+	// through any variable.
+	changedObjects map[*object]bool
 	// eltVals is the value of each element of the slice literals that ran,
 	// or vUnknown when it changed from one run to another.
 	eltVals map[dst.Expr]value
 	// grammarCalls are the calls that declared grammar.
 	grammarCalls map[*dst.CallExpr]bool
+	// storageCalls are the calls, like app.Flag("port", "").Int(), that
+	// returned a pointer to the value kingpin allocated for a clause.
+	storageCalls map[*dst.CallExpr]*clause
 	// moved are the arguments of grammar calls the conversion computes
 	// elsewhere, such as a default value only known at run time.
 	moved map[dst.Expr]bool
@@ -139,6 +147,7 @@ func newInterp(prog *Program) *interp {
 		specVals:     map[*dst.ValueSpec][]value{},
 		varVals:      map[types.Object]value{},
 		paramVals:    map[types.Object]value{},
+		storageCalls: map[*dst.CallExpr]*clause{},
 		valueCallees: map[*dst.CallExpr]*types.Func{},
 		globalWrites: map[*types.Var]value{},
 		initCalled:   map[*types.Func]bool{},
@@ -645,7 +654,7 @@ func plainData(o *object) bool {
 			if v.o.parent != o || !plainData(v.o) {
 				return false
 			}
-		case vPtr:
+		case vPtr, vCell, vVarPtr, vFieldPtr, vFunc:
 		default:
 			if !isData(v) {
 				return false
@@ -686,6 +695,7 @@ func (in *interp) store(fr *frame, lhs dst.Expr, v value) {
 				// in init, and becomes unknown if it gets a different one.
 				// Any other value only matters as the starting value of a
 				// flag writing into it.
+				in.logWrite(location{v: vr})
 				in.globalWrites[vr] = v
 				switch v.(type) {
 				case vStorage, vClause:
@@ -708,15 +718,38 @@ func (in *interp) store(fr *frame, lhs dst.Expr, v value) {
 					vo.o.parent, vo.o.pfield = obj, f
 				}
 			}
+			in.logWrite(location{o: obj, f: f})
+			if in.changedObjects != nil {
+				in.changedObjects[obj.root()] = true
+			}
 			obj.fields[f] = v
 		}
 	case *dst.StarExpr:
-		// Ignored: only structs are tracked through pointers, and they
-		// are shared, not copied.
+		// *cfg = Config{...} replaces the struct cfg points to, which
+		// keeps its identity.
+		// Other pointers are not tracked.
+		if p, ok := in.eval(fr, l.X).(vPtr); ok && p.o.st != nil {
+			if src, ok := v.(vObj); ok && plainData(src.o) {
+				fresh := in.copyPlain(src.o)
+				p.o.fields = fresh.fields
+				for _, fv := range p.o.fields {
+					if inner, ok := fv.(vObj); ok {
+						inner.o.parent = p.o
+					}
+				}
+			} else {
+				for f := range p.o.fields {
+					p.o.fields[f] = vUnknown{}
+				}
+			}
+		}
 	case *dst.IndexExpr:
 		// An element of a list or a map, as in endpoints[0] = url: the
-		// whole collection is no longer known.
+		// whole collection is no longer known, nor its aliases.
 		if plainExpr(l.X) {
+			if sl, ok := in.eval(fr, l.X).(vSlice); ok {
+				in.forgetAliases(fr, sl)
+			}
 			in.store(fr, l.X, vUnknown{})
 		}
 	case *dst.ParenExpr:
@@ -865,40 +898,131 @@ func (in *interp) ifStmt(fr *frame, s *dst.IfStmt) {
 			fr.jump = 0
 		}
 	}
+	// Each branch starts from the state before the if.
+	// The locals it assigns are read back by name, and the fields and
+	// package-level variables anything it runs writes, helpers included,
+	// are logged.
 	written := assigned(s)
 	before := in.readAll(fr, written)
+	bodyLog := writeLog{}
+	in.logs = append(in.logs, bodyLog)
 	fr.conds = append(append([]cond{}, saved...), cond{expr: s.Cond, fn: fr.fn, pkg: fr.pkg})
 	in.block(fr, s.Body.List)
 	settle()
+	in.logs = in.logs[:len(in.logs)-1]
 	afterBody, afterElse := in.readAll(fr, written), before
+	bodyWrites := in.readLog(bodyLog)
+	elseLog := writeLog{}
 	if s.Else != nil {
 		in.writeAll(fr, written, before)
+		in.restoreLog(bodyLog)
+		in.logs = append(in.logs, elseLog)
 		fr.conds = append(append([]cond{}, saved...), cond{expr: s.Cond, neg: true, fn: fr.fn, pkg: fr.pkg})
 		in.stmt(fr, s.Else)
 		settle()
+		in.logs = in.logs[:len(in.logs)-1]
 		afterElse = in.readAll(fr, written)
 	}
 	fr.conds = saved
 	// Plain data the branches set differently, like a default, now depends
 	// on the condition, so it is unknown.
 	// Grammar values keep what the last branch left.
-	for i, l := range written {
-		v := afterElse[i]
-		if eq, _ := equalValues(afterBody[i], afterElse[i]); !eq && isData(afterBody[i]) && isData(afterElse[i]) {
-			v = vUnknown{}
-		} else if s.Else == nil {
-			v = afterBody[i]
+	merge := func(b, e value) value {
+		if eq, _ := equalValues(b, e); !eq && mergeable(b) && mergeable(e) {
+			return vUnknown{}
 		}
-		in.store(fr, l, v)
+		if s.Else == nil {
+			return b
+		}
+		return e
+	}
+	for i, l := range written {
+		in.store(fr, l, merge(afterBody[i], afterElse[i]))
+	}
+	// The locations either branch wrote, with what each one left there:
+	// the state before the if when it didn't write them.
+	for l, old := range bodyLog {
+		e := old
+		if s.Else != nil {
+			e = in.readLoc(l)
+		}
+		in.writeLoc(l, merge(bodyWrites[l], e))
+	}
+	for l, old := range elseLog {
+		if _, done := bodyLog[l]; !done {
+			in.writeLoc(l, merge(old, in.readLoc(l)))
+		}
+	}
+	// Outer branches see these writes too.
+	for l := range bodyLog {
+		in.logWrite(l)
+	}
+	for l := range elseLog {
+		in.logWrite(l)
 	}
 }
 
-// assigned returns what an if statement assigns with =, ++ or --, like x
-// or cfg.Timeout.
+// A location is a field of an object, or a package-level variable.
+type location struct {
+	o *object
+	f *types.Var
+	v *types.Var
+}
+
+// writeLog keeps what each location held before a branch first wrote it,
+// nil when it held nothing.
+type writeLog map[location]value
+
+func (in *interp) readLoc(l location) value {
+	if l.o != nil {
+		return l.o.fields[l.f]
+	}
+	return in.globalWrites[l.v]
+}
+
+func (in *interp) writeLoc(l location, v value) {
+	switch {
+	case l.o != nil && v == nil:
+		delete(l.o.fields, l.f)
+	case l.o != nil:
+		l.o.fields[l.f] = v
+	case v == nil:
+		delete(in.globalWrites, l.v)
+	default:
+		in.globalWrites[l.v] = v
+	}
+}
+
+// logWrite records, in each branch running, what l held before its first
+// write.
+func (in *interp) logWrite(l location) {
+	for _, log := range in.logs {
+		if _, seen := log[l]; !seen {
+			log[l] = in.readLoc(l)
+		}
+	}
+}
+
+func (in *interp) readLog(log writeLog) map[location]value {
+	out := map[location]value{}
+	for l := range log {
+		out[l] = in.readLoc(l)
+	}
+	return out
+}
+
+func (in *interp) restoreLog(log writeLog) {
+	for l, old := range log {
+		in.writeLoc(l, old)
+	}
+}
+
+// assigned returns the variables an if statement assigns with =, ++ or --.
+// Fields and package-level variables are followed through the write log.
 func assigned(s *dst.IfStmt) []dst.Expr {
 	var out []dst.Expr
 	add := func(e dst.Expr) {
-		if id, ok := e.(*dst.Ident); ok && id.Name == "_" || !plainExpr(e) {
+		if id, ok := e.(*dst.Ident); !ok || id.Name == "_" {
 			return
 		}
 		out = append(out, e)
@@ -933,6 +1057,16 @@ func (in *interp) writeAll(fr *frame, exprs []dst.Expr, vals []value) {
 	for i, e := range exprs {
 		in.store(fr, e, vals[i])
 	}
+}
+
+// mergeable reports whether v, left by one branch of an if, is plain data
+// that becomes unknown when the other branch leaves something else, like a
+// configuration struct.
+func mergeable(v value) bool {
+	if o, ok := v.(vObj); ok {
+		return plainData(o.o)
+	}
+	return isData(v)
 }
 
 // isData reports whether v is plain data, not grammar.
@@ -1003,6 +1137,15 @@ func equalValues(a, b value) (equal, known bool) {
 func (in *interp) forgetWrites(fr *frame, n dst.Node) {
 	forget := func(l dst.Expr) {
 		in.markChanged(fr, l)
+		// *cfg = Config{...}: every field of what cfg points to.
+		if star, ok := unparen(l).(*dst.StarExpr); ok && plainExpr(star.X) {
+			if p, ok := in.eval(fr, star.X).(vPtr); ok && p.o.st != nil {
+				for i := range p.o.st.NumFields() {
+					p.o.fields[p.o.st.Field(i)] = vUnknown{}
+				}
+			}
+			return
+		}
 		for {
 			ix, ok := unparen(l).(*dst.IndexExpr)
 			if !ok {
@@ -1046,12 +1189,16 @@ func (in *interp) forgetWrites(fr *frame, n dst.Node) {
 			var args []value
 			for _, a := range n.Args {
 				v := value(vUnknown{})
-				if isAddress(a) && plainExpr(a) {
+				if plainExpr(a) {
 					v = in.eval(fr, a)
 				}
 				args = append(args, v)
 			}
-			in.forgetPointed(fr, n, vUnknown{}, args)
+			recv := value(vUnknown{})
+			if sel, ok := n.Fun.(*dst.SelectorExpr); ok && plainExpr(sel.X) && fr.pkg.selection(sel) != nil {
+				recv = in.eval(fr, sel.X)
+			}
+			in.forgetPointed(fr, n, recv, args)
 		}
 		return true
 	})
@@ -1076,9 +1223,13 @@ func (in *interp) forgetPointed(fr *frame, c *dst.CallExpr, recv value, args []v
 		for i := range o.st.NumFields() {
 			f := o.st.Field(i)
 			switch v := o.fields[f].(type) {
-			case nil, vConst, vSlice:
+			case nil, vConst, vSlice, vNil:
 				switch typeUnder(f.Type()).(type) {
 				case *types.Basic, *types.Slice:
+					o.fields[f] = vUnknown{}
+				case *types.Pointer, *types.Map, *types.Interface:
+					// A loader may fill an optional section, as
+					// json.Unmarshal does for TLS *TLSConfig.
 					o.fields[f] = vUnknown{}
 				case *types.Struct:
 					if v == nil {
@@ -1099,6 +1250,12 @@ func (in *interp) forgetPointed(fr *frame, c *dst.CallExpr, recv value, args []v
 		}
 	}
 	forgetObject := func(v value) {
+		if vp, ok := v.(vVarPtr); ok {
+			// A pointer saved in a variable, as in
+			// json.Unmarshal(raw, destination) with destination := &region.
+			in.forgetVar(fr, vp.v)
+			return
+		}
 		if fp, ok := v.(vFieldPtr); ok {
 			// As in readBool(&settings.Remote).
 			switch typeUnder(fp.f.Type()).(type) {
@@ -1107,8 +1264,16 @@ func (in *interp) forgetPointed(fr *frame, c *dst.CallExpr, recv value, args []v
 			}
 			return
 		}
-		if p, ok := v.(vPtr); ok && p.o.st != nil {
-			forgetFields(p.o)
+		switch p := v.(type) {
+		case vPtr:
+			if p.o.st != nil {
+				forgetFields(p.o)
+			}
+		case vObj:
+			// cfg.load() on a cfg held by value, when load takes *Config.
+			if p.o.st != nil && pointerMethod(in.staticCallee(fr.pkg, c)) {
+				forgetFields(p.o)
+			}
 		}
 	}
 	forgetObject(recv)
@@ -1118,6 +1283,14 @@ func (in *interp) forgetPointed(fr *frame, c *dst.CallExpr, recv value, args []v
 	for i, a := range c.Args {
 		if isAddress(a) {
 			in.markChanged(fr, a)
+		}
+		// A slice shares its elements with the callee, as in
+		// sort.Strings(endpoints).
+		if i < len(args) && plainExpr(a) && !isAddress(a) {
+			if sl, isSlice := args[i].(vSlice); isSlice {
+				in.store(fr, a, vUnknown{})
+				in.forgetAliases(fr, sl)
+			}
 		}
 		if u, ok := unparen(a).(*dst.UnaryExpr); ok && u.Op == token.AND {
 			if v, ok := fr.pkg.objectOf(unparen(u.X)).(*types.Var); ok && !v.IsField() {
@@ -1131,6 +1304,46 @@ func (in *interp) forgetPointed(fr *frame, c *dst.CallExpr, recv value, args []v
 			forgetObject(args[i])
 		}
 	}
+}
+
+// forgetVar forgets what the interpreter knows of variable v.
+func (in *interp) forgetVar(fr *frame, v *types.Var) {
+	if in.changedAfterNew != nil {
+		in.changedAfterNew[v] = true
+	}
+	if v.Parent() == v.Pkg().Scope() {
+		in.globalWrites[v] = vUnknown{}
+		return
+	}
+	fr.vars[v] = vUnknown{}
+	in.varVals[v] = vUnknown{}
+}
+
+// forgetAliases forgets the locals holding the same elements as sl, as
+// defaults does after defaults := endpoints, when endpoints changes.
+func (in *interp) forgetAliases(fr *frame, sl vSlice) {
+	if len(sl.elems) == 0 {
+		return
+	}
+	for o, v := range fr.vars {
+		if other, ok := v.(vSlice); ok && len(other.elems) > 0 && &other.elems[0] == &sl.elems[0] {
+			fr.vars[o] = vUnknown{}
+			in.varVals[o] = vUnknown{}
+		}
+	}
+}
+
+// pointerMethod reports whether fn is a method with a pointer receiver.
+func pointerMethod(fn *types.Func) bool {
+	if fn == nil {
+		return false
+	}
+	recv := fn.Type().(*types.Signature).Recv()
+	if recv == nil {
+		return false
+	}
+	_, ok := recv.Type().(*types.Pointer)
+	return ok
 }
 
 // leavesLoop reports whether s has a break or continue of the loop around it.
@@ -1911,6 +2124,14 @@ func (in *interp) inline(fr *frame, c *dst.CallExpr, fd funcDecl, fn *types.Func
 	if len(out) == 0 {
 		out = []value{vUnknown{}}
 	}
+	// A struct returned by value is a copy.
+	if sig != nil && sig.Results().Len() == len(out) {
+		for i := range out {
+			if _, isStruct := typeUnder(sig.Results().At(i).Type()).(*types.Struct); isStruct {
+				out[i] = in.copyValue(out[i])
+			}
+		}
+	}
 	if len(in.clauses) > mark {
 		if pv, ok := out[0].(vPtr); ok {
 			in.sites = append(in.sites, &callSite{
@@ -1947,6 +2168,11 @@ func adaptRecv(v value, t types.Type) value {
 
 func (in *interp) builtin(fr *frame, name string, c *dst.CallExpr) value {
 	switch name {
+	case "copy":
+		if len(c.Args) == 2 && plainExpr(c.Args[0]) {
+			in.store(fr, c.Args[0], vUnknown{})
+		}
+		return vUnknown{}
 	case "new":
 		if len(c.Args) == 1 {
 			if tv, ok := fr.pkg.tv(c.Args[0]); ok && tv.Type != nil {
@@ -2117,6 +2343,18 @@ func goValue(v value) (any, bool) {
 	c, ok := v.(vConst)
 	if !ok {
 		return nil, false
+	}
+	// A float keeps its own type, as fmt prints a float32 with fewer
+	// digits than the float64 it converts to.
+	if b, isBasic := typeUnder(c.t).(*types.Basic); isBasic && (c.c.Kind() == constant.Int || c.c.Kind() == constant.Float) {
+		switch b.Kind() {
+		case types.Float32:
+			f, _ := constant.Float32Val(constant.ToFloat(c.c))
+			return f, true
+		case types.Float64:
+			f, _ := constant.Float64Val(constant.ToFloat(c.c))
+			return f, true
+		}
 	}
 	switch c.c.Kind() {
 	case constant.String:

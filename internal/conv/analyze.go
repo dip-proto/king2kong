@@ -217,9 +217,36 @@ func (in *interp) resolveInstances() {
 		if len(owners) == 1 {
 			for o := range owners {
 				c.instance = o
+				// Options embedded by pointer, as in
+				// type serve struct{ *serverOptions }: kong fills a
+				// copy of its own, which the embedding struct the
+				// program holds doesn't see.
+				if outer := in.pointerEmbedder(o); outer != nil {
+					c.issue(fmt.Sprintf("its flags are stored in a %s that a %s embeds by pointer, which kong cannot fill; embed it by value", types.TypeString(o.typ, shortQual), types.TypeString(outer.root().typ, shortQual)))
+				}
 			}
 		}
 	}
+}
+
+// pointerEmbedder returns the one object that embeds o by pointer, or nil.
+func (in *interp) pointerEmbedder(o *object) *object {
+	var found *object
+	for _, other := range in.objects {
+		if other.st == nil {
+			continue
+		}
+		for i := range other.st.NumFields() {
+			f := other.st.Field(i)
+			if p, ok := other.fields[f].(vPtr); ok && f.Anonymous() && p.o == o {
+				if found != nil && found != other {
+					return nil
+				}
+				found = other
+			}
+		}
+	}
+	return found
 }
 
 // embeddedClauses returns the commands stored in o's fields or in the structs
