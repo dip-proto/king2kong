@@ -105,11 +105,11 @@ type clause struct {
 	prior      string
 	hasPrior   bool
 	priorTaken bool
-	// seeded is set when dst, a list or a map, already held values, which
-	// kingpin kept and added to.
-	seeded bool
-	enum       []string
-	enumVar    *types.Var // enum options computed at run time
+	// seeded is set when dst already held values kong would reset: a list
+	// or a map kingpin added to, or a custom value with fields set.
+	seeded  bool
+	enum    []string
+	enumVar *types.Var // enum options computed at run time
 	// storageType is the type behind the pointer a value method such as
 	// String() returns.
 	storageType types.Type
