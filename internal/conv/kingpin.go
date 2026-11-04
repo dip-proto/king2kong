@@ -178,11 +178,7 @@ func (in *interp) takePriors() {
 	for _, cl := range in.clauses {
 		if cl.dst != nil && !cl.priorTaken {
 			cl.prior, cl.hasPrior = in.priorDefault(cl.dst)
-			if v, t := in.priorValue(cl.dst); t != nil {
-				_, basic := t.Underlying().(*types.Basic)
-				_, unknown := v.(vUnknown)
-				cl.priorUnknown = basic && unknown
-			}
+			cl.priorUnknown = in.priorUnknown(cl.dst)
 			cl.seeded = in.seeded(cl.dst)
 			cl.priorTaken = true
 		}

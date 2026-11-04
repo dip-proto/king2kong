@@ -2823,6 +2823,36 @@ func (in *interp) priorValue(dst value) (value, types.Type) {
 	return v, t
 }
 
+// priorUnknown reports whether a flag destination holds a plain value only
+// known at run time, as one loaded from a configuration file or a variable
+// initialized with os.Getenv.
+func (in *interp) priorUnknown(dst value) bool {
+	unknown := func(v value) bool {
+		_, ok := v.(vUnknown)
+		return ok
+	}
+	switch d := dst.(type) {
+	case vVarPtr:
+		if _, basic := d.v.Type().Underlying().(*types.Basic); !basic {
+			return false
+		}
+		if val, ok := in.varVals[d.v]; ok {
+			return unknown(val)
+		}
+		if val, ok := in.globalWrites[d.v]; ok {
+			return unknown(val)
+		}
+		init, ok := in.prog.varInit[d.v]
+		return ok && callsAnything(init.pkg, init.expr)
+	case vFieldPtr:
+		if _, basic := d.f.Type().Underlying().(*types.Basic); !basic {
+			return false
+		}
+		return unknown(d.o.fields[d.f])
+	}
+	return false
+}
+
 // constantDefault writes a destination's constant value as a default.
 func constantDefault(c vConst, t types.Type) (string, bool) {
 	// A time.Duration is written the way kong parses it, as in 1m30s.
